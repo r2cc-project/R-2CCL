@@ -2,3 +2,8 @@
 /build
 *.gcov
 /coverage/
+/install
+.vscode
+*.log
+.DS_Store
+docs/

@@ -204,7 +204,7 @@ struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_COLLNET_DIRECT, NC
       struct ncclDirect* direct = &ncclShmem.channel.collnetDirect;
       int nNodes = ncclShmem.comm.nNodes;
       int nRails = direct->nHeads;
-      int part = ncclShmem.channelId - work->channelLo;
+      int part = ncclCollWorkChannelToPart(work, ncclShmem.channelId);
       void* inbuf = (void*)work->sendbuff;
       ssize_t sizePerRank = work->collnet.count;
 
@@ -259,8 +259,8 @@ struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_COLLNET_DIRECT, NC
   };
 
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
-    const int part = ncclShmem.channelId - work->channelLo;
-    const int nChannels = work->channelHi - work->channelLo + 1;
+    const int part = ncclCollWorkChannelToPart(work, ncclShmem.channelId);
+    const int nChannels = ncclCollWorkNChannels(work);
     struct ncclDirect* direct = &ncclShmem.channel.collnetDirect;
     int const &nNodes = ncclShmem.comm.nNodes;
     ssize_t chunkSize = int(work->collnet.chunkCount);

@@ -18,12 +18,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <poll.h>
+#include <time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <atomic>
+#include <cctype>
 #define ENABLE_TIMER 0
 #include "timer.h"
 
 #include "ibvwrap.h"
+
+#include <thread>
+#include <chrono>
+
+#include <ctime>
+#include <iomanip>
+#include <sstream>
 
 #define MAXNAMESIZE 64
 static char ncclIbIfName[MAX_IF_NAME_SIZE+1];
@@ -499,6 +509,7 @@ int ncclIbFindMatchingDev(int dev) {
 
 ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
   ncclResult_t ret = ncclSuccess;
+  INFO(NCCL_R2CC, "R2CC: ncclIbInit called - initializing IB devices");
   if (ncclParamIbDisable()) return ncclInternalError;
   static int shownIbHcaEnv = 0;
   if(wrap_ibv_symbols() != ncclSuccess) { return ncclInternalError; }
@@ -605,6 +616,7 @@ build_ib_list:
             ncclIbMergedDevs[mergedDev].devs[0] = ncclNIbDevs;
             ncclNMergedIbDevs++;
             strncpy(ncclIbMergedDevs[mergedDev].devName, ncclIbDevs[ncclNIbDevs].devName, MAXNAMESIZE);
+            INFO(NCCL_R2CC, "Created new mergedDev %d: %s (ndevs=1)", mergedDev, ncclIbMergedDevs[mergedDev].devName);
           // Matching dev found, edit name
           } else {
             // Set next device in this array to the current IB device
@@ -612,6 +624,7 @@ build_ib_list:
             ncclIbMergedDevs[mergedDev].devs[ndevs] = ncclNIbDevs;
             ncclIbMergedDevs[mergedDev].ndevs++;
             snprintf(ncclIbMergedDevs[mergedDev].devName + strlen(ncclIbMergedDevs[mergedDev].devName), MAXNAMESIZE+1, "+%s", ncclIbDevs[ncclNIbDevs].devName);
+            INFO(NCCL_R2CC, "Updated mergedDev %d: %s (ndevs=%d)", mergedDev, ncclIbMergedDevs[mergedDev].devName, ncclIbMergedDevs[mergedDev].ndevs);
           }
 
           // Aggregate speed
@@ -668,6 +681,7 @@ build_ib_list:
       char addrline[SOCKET_NAME_MAXLEN+1];
       INFO(NCCL_INIT|NCCL_NET, "NET/IB : Using%s %s; OOB %s:%s", line, ncclIbRelaxedOrderingEnabled ? "[RO]" : "",
            ncclIbIfName, ncclSocketToString(&ncclIbIfAddr, addrline));
+      INFO(NCCL_R2CC, "IB device initialization complete: ncclNMergedIbDevs=%d, ncclNIbDevs=%d", ncclNMergedIbDevs, ncclNIbDevs);
     }
     pthread_mutex_unlock(&ncclIbLock);
   }
@@ -857,6 +871,13 @@ const char* reqTypeStr[] = { "Unused", "Send", "Recv", "Flush" };
 struct ncclIbRequest {
   struct ncclIbNetCommBase* base;
   int type;
+  int failed;
+  int channel;
+  int step;
+  int id;
+  int operation;
+  ncclIbRequest* timeoutRequest;
+  void* comm;
   struct ncclSocket* sock;
   int events[NCCL_IB_MAX_DEVS_PER_NIC];
   struct ncclIbNetCommDevBase* devBases[NCCL_IB_MAX_DEVS_PER_NIC];
@@ -895,7 +916,8 @@ struct ncclIbSendFifo {
   uint32_t nreqs;
   uint32_t tag;
   uint64_t idx;
-  char padding[24];
+  uint32_t useBackup;
+  char padding[20];
 };
 
 struct ncclIbQp {
@@ -1053,6 +1075,12 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base, 
   qpInitAttr.cap.max_recv_sge = 1;
   qpInitAttr.cap.max_inline_data = ncclParamIbUseInline() ? sizeof(struct ncclIbSendFifo) : 0;
   NCCLCHECK(wrap_ibv_create_qp(&qp->qp, base->pd, &qpInitAttr));
+  
+  // R2CC: Log QP creation with detailed info
+  INFO(NCCL_R2CC, "Created QP=%p (qpn=%u) for base=%p, devIndex=%d, pd=%p, context=%p, device=%s", 
+       qp->qp, qp->qp->qp_num, base, qp->devIndex, base->pd, 
+       base->pd ? base->pd->context : NULL,
+       (base->pd && base->pd->context && base->pd->context->device) ? base->pd->context->device->name : "unknown");
   struct ibv_qp_attr qpAttr;
   memset(&qpAttr, 0, sizeof(struct ibv_qp_attr));
   qpAttr.qp_state = IBV_QPS_INIT;
@@ -1125,6 +1153,9 @@ ncclResult_t ncclIbRtsQp(struct ibv_qp* qp) {
   return ncclSuccess;
 }
 
+// R2CC: Global mutex to protect socket/port allocation
+static pthread_mutex_t ncclIbListenMutex = PTHREAD_MUTEX_INITIALIZER;
+
 ncclResult_t ncclIbListen(int dev, void* opaqueHandle, void** listenComm) {
   ncclResult_t ret = ncclSuccess;
   struct ncclIbListenComm* comm;
@@ -1133,13 +1164,41 @@ ncclResult_t ncclIbListen(int dev, void* opaqueHandle, void** listenComm) {
   static_assert(sizeof(struct ncclIbHandle) < NCCL_NET_HANDLE_MAXSIZE, "ncclIbHandle size too large");
   memset(handle, 0, sizeof(struct ncclIbHandle));
   comm->dev = dev;
+  
+  // R2CC: Log detailed listen info
+  static int listenCount = 0;
+  
+  // R2CC: SOLUTION - Use mutex to serialize socket allocation
+  pthread_mutex_lock(&ncclIbListenMutex);
+  listenCount++;
+  int currentListenCount = listenCount;
+  INFO(NCCL_R2CC, "ncclIbListen[%d]: START dev=%d, handle=%p, listenComm=%p, ncclNMergedIbDevs=%d (LOCKED)", 
+       currentListenCount, dev, handle, comm, ncclNMergedIbDevs);
+  
   handle->magic = NCCL_SOCKET_MAGIC;
-  NCCLCHECKGOTO(ncclSocketInit(&comm->sock, &ncclIbIfAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1), ret, fail);
-  NCCLCHECKGOTO(ncclSocketListen(&comm->sock), ret, fail);
-  NCCLCHECKGOTO(ncclSocketGetAddr(&comm->sock, &handle->connectAddr), ret, fail);
+  NCCLCHECKGOTO(ncclSocketInit(&comm->sock, &ncclIbIfAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1), ret, fail_unlock);
+  NCCLCHECKGOTO(ncclSocketListen(&comm->sock), ret, fail_unlock);
+  NCCLCHECKGOTO(ncclSocketGetAddr(&comm->sock, &handle->connectAddr), ret, fail_unlock);
+  
+  // Release mutex after socket is successfully allocated
+  pthread_mutex_unlock(&ncclIbListenMutex);
+  
+  // R2CC: Log the allocated port
+  char addrStr[SOCKET_NAME_MAXLEN+1];
+  INFO(NCCL_R2CC, "ncclIbListen[%d]: ALLOCATED dev=%d, magic=%lx, addr=%s, handle=%p (UNLOCKED)", 
+       currentListenCount, dev, handle->magic, 
+       ncclSocketToString(&handle->connectAddr, addrStr), handle);
+  
   *listenComm = comm;
+
+  // char line[SOCKET_NAME_MAXLEN+1];
+  TRACE(NCCL_INIT|NCCL_NET,"ncclIbListen Listening on socket %s", ncclSocketToString(&(handle->connectAddr), addrStr));
+  // TRACE(NCCL_INIT, "handle offset %d, handle state %d", handle->stage.offset, handle->stage.state);
+
 exit:
   return ret;
+fail_unlock:
+  pthread_mutex_unlock(&ncclIbListenMutex);
 fail:
   (void)ncclSocketClose(&comm->sock);
   free(comm);
@@ -1147,10 +1206,61 @@ fail:
 }
 
 ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm, ncclNetDeviceHandle_t** /*sendDevComm*/) {
+
+  // // TRACE(NCCL_INIT, "ncclIbConnect dev %d", dev);
   ncclResult_t ret = ncclSuccess;
   struct ncclIbHandle* handle = (struct ncclIbHandle*) opaqueHandle;
   struct ncclIbCommStage* stage = &handle->stage;
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)stage->comm;
+
+  // TRACE(NCCL_INIT, "handle offset %d, handle state %d", handle->stage.offset, handle->stage.state);
+  
+  // R2CC debugging - Enhanced connection state tracking
+  static int connectCalls[8] = {0};
+  static int connectCount = 0;
+  static int prevState[8] = {-1};
+  static char connectID[8][64] = {{0}};
+  
+  if (stage->state == ncclIbCommStateStart) {
+    connectCount++;
+    // Generate a unique ID for this connection attempt
+    if (dev < 8) {
+      snprintf(connectID[dev], 64, "CONN_%d_dev%d_%lx", connectCount, dev, handle->magic);
+    }
+  }
+  
+  if (dev < 8) {
+    connectCalls[dev]++;
+    
+    // Log state transitions
+    if (prevState[dev] != stage->state) {
+      char addrStr[SOCKET_NAME_MAXLEN+1];
+      const char* stateNames[] = {"Start", "Connect", "?", "Accept", "Send", "Recv", "Connecting", "Connected", "PendingReady"};
+      const char* stateName = (stage->state >= 0 && stage->state <= 8) ? stateNames[stage->state] : "Unknown";
+      const char* prevStateName = (prevState[dev] >= 0 && prevState[dev] <= 8) ? stateNames[prevState[dev]] : "None";
+      
+      INFO(NCCL_R2CC_LEVEL_1, "[%s] STATE CHANGE: %s(%d) -> %s(%d), dev=%d, calls=%d, handle=%p, addr=%s",
+           connectID[dev], prevStateName, prevState[dev], stateName, stage->state,
+           dev, connectCalls[dev], handle,
+           ncclSocketToString(&handle->connectAddr, addrStr));
+      prevState[dev] = stage->state;
+    }
+    
+    // Periodic logging for long-running states
+    if (connectCalls[dev] % 10000 == 0) {
+      char addrStr[SOCKET_NAME_MAXLEN+1];
+      INFO(NCCL_R2CC_LEVEL_1, "[%s] PROGRESS: dev=%d still in state=%d after %d calls, handle=%p, addr=%s", 
+           connectID[dev], dev, stage->state, connectCalls[dev], handle,
+           ncclSocketToString(&handle->connectAddr, addrStr));
+    }
+    
+    // Log if this is the first call but state is not 0
+    if (connectCalls[dev] == 1 && stage->state != ncclIbCommStateStart) {
+      WARN("[%s] SUSPICIOUS: First call to dev=%d but state=%d (expected 0)!", 
+           connectID[dev], dev, stage->state);
+    }
+  }
+  
   int ready;
   *sendComm = NULL;
 
@@ -1159,7 +1269,9 @@ ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm, ncclNet
   if (stage->state == ncclIbCommStateConnecting) goto ib_connect;
   if (stage->state == ncclIbCommStateConnected)  goto ib_send_ready;
   if (stage->state != ncclIbCommStateStart) {
-    WARN("Error: trying to connect already connected sendComm");
+    
+    // TRACE(NCCL_INIT, "dev %d already connected", dev);
+    WARN("Error: trying to connect already connected sendComm, state=%d", stage->state);
     return ncclInternalError;
   }
   stage->buffer = NULL;
@@ -1167,14 +1279,30 @@ ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm, ncclNet
   NCCLCHECK(ncclIbMalloc((void**)&comm, sizeof(struct ncclIbSendComm)));
   NCCLCHECKGOTO(ncclIbStatsInit(&comm->base.stats), ret, fail);
   NCCLCHECKGOTO(ncclSocketInit(&comm->base.sock, &handle->connectAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1), ret, fail);
+  // char line[SOCKET_NAME_MAXLEN+1];
+  // TRACE(NCCL_INIT|NCCL_NET,"Step1: Sender init Socket use connectInfo %s magic %ld", ncclSocketToString(&(handle->connectAddr), line), handle->magic);
+  
+
   stage->comm = comm;
   stage->state = ncclIbCommStateConnect;
   NCCLCHECKGOTO(ncclSocketConnect(&comm->base.sock), ret, fail);
+  TRACE(NCCL_INIT, "Step2: Sender send connect requet");
 
 ib_connect_check:
+  // TRACE(NCCL_INIT, "ncclIbConnect dev %d ib_connect_check", dev);
   /* since ncclSocketConnect is async, we must check if connection is complete */
   NCCLCHECKGOTO(ncclSocketReady(&comm->base.sock, &ready), ret, fail);
-  if (!ready) return ncclSuccess;
+  if (!ready) {
+    static int notReadyCount[8] = {0};
+    if (dev < 8) {
+      notReadyCount[dev]++;
+      if (notReadyCount[dev] % 10000 == 0) {
+        INFO(NCCL_R2CC, "ncclIbConnect: dev=%d socket not ready after %d checks", dev, notReadyCount[dev]);
+      }
+    }
+    return ncclSuccess;
+  }
+  // TRACE(NCCL_INIT, "ncclIbConnect dev %d ncclSocketReady", dev);
 
   // IB Setup
   struct ncclIbMergedDev* mergedDev;
@@ -1260,24 +1388,80 @@ ib_connect_check:
   strncpy(meta.devName, mergedDev->devName, MAX_MERGED_DEV_NAME);
 
   stage->state = ncclIbCommStateSend;
+  // TRACE(NCCL_INIT, "ncclIbConnect dev %d stage->state = ncclIbCommStateSend", dev);
   stage->offset = 0;
   NCCLCHECKGOTO(ncclIbMalloc((void**)&stage->buffer, sizeof(meta)), ret, fail);
 
   memcpy(stage->buffer, &meta, sizeof(meta));
 
 ib_send:
+  // TRACE(NCCL_INIT, "ncclIbConnect dev %d ib_send", dev);
   NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, stage->buffer, sizeof(meta), &stage->offset), ret, fail);
   if (stage->offset != sizeof(meta)) return ncclSuccess;
 
+  TRACE(NCCL_INIT, "Step4: Sender send metadata to receiver");
+  // TRACE(NCCL_INIT, "ncclIbConnect dev %d ib_send tage->offset == sizeof(meta)", dev);
+
   stage->state = ncclIbCommStateConnecting;
+  // TRACE(NCCL_INIT, "ncclIbConnect dev %d stage->state = ncclIbCommStateConnecting", dev);
   stage->offset = 0;
   // Clear the staging buffer for re-use
   memset(stage->buffer, 0, sizeof(meta));
 
 ib_connect:
+  // TRACE(NCCL_INIT, "ncclIbConnect dev %d ib_connect", dev);
   struct ncclIbConnectionMetadata remMeta;
+  
+  // R2CC: Log when we're stuck waiting for metadata
+  static int connectingLogCount[8] = {0};
+  static int lastOffset[8] = {0};
+  static int noProgressCount[8] = {0};
+  if (dev < 8) {
+    connectingLogCount[dev]++;
+    
+    // Track if we're making progress
+    if (stage->offset == lastOffset[dev]) {
+      noProgressCount[dev]++;
+    } else {
+      if (noProgressCount[dev] > 1000) {
+        INFO(NCCL_R2CC, "ncclIbConnect: dev=%d made progress after %d calls without progress, offset %d->%d", 
+             dev, noProgressCount[dev], lastOffset[dev], stage->offset);
+      }
+      noProgressCount[dev] = 0;
+      lastOffset[dev] = stage->offset;
+    }
+    
+    // Log more frequently to track progress
+    if (connectingLogCount[dev] == 1 || noProgressCount[dev] == 1000 || noProgressCount[dev] % 10000 == 0) {
+      INFO(NCCL_R2CC_LEVEL_1, "[%s] STATE=6 WAITING: dev=%d waiting for metadata, called %d times, offset=%d/%zu, no progress for %d calls", 
+           connectID[dev], dev, connectingLogCount[dev], stage->offset, sizeof(ncclIbConnectionMetadata), noProgressCount[dev]);
+    }
+    
+    // R2CC FIX: Reset connection if stuck in state=6 for too long (100K calls with no progress)
+    if (noProgressCount[dev] >= 100000 && noProgressCount[dev] % 10000 == 0) {
+      WARN("ncclIbConnect: dev=%d stuck in state=6 for %d calls without progress", 
+           dev, noProgressCount[dev]);
+      // Reset counters
+      // connectingLogCount[dev] = 0;
+      // noProgressCount[dev] = 0;
+      // lastOffset[dev] = 0;
+      // // Reset stage to state 0 to restart connection
+      // stage->state = ncclIbCommStateStart;
+      // stage->offset = 0;
+      // // Close socket to force reconnection
+      // if (comm->base.sock.fd != -1) {
+      //   ncclSocketClose(&comm->base.sock);
+      // }
+      // return ncclSuccess;  // Return to let the next call retry from beginning
+    }
+  }
+  
   NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->base.sock, stage->buffer, sizeof(ncclIbConnectionMetadata), &stage->offset), ret, fail);
   if (stage->offset != sizeof(remMeta)) return ncclSuccess;
+  
+  INFO(NCCL_R2CC_LEVEL_1, "[%s] METADATA RECEIVED: dev=%d got metadata from receiver after %d calls in state=6", 
+       connectID[dev], dev, connectingLogCount[dev]);
+  TRACE(NCCL_INIT, "Step7: Sender receive metadata from receiver");
 
   memcpy(&remMeta, stage->buffer, sizeof(ncclIbConnectionMetadata));
 
@@ -1329,6 +1513,10 @@ ib_connect:
 
     NCCLCHECKGOTO(ncclIbRtrQp(qp, &commDev->base.gidInfo, remQpInfo->qpn, remDevInfo, false), ret, fail);
     NCCLCHECKGOTO(ncclIbRtsQp(qp), ret, fail);
+    
+    // R2CC: Log QP ready for communication
+    INFO(NCCL_R2CC, "ncclIbConnect: QP ready - QP=%p (qpn=%u) for sendComm=%p, dev=%d, remoteQPN=%u", 
+         qp, qp->qp_num, comm, dev, remQpInfo->qpn);
   }
 
   if (link_layer == IBV_LINK_LAYER_ETHERNET ) { // RoCE
@@ -1341,15 +1529,34 @@ ib_connect:
     }
   }
 
+
   comm->base.ready = 1;
   stage->state = ncclIbCommStateConnected;
   stage->offset = 0;
+  TRACE(NCCL_INIT, "Step8: Sender finish setup and ready");
 
 ib_send_ready:
+  static int readyAttempts[8] = {0};
+  if (dev < 8) {
+    readyAttempts[dev]++;
+    if (readyAttempts[dev] % 1000 == 0) {
+      INFO(NCCL_R2CC, "ncclIbConnect: dev=%d attempting to send ready, attempt %d", 
+           dev, readyAttempts[dev]);
+    }
+  }
   NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, &comm->base.ready, sizeof(int), &stage->offset), ret, fail);
   if (stage->offset != sizeof(int)) return ncclSuccess;
-
+  TRACE(NCCL_INIT, "Step9: Sender send ready to receiver");
+  INFO(NCCL_R2CC, "ncclIbConnect: dev=%d successfully sent ready signal", dev);
   *sendComm = comm;
+  
+  // R2CC FIX: Reset handle stage to prevent reuse issues
+  if (handle) {
+    INFO(NCCL_R2CC, "ncclIbConnect: SUCCESS! dev=%d Resetting handle->stage state from %d to 0", dev, handle->stage.state);
+    // Only reset the stage, not the entire handle
+    memset(&handle->stage, 0, sizeof(handle->stage));
+  }
+  
 exit:
   if (stage->buffer) free(stage->buffer);
   stage->state = ncclIbCommStateStart;
@@ -1366,9 +1573,46 @@ ncclResult_t ncclIbAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle
   struct ncclIbListenComm* lComm = (struct ncclIbListenComm*)listenComm;
   struct ncclIbCommStage* stage = &lComm->stage;
   struct ncclIbRecvComm* rComm = (struct ncclIbRecvComm*)stage->comm;
+  
+  // R2CC debugging - Enhanced Accept state tracking
+  static int acceptCalls[8] = {0};
+  static int acceptCount = 0;
+  static int prevAcceptState[8] = {-1};
+  static char acceptID[8][64] = {{0}};
+  
+  if (stage->state == ncclIbCommStateStart) {
+    acceptCount++;
+    // Generate a unique ID for this accept attempt
+    if (lComm->dev < 8) {
+      snprintf(acceptID[lComm->dev], 64, "ACPT_%d_dev%d_%p", acceptCount, lComm->dev, lComm);
+    }
+  }
+  
+  if (lComm->dev < 8) {
+    acceptCalls[lComm->dev]++;
+    
+    // Log state transitions
+    if (prevAcceptState[lComm->dev] != stage->state) {
+      const char* stateNames[] = {"Start", "Connect", "?", "Accept", "Send", "Recv", "Connecting", "Connected", "PendingReady"};
+      const char* stateName = (stage->state >= 0 && stage->state <= 8) ? stateNames[stage->state] : "Unknown";
+      const char* prevStateName = (prevAcceptState[lComm->dev] >= 0 && prevAcceptState[lComm->dev] <= 8) ? stateNames[prevAcceptState[lComm->dev]] : "None";
+      
+      INFO(NCCL_R2CC_LEVEL_1, "[%s] ACCEPT STATE CHANGE: %s(%d) -> %s(%d), dev=%d, calls=%d, listenComm=%p",
+           acceptID[lComm->dev], prevStateName, prevAcceptState[lComm->dev], stateName, stage->state,
+           lComm->dev, acceptCalls[lComm->dev], lComm);
+      prevAcceptState[lComm->dev] = stage->state;
+    }
+    
+    // Periodic logging for long-running states
+    if (acceptCalls[lComm->dev] % 100000 == 0) {  // Log every 100K calls
+      INFO(NCCL_R2CC_LEVEL_1, "[%s] ACCEPT PROGRESS: dev=%d still in state=%d after %d calls, listenComm=%p", 
+           acceptID[lComm->dev], lComm->dev, stage->state, acceptCalls[lComm->dev], lComm);
+    }
+  }
+  
   int ready;
   *recvComm = NULL;
-
+  // TRACE(NCCL_INIT, "ib_recv, stage->state %d", stage->state);
   if (stage->state == ncclIbCommStateAccept) goto ib_accept_check;
   if (stage->state == ncclIbCommStateRecv) goto ib_recv;
   if (stage->state == ncclIbCommStateSend) goto ib_send;
@@ -1385,6 +1629,9 @@ ncclResult_t ncclIbAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle
   NCCLCHECKGOTO(ncclSocketInit(&rComm->base.sock), ret, fail);
   NCCLCHECKGOTO(ncclSocketAccept(&rComm->base.sock, &lComm->sock), ret, fail);
 
+  TRACE(NCCL_INIT, "Step3: Receiver accept connection");
+
+
 ib_accept_check:
   NCCLCHECKGOTO(ncclSocketReady(&rComm->base.sock, &ready), ret, fail);
   if (!ready) return ncclSuccess;
@@ -1395,8 +1642,63 @@ ib_accept_check:
   NCCLCHECKGOTO(ncclIbMalloc((void**)&stage->buffer, sizeof(remMeta)), ret, fail);
 
 ib_recv:
+  // R2CC: Log receiving progress
+  if (lComm->dev < 8 && stage->offset == 0) {
+    INFO(NCCL_R2CC, "ncclIbAccept[%d]: START receiving metadata, dev=%d, listenComm=%p", 
+         acceptCount, lComm->dev, lComm);
+  }
+  static int recvAttempts[8] = {0};
+  static int lastRecvOffset[8] = {0};
+  static int noRecvProgressCount[8] = {0};
+  
+  if (lComm->dev < 8) {
+    recvAttempts[lComm->dev]++;
+    
+    // Track receive progress
+    if (stage->offset == lastRecvOffset[lComm->dev]) {
+      noRecvProgressCount[lComm->dev]++;
+    } else {
+      noRecvProgressCount[lComm->dev] = 0;
+      lastRecvOffset[lComm->dev] = stage->offset;
+    }
+    
+    if (recvAttempts[lComm->dev] == 1 || recvAttempts[lComm->dev] % 100000 == 0) {
+      INFO(NCCL_R2CC, "ncclIbAccept: dev=%d in state=5 (Recv), waiting for metadata from sender, attempt=%d, offset=%d/%zu", 
+           lComm->dev, recvAttempts[lComm->dev], stage->offset, sizeof(remMeta));
+    }
+    
+    // R2CC FIX: Reset accept if stuck for too long (100K attempts with no progress)
+    if (noRecvProgressCount[lComm->dev] > 100000) {
+      WARN("ncclIbAccept: dev=%d stuck in state=5 for %d attempts without progress, resetting accept to retry", 
+           lComm->dev, noRecvProgressCount[lComm->dev]);
+      // Reset counters
+      recvAttempts[lComm->dev] = 0;
+      noRecvProgressCount[lComm->dev] = 0;
+      lastRecvOffset[lComm->dev] = 0;
+      // Reset stage to restart accept
+      stage->state = ncclIbCommStateStart;
+      stage->offset = 0;
+      // Close socket to force re-accept
+      if (rComm->base.sock.fd != -1) {
+        ncclSocketClose(&rComm->base.sock);
+      }
+      return ncclSuccess;  // Return to let the next call retry
+    }
+  }
+  
   NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_RECV, &rComm->base.sock, stage->buffer, sizeof(remMeta), &stage->offset), ret, fail);
-  if (stage->offset != sizeof(remMeta)) return ncclSuccess;
+  // TRACE(NCCL_INIT, "ib_recv, stage->offset %d", stage->offset);
+  if (stage->offset != sizeof(remMeta)) {
+    if (lComm->dev < 8 && recvAttempts[lComm->dev] % 100000 == 0) {
+      INFO(NCCL_R2CC, "ncclIbAccept: dev=%d still waiting for metadata, offset=%d/%zu", 
+           lComm->dev, stage->offset, sizeof(remMeta));
+    }
+    return ncclSuccess;
+  }
+  
+  INFO(NCCL_R2CC, "ncclIbAccept: dev=%d RECEIVED metadata from sender after %d attempts", lComm->dev, recvAttempts[lComm->dev]);
+  TRACE(NCCL_INIT, "Step5: Receiver recv metadata from sender");
+  // TRACE(NCCL_INIT, "ib_recv, copy back the received info");
 
   /* copy back the received info */
   memcpy(&remMeta, stage->buffer, sizeof(struct ncclIbConnectionMetadata));
@@ -1411,7 +1713,9 @@ ib_recv:
   struct ncclIbQp* qp;
 
   mergedDev = ncclIbMergedDevs + lComm->dev;
+  INFO(NCCL_R2CC, "ncclIbAccept: lComm->dev=%d, ncclNMergedIbDevs=%d", lComm->dev, ncclNMergedIbDevs);
   rComm->base.ndevs = mergedDev->ndevs;
+  INFO(NCCL_R2CC, "ncclIbAccept: mergedDev->ndevs=%d, mergedDev->devName=%s", mergedDev->ndevs, mergedDev->devName);
   rComm->base.nqps  = ncclParamIbQpsPerConn() * rComm->base.ndevs; // We must have at least 1 qp per-device
   rComm->base.isSend = false;
 
@@ -1474,6 +1778,10 @@ ib_recv:
     bool override_tc = (q == 0) ? true : false;
     NCCLCHECKGOTO(ncclIbRtrQp(qp->qp, &rCommDev->base.gidInfo, remMeta.qpInfo[q].qpn, remDevInfo, override_tc), ret, fail);
     NCCLCHECKGOTO(ncclIbRtsQp(qp->qp), ret, fail);
+    
+    // R2CC: Log QP ready for communication
+    INFO(NCCL_R2CC, "ncclIbAccept: QP ready - QP=%p (qpn=%u) for recvComm=%p, dev=%d, remoteQPN=%u", 
+         qp->qp, qp->qp->qp_num, rComm, lComm->dev, remMeta.qpInfo[q].qpn);
   }
 
   rComm->flushEnabled = ((ncclIbGdrSupport() == ncclSuccess || ncclIbDmaBufSupport(lComm->dev) == ncclSuccess)
@@ -1544,8 +1852,39 @@ ib_recv:
   memcpy(stage->buffer, &meta, sizeof(struct ncclIbConnectionMetadata));
 
 ib_send:
+  // R2CC: Log sending progress with no-progress tracking
+  static int sendAttempts[8] = {0};
+  static int lastSendOffset[8] = {0};
+  static int sendNoProgressCount[8] = {0};
+  if (lComm->dev < 8) {
+    sendAttempts[lComm->dev]++;
+    
+    // Track if we're making progress
+    if (stage->offset == lastSendOffset[lComm->dev]) {
+      sendNoProgressCount[lComm->dev]++;
+    } else {
+      if (sendNoProgressCount[lComm->dev] > 1000) {
+        INFO(NCCL_R2CC, "ncclIbAccept: dev=%d send made progress after %d calls without progress, offset %d->%d", 
+             lComm->dev, sendNoProgressCount[lComm->dev], lastSendOffset[lComm->dev], stage->offset);
+      }
+      sendNoProgressCount[lComm->dev] = 0;
+      lastSendOffset[lComm->dev] = stage->offset;
+    }
+    
+    if (sendAttempts[lComm->dev] == 1 || sendNoProgressCount[lComm->dev] == 10000) {
+      INFO(NCCL_R2CC, "ncclIbAccept: dev=%d in state=4 (Send), sending metadata, attempt=%d, offset=%d/%zu, no progress for %d calls", 
+           lComm->dev, sendAttempts[lComm->dev], stage->offset, sizeof(struct ncclIbConnectionMetadata), sendNoProgressCount[lComm->dev]);
+    }
+  }
+  
   NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, &rComm->base.sock, stage->buffer, sizeof(struct ncclIbConnectionMetadata), &stage->offset), ret, fail);
-  if (stage->offset < sizeof(struct ncclIbConnectionMetadata)) return ncclSuccess;
+
+  if (stage->offset < sizeof(struct ncclIbConnectionMetadata)) {
+    return ncclSuccess;
+  }
+  
+  INFO(NCCL_R2CC, "ncclIbAccept: dev=%d SENT metadata to sender after %d attempts", lComm->dev, sendAttempts[lComm->dev]);
+  TRACE(NCCL_INIT, "Step6: Receiver send metadata to sender");
 
   stage->offset = 0;
   stage->state = ncclIbCommStatePendingReady;
@@ -1553,8 +1892,18 @@ ib_send:
 ib_recv_ready:
   NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_RECV,  &rComm->base.sock, &rComm->base.ready, sizeof(int), &stage->offset), ret, fail);
   if (stage->offset != sizeof(int)) return ncclSuccess;
+    TRACE(NCCL_INIT, "Step10: Receiver receive ready from sender");
 
   *recvComm = rComm;
+  // TRACE(NCCL_INIT, "*recvComm = rComm");
+  
+  // R2CC FIX: Reset entire lComm stage to prevent reuse issues  
+  if (listenComm && lComm) {
+    INFO(NCCL_R2CC, "ncclIbAccept: SUCCESS! dev=%d Resetting entire lComm stage from state %d", lComm->dev, lComm->stage.state);
+    // Clear the entire stage structure to ensure clean state for reuse
+    memset(&lComm->stage, 0, sizeof(lComm->stage));
+  }
+  
 exit:
   /* reset lComm stage */
   if (stage->buffer) free(stage->buffer);
@@ -1578,6 +1927,7 @@ ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbReque
       r->devBases[1] = NULL;
       r->events[0] = r->events[1] = 0;
       *req = r;
+      INFO(NCCL_R2CC, "ncclIbGetRequest: Allocated request slot %d, req=%p, base=%p", i, r, base);
       return ncclSuccess;
     }
   }
@@ -1587,6 +1937,7 @@ ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbReque
 }
 
 ncclResult_t ncclIbFreeRequest(struct ncclIbRequest* r) {
+  INFO(NCCL_R2CC, "ncclIbFreeRequest: Freeing request %p, base=%p", r, r ? r->base : NULL);
   r->type = NCCL_NET_IB_REQ_UNUSED;
   return ncclSuccess;
 }
@@ -1661,11 +2012,26 @@ ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, ui
   ncclResult_t ret = ncclSuccess;
   assert(size > 0);
   struct ncclIbNetCommBase* base = (struct ncclIbNetCommBase*) comm;
+  
+  // R2CC: Log registration details
+  INFO(NCCL_R2CC, "ncclIbRegMrDmaBuf: comm=%p, data=%p, size=%lu, type=%d, ndevs=%d, isSend=%d", 
+       comm, data, size, type, base->ndevs, base->isSend);
+  
   struct ncclIbMrHandle* mhandleWrapper = (struct ncclIbMrHandle*) malloc(sizeof(struct ncclIbMrHandle));
   for (int i = 0; i < base->ndevs; i++) {
     // Each ncclIbNetCommDevBase is at different offset in send and recv netComms
     struct ncclIbNetCommDevBase* devComm = ncclIbGetNetCommDevBase(base, i);
+    
+    // R2CC: Log device details
+    INFO(NCCL_R2CC, "  Registering with dev[%d]: devComm=%p, pd=%p, ibDevN=%d", 
+         i, devComm, devComm->pd, devComm->ibDevN);
+    
     NCCLCHECKGOTO(ncclIbRegMrDmaBufInternal(devComm, data, size, type, offset, fd, mhandleWrapper->mrs + i), ret, fail);
+    
+    // R2CC: Log MR details after registration
+    struct ibv_mr* mr = mhandleWrapper->mrs[i];
+    INFO(NCCL_R2CC, "  Registered MR[%d]: mr=%p, addr=%p, length=%lu, lkey=0x%x, rkey=0x%x, pd=%p",
+         i, mr, mr->addr, mr->length, mr->lkey, mr->rkey, mr->pd);
   }
   *mhandle = (void*) mhandleWrapper;
 exit:
@@ -1720,6 +2086,7 @@ ncclResult_t ncclIbDeregMr(void* comm, void* mhandle) {
 NCCL_PARAM(IbSplitDataOnQps, "IB_SPLIT_DATA_ON_QPS", 0);
 
 ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
+  // TRACE(NCCL_INIT, "ncclIbMultiSend");
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
   volatile struct ncclIbSendFifo* slots = comm->fifo[slot];
   int nreqs = slots[0].nreqs;
@@ -1749,6 +2116,9 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
     for (int r=0; r<nreqs; r++) sizes[r] = reqs[r]->send.size;
     comm->remSizesFifo.sge.addr = (uint64_t)sizes;
     comm->remSizesFifo.sge.length = nreqs*sizeof(int);
+    if (nreqs > NCCL_NET_IB_MAX_RECVS) {
+      WARN("R2CC: Invalid nreqs %d > MAX_RECVS %d in ncclIbIsend", nreqs, NCCL_NET_IB_MAX_RECVS);
+    }
   }
 
   struct ibv_send_wr* lastWr = comm->wrs+nreqs-1;
@@ -1806,6 +2176,18 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
     }
 
     struct ibv_send_wr* bad_wr;
+    // TRACE(NCCL_INIT, "ncclIbMultiSend wrap_ibv_post_send qp=%d [%s]", i, 
+    //  ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })()
+    // );
+
+    // R2CC: Log QP info for send with WR details
+    INFO(NCCL_R2CC, "ncclIbMultiSend: Posting send on QP=%p (qpn=%u), comm=%p, devIndex=%d, qpIndex=%d", 
+         qp->qp, qp->qp->qp_num, comm, devIndex, i);
+    if (comm->wrs[0].sg_list) {
+      INFO(NCCL_R2CC, "  WR[0]: addr=0x%lx, length=%u, lkey=0x%x, remote_addr=0x%lx, rkey=0x%x",
+           comm->wrs[0].sg_list->addr, comm->wrs[0].sg_list->length, comm->wrs[0].sg_list->lkey,
+           comm->wrs[0].wr.rdma.remote_addr, comm->wrs[0].wr.rdma.rkey);
+    }
     NCCLCHECK(wrap_ibv_post_send(qp->qp, comm->wrs, &bad_wr));
 
     for (int r=0; r<nreqs; r++) {
@@ -1823,26 +2205,60 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
 }
 
 ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
+  // TRACE(NCCL_INIT, "ibisend start");
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
+  if(comm == NULL) {
+    // TRACE(NCCL_INIT, "sendComm_backup is NULL");
+  }
+    // TRACE(NCCL_INIT, "ibisend 0.1, comm->base.ready = %d", comm->base.ready);
   if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIsend() called when comm->base.ready == 0"); return ncclInternalError; }
+    // TRACE(NCCL_INIT, "ibisend 0.2");
   if (comm->base.ready == 0) { *request = NULL; return ncclSuccess; }
+
+  // R2CC: Debug info for send operation with detailed MR info
+  INFO(NCCL_R2CC, "ncclIbIsend: comm=%p, ndevs=%d, data=%p, size=%d, mhandle=%p", 
+        comm, comm->base.ndevs, data, size, mhandle);
+  if (mhandle) {
+    struct ncclIbMrHandle* mh = (struct ncclIbMrHandle*)mhandle;
+    if (mh->mrs[0]) {
+      INFO(NCCL_R2CC, "  Using MR: mr=%p, addr=%p, length=%lu, lkey=0x%x, rkey=0x%x, pd=%p",
+           mh->mrs[0], mh->mrs[0]->addr, mh->mrs[0]->length, 
+           mh->mrs[0]->lkey, mh->mrs[0]->rkey, mh->mrs[0]->pd);
+    }
+  }
+
+    // TRACE(NCCL_INIT, "ibisend 0.3");
   NCCLCHECK(ncclIbStatsCheckFatalCount(&comm->base.stats,__func__));
+
+  // TRACE(NCCL_INIT, "ncclIbIsend");
+    // TRACE(NCCL_INIT, "ibisend 0.4");
 
   struct ncclIbMrHandle* mhandleWrapper = (struct ncclIbMrHandle*) mhandle;
 
-  // Wait for the receiver to have posted the corresponding receive
   int nreqs = 0;
   volatile struct ncclIbSendFifo* slots;
 
+  // TRACE(NCCL_INIT, "ibisend 1");
   int slot = (comm->fifoHead) % MAX_REQUESTS;
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
   slots = comm->fifo[slot];
   uint64_t idx = comm->fifoHead+1;
-  if (slots[0].idx != idx) { *request = NULL; return ncclSuccess; }
+
+  // TRACE(NCCL_INIT, "slots[0].idx=%lu"); 
+
+  if (slots[0].idx != idx) { 
+    //TRACE(NCCL_INIT, "slots[0].idx != idx");
+    *request = NULL; 
+    return ncclSuccess; 
+  }else{
+    //TRACE(NCCL_INIT, "slots[0].idx == idx");
+  }
   nreqs = slots[0].nreqs;
   // Wait until all data has arrived
   for (int r=1; r<nreqs; r++) while(slots[r].idx != idx);
   __sync_synchronize(); // order the nreqsPtr load against tag/rkey/addr loads below
+
+  // TRACE(NCCL_INIT, "ibisend 2");
   for (int r=0; r<nreqs; r++) {
     if (reqs[r] != NULL || slots[r].tag != tag) continue;
 
@@ -1856,9 +2272,12 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
         r, nreqs, tag, ncclSocketToString(&addr, line), slots[r].size, slots[r].addr, slots[r].rkeys[0]);
       return ncclInternalError;
     }
+    // TRACE(NCCL_INIT, "ibisend 2.1");
 
     struct ncclIbRequest* req;
+    INFO(NCCL_R2CC, "ncclIbIsend: About to get request, comm=%p", comm);
     NCCLCHECK(ncclIbGetRequest(&comm->base, &req));
+    INFO(NCCL_R2CC, "ncclIbIsend: Got request %p for send", req);
     req->type = NCCL_NET_IB_REQ_SEND;
     req->sock = &comm->base.sock;
     req->base = &comm->base;
@@ -1882,6 +2301,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
       qpIndex = (qpIndex+1)%comm->base.nqps;
     }
 
+    // TRACE(NCCL_INIT, "ibisend 2.2");
     // Store all lkeys
     for (int i = 0; i < comm->base.ndevs; i++) {
       req->send.lkeys[i] = mhandleWrapper->mrs[i]->lkey;
@@ -1894,17 +2314,23 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
       if (reqs[r] == NULL) return ncclSuccess;
     }
 
+      // TRACE(NCCL_INIT, "ibisend 2.3");
     TIME_START(0);
     NCCLCHECK(ncclIbMultiSend(comm, slot));
+
+      // TRACE(NCCL_INIT, "ibisend 2.4");
 
     // Clear slots[0]->nreqs, as well as other fields to help debugging and sanity checks
     memset((void*)slots, 0, sizeof(struct ncclIbSendFifo));
     memset(reqs, 0, NCCL_NET_IB_MAX_RECVS*sizeof(struct ncclIbRequest*));
     comm->fifoHead++;
     TIME_STOP(0);
+
+      // TRACE(NCCL_INIT, "ibisend 2.5");
     return ncclSuccess;
   }
 
+  // TRACE(NCCL_INIT, "ibisend 3");
   *request = NULL;
   return ncclSuccess;
 }
@@ -1920,6 +2346,10 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
 
   // Select the next devIndex (local) and QP to use for posting this CTS message
   // Since QPs are initialized by striping across devIndex, we can simply assign this to the same value
+  if (comm->base.ndevs == 0) {
+    WARN("ncclIbPostFifo: comm->base.ndevs is 0! This will cause SIGFPE");
+    return ncclInternalError;
+  }
   ncclIbQp* ctsQp = comm->base.qps + comm->base.devIndex;
   comm->base.devIndex = (comm->base.devIndex + 1) % comm->base.ndevs;
 
@@ -1975,11 +2405,17 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
   // This works out that each fifo posting QP gets drained
   if (slot == ctsQp->devIndex) {
     wr.send_flags |= IBV_SEND_SIGNALED;
+    // wr.wr_id = req - comm->base.reqs;
     wr.wr_id = req - comm->base.reqs;
     ncclIbAddEvent(req, ctsQp->devIndex, &comm->devs[ctsQp->devIndex].base);
   }
 
   struct ibv_send_wr* bad_wr;
+  //TRACE(NCCL_INIT, "ncclIbPostFifo wrap_ibv_post_send [%s]",  ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })());
+  
+  // R2CC: Log QP info for PostFifo (CTS message)
+  INFO(NCCL_R2CC, "ncclIbPostFifo: Posting CTS on QP=%p (qpn=%u), comm=%p, devIndex=%d", 
+       ctsQp->qp, ctsQp->qp->qp_num, comm, ctsQp->devIndex);
   NCCLCHECK(wrap_ibv_post_send(ctsQp->qp, &wr, &bad_wr));
   comm->remFifo.fifoTail++;
 
@@ -1987,12 +2423,30 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
 }
 
 ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
+  //return ncclSuccess;
+
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
   if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIrecv() called when comm->base.ready == 0"); return ncclInternalError; }
   if (comm->base.ready == 0) { *request = NULL; return ncclSuccess; }
   if (n > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
+  
+  // R2CC: Debug info for receive operation with detailed MR info
+  for (int i = 0; i < n && i < 1; i++) {  // Only log first buffer
+    INFO(NCCL_R2CC, "ncclIbIrecv: comm=%p, ndevs=%d, data[0]=%p, size[0]=%d, mhandle[0]=%p", 
+          comm, comm->base.ndevs, data[i], sizes[i], mhandles[i]);
+    if (mhandles[i]) {
+      struct ncclIbMrHandle* mh = (struct ncclIbMrHandle*)mhandles[i];
+      if (mh->mrs[0]) {
+        INFO(NCCL_R2CC, "  Using MR: mr=%p, addr=%p, length=%lu, lkey=0x%x, rkey=0x%x, pd=%p",
+             mh->mrs[0], mh->mrs[0]->addr, mh->mrs[0]->length, 
+             mh->mrs[0]->lkey, mh->mrs[0]->rkey, mh->mrs[0]->pd);
+      }
+    }
+  }
+  
   NCCLCHECK(ncclIbStatsCheckFatalCount(&comm->base.stats,__func__));
 
+  //TRACE(NCCL_NET, "Irecv");
   struct ncclIbRequest* req;
   NCCLCHECK(ncclIbGetRequest(&comm->base, &req));
   req->type = NCCL_NET_IB_REQ_RECV;
@@ -2005,6 +2459,8 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
 
   struct ibv_recv_wr wr;
   memset(&wr, 0, sizeof(wr));
+
+  // wr_id = req - comm->base.reqs;
   wr.wr_id = req - comm->base.reqs;
   wr.sg_list = NULL;
   wr.num_sge = 0;
@@ -2018,6 +2474,11 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
   for (int i = 0; i < nqps; i++) {
     struct ncclIbQp* qp = comm->base.qps + comm->base.qpIndex;
     ncclIbAddEvent(req, qp->devIndex, &comm->devs[qp->devIndex].base);
+    //TRACE(NCCL_INIT, "ncclIbIrecv wrap_ibv_post_recv qp=%d [%s]",  i, ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })());
+    
+    // R2CC: Log QP info for receive
+    INFO(NCCL_R2CC, "ncclIbIrecv: Posting recv on QP=%p (qpn=%u), comm=%p, qpIndex=%d, devIndex=%d", 
+         qp->qp, qp->qp->qp_num, comm, comm->base.qpIndex, qp->devIndex);
     NCCLCHECK(wrap_ibv_post_recv(qp->qp, &wr, &bad_wr));
     comm->base.qpIndex = (comm->base.qpIndex+1)%comm->base.nqps;
   }
@@ -2061,6 +2522,8 @@ ncclResult_t ncclIbIflush(void* recvComm, int n, void** data, int* sizes, void**
 
     TIME_START(4);
     struct ibv_send_wr* bad_wr;
+    TRACE(NCCL_INIT, "ncclIbIflush wrap_ibv_post_send [%s]", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })());
+
     NCCLCHECK(wrap_ibv_post_send(comm->devs[i].gpuFlush.qp.qp, &wr, &bad_wr));
     TIME_STOP(4);
 
@@ -2073,20 +2536,147 @@ ncclResult_t ncclIbIflush(void* recvComm, int n, void** data, int* sizes, void**
 
 #define HCA_NAME(req, index) ((req)->devBases[(index)]->pd->context->device->name)
 
+char* operations[] = {"default: ", "recvProxyProgress:", "sendProxyProgress:"};
+
+static const char* r2ccGetDisconnectedEnv() {
+  const char* env = getenv("R2CC_DISCONNECTED_HCA");
+  if (!env || env[0] == '\0') env = getenv("R2CC_Disconnected_HCA");
+  return env;
+}
+
+static int r2ccGetDisconnectedStep() {
+  const char* env = getenv("R2CC_DISCONNECTED_STEP");
+  if (!env || env[0] == '\0') env = getenv("R2CC_Disconnected_STEP");
+  if (!env || env[0] == '\0') return 10;
+  return atoi(env);
+}
+
+static bool r2ccTokenMatchesHca(const char* start, int len, const char* devName, int devIndex) {
+  if (len <= 0) return false;
+  if (devName && (int)strlen(devName) == len && strncmp(start, devName, len) == 0) return true;
+  int value = 0;
+  bool numeric = true;
+  for (int i = 0; i < len; i++) {
+    if (!std::isdigit(static_cast<unsigned char>(start[i]))) { numeric = false; break; }
+    value = value * 10 + (start[i] - '0');
+  }
+  if (!numeric) return false;
+  if (value == devIndex) return true;
+  if (devName) {
+    const char* underscore = strrchr(devName, '_');
+    if (underscore && *(underscore + 1) != '\0') {
+      int suffix = atoi(underscore + 1);
+      if (suffix == value) return true;
+    }
+  }
+  return false;
+}
+
+static bool r2ccMatchDisconnectedHca(const char* devName, int devIndex) {
+  const char* env = r2ccGetDisconnectedEnv();
+  if (!env || env[0] == '\0') return false;
+  const char* p = env;
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == ',') p++;
+    if (*p == '\0') break;
+    const char* start = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != ',') p++;
+    int len = (int)(p - start);
+    if (r2ccTokenMatchesHca(start, len, devName, devIndex)) return true;
+  }
+  return false;
+}
+
+static std::atomic<uint64_t> r2ccInjectedMask{0};
+
+static bool r2ccShouldInjectFailure(struct ncclIbRequest* r) {
+  const char* env = r2ccGetDisconnectedEnv();
+  if (!env || env[0] == '\0') return false;
+  int stepToFail = r2ccGetDisconnectedStep();
+  if (stepToFail < 0) return false;
+  if (r->step != stepToFail) return false;
+  if (r->channel < 0 || r->channel >= 64) return false;
+
+  bool match = false;
+  int ndevs = r->base ? r->base->ndevs : 0;
+  for (int i = 0; i < ndevs && i < NCCL_IB_MAX_DEVS_PER_NIC; i++) {
+    struct ncclIbNetCommDevBase* base = r->devBases[i];
+    if (!base || !base->pd || !base->pd->context || !base->pd->context->device) continue;
+    const char* name = base->pd->context->device->name;
+    if (r2ccMatchDisconnectedHca(name, base->ibDevN)) { match = true; break; }
+  }
+  if (!match) return false;
+
+  uint64_t bit = 1ull << r->channel;
+  uint64_t old = r2ccInjectedMask.fetch_or(bit);
+  if (old & bit) return false;
+  return true;
+}
+
 ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
   struct ncclIbRequest *r = (struct ncclIbRequest*)request;
+  static int testCount = 0;
+  testCount++;
+  if (testCount % 100000 == 0) {
+    INFO(NCCL_R2CC, "ncclIbTest: Called %d times, testing request %p", testCount, r);
+  }
+  if(r->timeoutRequest!=NULL){
+    int childDone = 0;
+    ncclIbTest(r->timeoutRequest, &childDone, NULL);
+    if(childDone == -1){
+      NCCLCHECK(ncclIbFreeRequest(r));
+      *done = -1;  // net disconnection.
+      return ncclSuccess;
+    }
+    if(childDone == 0){
+      *done = 2; //child request in progress, update timer.
+      return ncclSuccess;
+    }
+    if(childDone == 1){
+      r->timeoutRequest = NULL; 
+      *done = 2; // net has no issue, update timer
+      return ncclSuccess;
+    }
+  }
+
+  if (r2ccShouldInjectFailure(r)) {
+    INFO(NCCL_R2CC, "R2CC inject failure: channel=%d step=%d env=%s", r->channel, r->step, r2ccGetDisconnectedEnv());
+    r->failed = 1;
+    NCCLCHECK(ncclIbFreeRequest(r));
+    *done = -1;
+    return ncclSuccess;
+  }
+
+
+  if(r->failed ==1){
+    TRACE(NCCL_INIT, "%s request args_id=%d, channel=%d, step=%d, comm=%p failed", operations[r->operation], r->id, r->channel, r->step, r->comm);
+    
+    NCCLCHECK(ncclIbFreeRequest(r));
+    *done = -1;
+    return ncclSuccess;
+  }
   *done = 0;
   while (1) {
     NCCLCHECK(ncclIbStatsCheckFatalCount(&r->base->stats,__func__));
     if (r->events[0] == 0 && r->events[1] == 0) {
-      TRACE(NCCL_NET, "r=%p done", r);
-      *done = 1;
+      if(r->failed ==1){
+        TRACE(NCCL_INIT, "%s request args_id=%d, channel=%d, step=%d, comm=%p failed", operations[r->operation], r->id, r->channel, r->step, r->comm);
+        NCCLCHECK(ncclIbFreeRequest(r));
+        *done = -1;
+        return ncclSuccess;
+      }
+
+     // TRACE(NCCL_NET, "r=%p done", r);
+      if(*done != -1){
+        *done = 1;
+      }
       if (sizes && r->type == NCCL_NET_IB_REQ_RECV) {
         for (int i=0; i<r->nreqs; i++) sizes[i] = r->recv.sizes[i];
       }
       if (sizes && r->type == NCCL_NET_IB_REQ_SEND) {
         sizes[0] = r->send.size;
       }
+      INFO(NCCL_R2CC, "ncclIbTest: Completed successfully, freeing request %p, type=%d", r, r->type);
       NCCLCHECK(ncclIbFreeRequest(r));
       return ncclSuccess;
     }
@@ -2108,6 +2698,65 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
           if (wc->status != IBV_WC_SUCCESS) {
             union ncclSocketAddress addr;
             ncclSocketGetAddr(r->sock, &addr);
+            struct ncclIbRequest* req = r->base->reqs+(wc->wr_id & 0xff);
+            req->failed = 1;
+
+            if (req) {
+                const char* opcode_str = NULL;
+                switch (wc->opcode) {
+                    case IBV_WC_SEND:
+                        opcode_str = "IBV_WC_SEND";
+                        break;
+                    case IBV_WC_RDMA_WRITE:
+                        opcode_str = "IBV_WC_RDMA_WRITE";
+                        break;
+                    case IBV_WC_RDMA_READ:
+                        opcode_str = "IBV_WC_RDMA_READ";
+                        break;
+                    case IBV_WC_COMP_SWAP:
+                        opcode_str = "IBV_WC_COMP_SWAP";
+                        break;
+                    case IBV_WC_FETCH_ADD:
+                        opcode_str = "IBV_WC_FETCH_ADD";
+                        break;
+                    case IBV_WC_BIND_MW:
+                        opcode_str = "IBV_WC_BIND_MW";
+                        break;
+                    case IBV_WC_RECV:
+                        opcode_str = "IBV_WC_RECV";
+                        break;
+                    case IBV_WC_RECV_RDMA_WITH_IMM:
+                        opcode_str = "IBV_WC_RECV_RDMA_WITH_IMM";
+                        break;
+                    default:
+                        opcode_str = "UNKNOWN_OPCODE";
+                        break;
+                }
+                TRACE(NCCL_INIT, "%s request args_id=%d, channel=%d, step=%d, comm=%p %s !IBV_WC_SUCCESS",
+                      operations[req->operation], req->id, req->channel, req->step, req->comm, opcode_str);
+            }
+
+
+
+
+
+            if (req && req->type == NCCL_NET_IB_REQ_SEND) {
+              for (int j = 0; j < req->nreqs; j++) {
+                struct ncclIbRequest* sendReq = r->base->reqs+((wc->wr_id >> (j*8)) & 0xff);
+                sendReq->failed = 1;
+              }
+            } else {
+              if (req && wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+                if (req->type != NCCL_NET_IB_REQ_RECV) {
+                  WARN("NET/IB: wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM and req->type=%d", req->type);
+                  return ncclInternalError;
+                }
+              }
+              req->failed = 1;
+            }
+
+            continue;
+
             char localGidString[INET6_ADDRSTRLEN] = "";
             char remoteGidString[INET6_ADDRSTRLEN] = "";
             const char* localGidStr = NULL, *remoteGidStr = NULL;
@@ -2119,19 +2768,64 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
             char line[SOCKET_NAME_MAXLEN+1];
             char *hcaName = r->devBases[i]->pd->context->device->name;
             WARN("NET/IB: Got completion from peer %s with status=%d opcode=%d len=%d vendor err %d (%s)%s%s%s%s hca %s",
-                ncclSocketToString(&addr, line), wc->status, wc->opcode, wc->byte_len, wc->vendor_err, reqTypeStr[r->type],
-                localGidStr ?  " localGid ":"", localGidString, remoteGidStr ? " remoteGids":"", remoteGidString, hcaName);
-            return ncclRemoteError;
+               ncclSocketToString(&addr, line), wc->status, wc->opcode, wc->byte_len, wc->vendor_err, reqTypeStr[r->type],
+               localGidStr ?  " localGid ":"", localGidString, remoteGidStr ? " remoteGids":"", remoteGidString, hcaName);
+            
+            //*done = -1;
+            return ncclSuccess;
+            // return ncclRemoteError;
           }
+
+
+          
 
           union ncclSocketAddress addr;
           ncclSocketGetAddr(r->sock, &addr);
           struct ncclIbRequest* req = r->base->reqs+(wc->wr_id & 0xff);
 
+          if (req) {
+              const char* opcode_str = NULL;
+              switch (wc->opcode) {
+                  case IBV_WC_SEND:
+                      opcode_str = "IBV_WC_SEND";
+                      break;
+                  case IBV_WC_RDMA_WRITE:
+                      opcode_str = "IBV_WC_RDMA_WRITE";
+                      break;
+                  case IBV_WC_RDMA_READ:
+                      opcode_str = "IBV_WC_RDMA_READ";
+                      break;
+                  case IBV_WC_COMP_SWAP:
+                      opcode_str = "IBV_WC_COMP_SWAP";
+                      break;
+                  case IBV_WC_FETCH_ADD:
+                      opcode_str = "IBV_WC_FETCH_ADD";
+                      break;
+                  case IBV_WC_BIND_MW:
+                      opcode_str = "IBV_WC_BIND_MW";
+                      break;
+                  case IBV_WC_RECV:
+                      opcode_str = "IBV_WC_RECV";
+                      break;
+                  case IBV_WC_RECV_RDMA_WITH_IMM:
+                      opcode_str = "IBV_WC_RECV_RDMA_WITH_IMM";
+                      break;
+                  default:
+                      opcode_str = "UNKNOWN_OPCODE";
+                      break;
+              }
+              TRACE(NCCL_INIT, "%s request args_id=%d, channel=%d, step=%d, comm=%p %s IBV_WC_SUCCESS",
+                    operations[req->operation], req->id, req->channel, req->step, req->comm, opcode_str);
+          }
+
+
+
+
+
           #ifdef ENABLE_TRACE
           char line[SOCKET_NAME_MAXLEN+1];
           TRACE(NCCL_NET, "Got completion from peer %s with status=%d opcode=%d len=%d wr_id=%ld r=%p type=%d events={%d,%d}, i=%d",
-              ncclSocketToString(&addr, line), wc->status, wc->opcode,wc->byte_len, wc->wr_id, req, req->type, req->events[0], req->events[1], i);
+             ncclSocketToString(&addr, line), wc->status, wc->opcode,wc->byte_len, wc->wr_id, req, req->type, req->events[0], req->events[1], i);
           #endif
           if (req && req->type == NCCL_NET_IB_REQ_SEND) {
             for (int j = 0; j < req->nreqs; j++) {
@@ -2157,10 +2851,9 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
         }
         // Once the IB fatal event is reported in the async thread, we want to propagate this error
         // to communicator and prevent further polling to reduce error pollution.
-        NCCLCHECK(ncclIbStatsCheckFatalCount(&ncclIbDevs[r->devBases[i]->ibDevN].stats,__func__));
+        // NCCLCHECK(ncclIbStatsCheckFatalCount(&ncclIbDevs[r->devBases[i]->ibDevN].stats,__func__));
       }
     }
-
     // If no CQEs found on any device, return and come back later
     if (totalWrDone == 0) return ncclSuccess;
   }
@@ -2218,6 +2911,179 @@ ncclResult_t ncclIbCloseListen(void* listenComm) {
   return ncclSuccess;
 }
 
+
+// ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
+// ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
+
+
+ncclResult_t ncclIbSetBackup(void* sendComm) {
+  struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
+  volatile struct ncclIbSendFifo* slots;
+  slots = comm->fifo[0];
+  slots[0].useBackup = 1;
+  __sync_synchronize();
+  TRACE(NCCL_INIT, "ncclIbSetBackup  slots[0].useBackup = %d",  slots[0].useBackup);
+  return ncclSuccess;
+}
+
+ncclResult_t ncclIbTestBackup(void* recvComm, int* done) {
+  struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
+  volatile struct ncclIbSendFifo* slots = comm->remFifo.elems[0];
+  __sync_synchronize();
+  if (slots[0].useBackup == 1) {
+    *done = -1;
+  }
+  TRACE(NCCL_INIT, "ncclIbTestBackup  slots[0].useBackup = %d",  slots[0].useBackup);
+  return ncclSuccess;
+}
+
+ncclResult_t setRequestChannel(void** request, int channel) {
+  ((ncclIbRequest*)(*request))->channel = channel;
+  return ncclSuccess;
+}
+
+int getRequestChannel(void* request) {
+  return ((ncclIbRequest*)(request))->channel;
+}
+
+ncclResult_t setRequestId(void** request, int id) {
+  ((ncclIbRequest*)(*request))->id = id;
+  return ncclSuccess;
+}
+
+int getRequestId(void* request){
+  return ((ncclIbRequest*)(request))->id;
+}
+
+
+ncclResult_t setRequestComm(void** request, void* comm) {
+  ((ncclIbRequest*)(*request))->comm = comm;
+  return ncclSuccess;
+}
+
+void* getRequestComm(void* request){
+  return ((ncclIbRequest*)(request))->comm;
+}
+
+ncclResult_t setRequestStep(void** request, int step) {
+  ((ncclIbRequest*)(*request))->step = step;
+  return ncclSuccess;
+}
+
+// 0 default, 1 recv, 2 send
+ncclResult_t setRequestOperation(void** request, int operation ) {
+  ((ncclIbRequest*)(*request))->operation = operation; 
+  return ncclSuccess;
+}
+
+
+int log_counter2 = 0;
+ncclResult_t checkSwitchToBackup(void* sendComm, int* change) {
+  *change = 0;
+  struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
+  if(comm == NULL) {
+    TRACE(NCCL_INIT, "sendProxyProgress: sendComm_backup is NULL");
+  }
+  if (comm->base.ready == 0) { 
+    TRACE(NCCL_INIT, "sendProxyProgress: comm->base.ready == 0");
+    return ncclSuccess; 
+  }
+  NCCLCHECK(ncclIbStatsCheckFatalCount(&comm->base.stats,__func__));
+  volatile struct ncclIbSendFifo* slots;
+  int slot = (comm->fifoHead) % MAX_REQUESTS;
+  slots = comm->fifo[slot];
+  uint64_t idx = comm->fifoHead+1;
+
+  
+
+  //log_counter2++;
+  //if(log_counter2 %100007==0){
+  //  // better to keep this trace, as it can force to flush slots[0].idx.
+  //  TRACE(NCCL_INIT, "sendProxyProgress:idx = (comm->fifoHead=%" PRIu64 " + 1), slots[0].idx=%" PRIu64, comm->fifoHead, slots[0].idx);  
+  // }
+
+  uint64_t k = slots[0].idx;
+  if(k == 1){
+    TRACE(NCCL_INIT, "sendProxyProgress: got message");  
+
+  }
+
+  if (slots[0].idx != idx) { 
+     //TRACE(NCCL_INIT, "backup slots[0].idx != idx");
+     return ncclSuccess;
+  }else{
+    // TRACE(NCCL_INIT, "sendProxyProgress: done=-1 usebackup=1 idx = (comm->fifoHead=%" PRIu64 " + 1), slots[0].idx=%" PRIu64, comm->fifoHead, slots[0].idx);  
+    *change = 1;
+    return ncclSuccess;
+  }
+}
+
+
+
+ncclResult_t ncclIbTimeoutPost(void* recvComm, void* request) {
+  struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
+
+  if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIrecv() called when comm->base.ready == 0"); return ncclInternalError; }
+  if (comm->base.ready == 0) { request = NULL; return ncclSuccess; }
+  NCCLCHECK(ncclIbStatsCheckFatalCount(&comm->base.stats,__func__));
+
+  //TRACE(NCCL_NET, "Irecv");
+  struct ncclIbRequest* req;
+  NCCLCHECK(ncclIbGetRequest(&comm->base, &req));
+  req->type = NCCL_NET_IB_REQ_RECV;
+  req->sock = &comm->base.sock;
+  req->nreqs = 1;
+
+  for (int i = 0; i < comm->base.ndevs; i++) {
+    req->devBases[i] = &comm->devs[i].base;
+  }
+
+  struct ibv_send_wr wr;
+  memset(&wr, 0, sizeof(wr));
+
+  // Calculate a valid remote address in the FIFO memory region
+  // Since we're not modifying the FIFO, we can use any valid address within the registered memory
+  uint64_t remote_addr = comm->remFifo.addr;
+
+  // Select the next device index (local) and QP to use for posting this message
+  ncclIbQp* ctsQp = comm->base.qps + comm->base.devIndex;
+  comm->base.devIndex = (comm->base.devIndex + 1) % comm->base.ndevs;
+
+  // Prepare the RDMA Write operation with zero-byte length
+  wr.wr.rdma.remote_addr = remote_addr;
+  
+  // Lookup the correct fifoRkey
+  wr.wr.rdma.rkey = comm->base.remDevs[ctsQp->remDevIdx].fifoRkey;
+  
+  // Since we're doing a zero-byte write, set the SG list to NULL
+  wr.sg_list = NULL;
+  wr.num_sge = 0;
+
+  wr.opcode = IBV_WR_RDMA_WRITE;
+  wr.send_flags = IBV_SEND_SIGNALED; // Ensure a Work Completion is generated
+
+  // Set wr_id if necessary for tracking completions
+  wr.wr_id = req - comm->base.reqs;
+  ncclIbAddEvent(req, ctsQp->devIndex, &comm->devs[ctsQp->devIndex].base);
+
+  struct ibv_send_wr* bad_wr;
+  // Post the send request
+  NCCLCHECK(wrap_ibv_post_send(ctsQp->qp, &wr, &bad_wr));
+
+  // Do NOT increment comm->remFifo.fifoTail since we're not modifying the FIFO
+
+  req->operation = ((ncclIbRequest*)request)->operation;
+  req->id = ((ncclIbRequest*)request)->id;
+  req->channel = ((ncclIbRequest*)request)->channel;
+  req->step = ((ncclIbRequest*)request)->step;
+  req->comm = ((ncclIbRequest*)request)->comm;
+  ((ncclIbRequest*)request)->timeoutRequest = req;
+
+  return ncclSuccess;
+}
+
+
+
 ncclNet_t ncclNetIb = {
   "IB",
   ncclIbInit,
@@ -2237,6 +3103,17 @@ ncclNet_t ncclNetIb = {
   ncclIbCloseRecv,
   ncclIbCloseListen,
   NULL /* getDeviceMr */,
-  NULL /* irecvConsumed */
+  NULL /* irecvConsumed */,
+  ncclIbSetBackup,
+  ncclIbTestBackup,
+  setRequestChannel,
+  getRequestChannel,
+  setRequestId,
+  getRequestId,
+  setRequestComm,
+  getRequestComm,
+  setRequestStep,
+  setRequestOperation,
+  checkSwitchToBackup,
+  ncclIbTimeoutPost
 };
-

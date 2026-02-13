@@ -33,6 +33,7 @@ static ncclResult_t selectTransport(struct ncclComm* comm, struct ncclTopoGraph*
       connector->transportComm = transportComm;
       NCCLCHECK(transportComm->setup(comm, graph, myInfo, peerInfo, connect, connector, channelId, connIndex));
       if (transportType) *transportType = t;
+      TRACE(NCCL_INIT, "p2p connect my rank %d with peer rank %d type is %s channel is %d setup through NTRANSPORTS[%s]", myInfo->rank, peerInfo->rank, type==1?"send":"recv", channelId, t==0? "p2p":t==1?"shm":"net");
       return ncclSuccess;
     }
   }
@@ -96,14 +97,43 @@ ncclResult_t ncclTransportCheckP2pType(struct ncclComm* comm, bool* intraNodeP2p
   *directMode = directFlag;
   return ncclSuccess;
 }
+enum ncclIbCommState {
+  ncclIbCommStateStart = 0,
+  ncclIbCommStateConnect = 1,
+  ncclIbCommStateAccept = 3,
+  ncclIbCommStateSend = 4,
+  ncclIbCommStateRecv = 5,
+  ncclIbCommStateConnecting = 6,
+  ncclIbCommStateConnected = 7,
+  ncclIbCommStatePendingReady = 8,
+};
+struct ncclIbCommStage {
+  enum ncclIbCommState state;
+  int offset;
+  void* buffer;
+  void* comm;
+};
+
+
+struct ncclIbHandle {
+  union ncclSocketAddress connectAddr; // Filled by the target
+  uint64_t magic; // random number to help debugging
+  struct ncclIbCommStage stage; // Used by the other side when connecting
+};
+
 
 ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, int connIndex, int* highestTransportType/*=NULL*/) {
+    INFO(NCCL_R2CC_LEVEL_1,"R2CC: Starting ncclTransportP2pSetup for comm=%p, connIndex=%d, nChannels=%d", 
+         comm, connIndex, comm->nChannels); 
   // Stream used during transport setup; need for P2P pre-connect + CUDA Graph
   ncclResult_t ret = ncclSuccess;
   int highestType = TRANSPORT_UNDEFINED;  // track highest transport type
   struct ncclConnect** data; // Store intermediate send/recvData structs for connect
   struct ncclConnect** recvData = NULL; // Points to entries inside data for given recv connection within a channel
   struct ncclConnect** sendData = NULL; // Points to entries inside data for given send connection within a channel
+
+  TRACE(NCCL_INIT, "sizeof ncclConnect %lu", sizeof(ncclConnect));
+
   int done = 0;
   int maxPeers = ncclParamConnectRoundMaxPeers();
 
@@ -122,6 +152,9 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
     int bootstrapTag = (i<<8) + (graph ? graph->id+1 : 0);
     int recvPeer = (comm->rank - i + comm->nRanks) % comm->nRanks;
     int sendPeer = (comm->rank + i) % comm->nRanks;
+
+    TRACE(NCCL_INIT, "p2p setup myrank %d, with recvPeer %d, sendPeer %d",comm->rank, recvPeer, sendPeer);
+
     uint64_t recvMask = comm->connectRecv[recvPeer];
     uint64_t sendMask = comm->connectSend[sendPeer];
 
@@ -131,6 +164,7 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
     // The next M entries contain sendData, connection information for send connections
     // It's not guaranteed that each entry of data has the same number of total or send/recv specific connections
     int p = i-(done+1);
+    // 1 for default device and 1 for backup devices.
     if (recvMask || sendMask) NCCLCHECKGOTO(ncclCalloc(data+p, 2*MAXCHANNELS), ret, fail);
     recvData[p] = data[p];
     int sendChannels = 0, recvChannels = 0;
@@ -138,7 +172,10 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
     TIME_START(0);
     for (int c=0; c<MAXCHANNELS; c++) {
       if (recvMask & (1UL<<c)) {
-        NCCLCHECKGOTO(selectTransport<0>(comm, graph, recvData[p]+recvChannels++, c, recvPeer, connIndex, &type), ret, fail);
+        NCCLCHECKGOTO(selectTransport<0>(comm, graph, recvData[p]+recvChannels, c, recvPeer, connIndex, &type), ret, fail);
+        recvChannels++;
+        // TRACE(NCCL_INIT, "selectTransport<0> comm->rank %d, recvData[p]+recvChannels %d sendPeer %d", comm->rank, *((int*)(recvData[p]+(recvChannels-1))), recvPeer); 
+        
         if (type > highestType) highestType = type;
       }
     }
@@ -147,7 +184,9 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
     sendData[p] = recvData[p]+recvChannels;
     for (int c=0; c<MAXCHANNELS; c++) {
       if (sendMask & (1UL<<c)) {
-        NCCLCHECKGOTO(selectTransport<1>(comm, graph, sendData[p]+sendChannels++, c, sendPeer, connIndex, &type), ret, fail);
+        NCCLCHECKGOTO(selectTransport<1>(comm, graph, sendData[p]+sendChannels, c, sendPeer, connIndex, &type), ret, fail);
+        sendChannels++;
+        // TRACE(NCCL_INIT, "selectTransport<1> comm->rank %d, sendData[p]+sendChannels %d sendPeer %d", comm->rank, *((int*)(sendData[p]+(sendChannels-1))), sendPeer); 
         if (type > highestType) highestType = type;
       }
     }
@@ -190,7 +229,11 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
               struct ncclConnector* conn = comm->channels[c].peers[sendPeer]->send + connIndex;
               // This connector hasn't completed connection yet
               if (conn->connected == 0) {
+
+                // TRACE(NCCL_INIT, "transportComm->connect comm->rank %d, sendData[p]+sendDataOffset %d", comm->rank, ((ncclIbHandle*)(sendData[p]+sendDataOffset))->stage.offset);
                 NCCLCHECKGOTO(conn->transportComm->connect(comm, sendData[p] + sendDataOffset, 1, comm->rank, conn), ret, fail);
+                // TRACE(NCCL_INIT, "transportComm->connect comm->rank %d, sendData[p]+sendDataOffset %d", comm->rank, *((int*)(sendData[p]+sendDataOffset))); 
+                // TRACE(NCCL_INIT, "transportComm->connect comm->rank %d, sendData[p]+sendDataOffset %d", comm->rank, ((ncclIbHandle*)(sendData[p]+sendDataOffset))->stage.offset);
                 if (ret == ncclSuccess) {
                   conn->connected = 1;
                   /* comm->channels[c].devPeers[sendPeer]->send[connIndex] is a device memory access. */
@@ -210,6 +253,8 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
               // This connector hasn't completed connection yet
               if (conn->connected == 0) {
                 NCCLCHECKGOTO(conn->transportComm->connect(comm, recvData[p] + recvDataOffset, 1, comm->rank, conn), ret, fail);
+                // TRACE(NCCL_INIT, "transportComm->connect comm->rank %d, recvData[p]+recvDataOffset %d", comm->rank, *((int*)(recvData[p]+recvDataOffset))); 
+                
                 if (ret == ncclSuccess) {
                   conn->connected = 1;
                   /* comm->channels[c].devPeers[recvPeer]->recv[connIndex] is a device memory access. */
@@ -227,17 +272,17 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
             data[p] = NULL;
           }
         }
-	if (ncclParamReportConnectProgress() && comm->rank == 0 && done > 0) {
+	      if (ncclParamReportConnectProgress() && comm->rank == 0 && done > 0) {
           struct timeval now;
           gettimeofday(&now, NULL);
           if (((now.tv_sec - timeLast.tv_sec)*1.0 + (now.tv_usec-timeLast.tv_usec)*1e-6) > 1) {
             float elapsed = (now.tv_sec - timeStart.tv_sec)*1.0 + (now.tv_usec-timeStart.tv_usec)*1e-6;
-	    float remaining = elapsed*(comm->nRanks-done)/done;
+	          float remaining = elapsed*(comm->nRanks-done)/done;
             printf("%sP2p connect: %g%% Elapsed %d:%02d Remaining %d:%02d                                       ",
                 timeReported ? "\r" : "", done*100.0/comm->nRanks, ((int)elapsed)/60, ((int)elapsed)%60, ((int)remaining)/60, ((int)remaining)%60);
             fflush(stdout);
             timeReported = true;
-	    timeLast = now; // struct copy;
+	          timeLast = now; // struct copy;
           }
         }
       }

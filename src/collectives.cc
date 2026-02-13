@@ -7,7 +7,13 @@
 #include "argcheck.h" // Need some checks here since we access comm
 #include "collectives.h"
 #include "enqueue.h"
+#include "debug.h"
+#include "bootstrap.h"
+#include "r2cc/oob/oob_udp.h"
 #include "nccl.h"
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 
 const char* ncclFuncToString(ncclFunc_t fn) {
   switch (fn) {
@@ -108,10 +114,180 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
   NvtxParamsAllReduce payload{count * ncclTypeSize(datatype), op};
   NVTX3_FUNC_WITH_PARAMS(AllReduce, AllReduceSchema, payload)
 
-  struct ncclInfo info = { ncclFuncAllReduce, "AllReduce",
-    sendbuff, recvbuff, count, datatype, op, 0, comm, stream, /* Args */
-    ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
-  NCCLCHECK(ncclEnqueueCheck(&info));
+
+  size_t totalUserBytes = count * ncclTypeSize(datatype);
+  bool parallel = totalUserBytes <= 134217728;
+
+  // auto t0 = std::chrono::high_resolution_clock::now();
+  
+  // R2CC: If any peer reports a hot-repair event through OOB, gather per-rank failed
+  // channel masks via bootstrapAllGather, combine (per-node then global OR), and
+  // force Balance mode (R2CC_MODE=2) from this AllReduce onwards.
+  {
+    const char* env = getenv("R2CC_MODE");
+    int curMode = env ? atoi(env) : 0;
+    OobNet& oob = OobNet::Get();
+    bool seen = oob.PollHotRepair();
+    uint64_t localMask = oob.LocalFailedChannelMask();
+    uint64_t globalMask = oob.GlobalFailedChannelMask();
+
+    // Only perform the bootstrap allgather once (v1). This requires all ranks to
+    // observe the hot-repair signal before entering this branch.
+    static std::atomic<int> hrSynced{0};
+    if (hrSynced.load(std::memory_order_relaxed) == 0 && (seen || localMask != 0)) {
+      int nranks = comm->nRanks;
+      uint64_t* allMasks = (uint64_t*)calloc((size_t)nranks, sizeof(uint64_t));
+      if (allMasks) {
+        allMasks[comm->rank] = localMask;
+        NCCLCHECK(bootstrapAllGather(comm->bootstrap, allMasks, sizeof(uint64_t)));
+
+        // Combine per-node first, then global OR.
+        int nNodes = comm->nNodes;
+        uint64_t* nodeMasks = (uint64_t*)calloc((size_t)nNodes, sizeof(uint64_t));
+        if (nodeMasks) {
+          for (int r = 0; r < nranks; r++) {
+            int node = comm->rankToNode[r];
+            if (node >= 0 && node < nNodes) nodeMasks[node] |= allMasks[r];
+          }
+          uint64_t merged = 0;
+          for (int n = 0; n < nNodes; n++) merged |= nodeMasks[n];
+          free(nodeMasks);
+          globalMask = merged;
+        } else {
+          // Fallback: global OR across all ranks directly.
+          uint64_t merged = 0;
+          for (int r = 0; r < nranks; r++) merged |= allMasks[r];
+          globalMask = merged;
+        }
+
+        oob.SetGlobalFailedChannelMask(globalMask);
+        if (comm->rank == 0) {
+          INFO(NCCL_R2CC, "R2CC: hot-repair gather complete: localMask=0x%lx globalMask=0x%lx",
+               (unsigned long)localMask, (unsigned long)globalMask);
+        }
+        free(allMasks);
+      } else {
+        WARN("R2CC: hot-repair gather failed to allocate allMasks");
+      }
+      hrSynced.store(1, std::memory_order_relaxed);
+    }
+
+    if (curMode < 2 && (globalMask != 0 || seen || localMask != 0)) {
+      setenv("R2CC_MODE", "2", 1);
+      static std::atomic<int> switched{0};
+      int expected = 0;
+      if (switched.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
+        INFO(NCCL_R2CC, "R2CC: hot-repair detected, forcing R2CC_MODE=2");
+      }
+    }
+  }
+
+
+  // R2CC_MODE=3/4/5: Split AllReduce implementation  
+  const char* r2ccMode = getenv("R2CC_MODE");
+  int mode = r2ccMode ? atoi(r2ccMode) : 0;
+  if (mode >= 3 && mode <= 5 && totalUserBytes > 16384) {
+    // Get number of network devices to simulate failed NIC
+    int nNetDevs;
+    NCCLCHECK(comm->ncclNet->devices(&nNetDevs));
+    
+
+    if (nNetDevs > 1) {
+      // Calculate split: main ring handles (n-1)/n of data
+      size_t elementSize = ncclTypeSize(datatype);
+      size_t originalCount = count;
+
+      const char* failure2SameServer_str = getenv("FAILURE2_SAME_SERVER");
+      int failure2SameServer = failure2SameServer_str ? atoi(failure2SameServer_str) : 0;
+      int failure_num = failure2SameServer ? 2 : 1;  
+
+      size_t mainCount = originalCount * (nNetDevs - failure_num) / nNetDevs;
+      size_t subCount = originalCount - mainCount;
+      
+      // MODE=3: Both phases
+      // MODE=4: Only Phase 1 (AllReduce)
+      // MODE=5: Only Phase 2 (Broadcast)
+      if(mode == 3 and parallel){
+        NCCLCHECK(ncclGroupStart());
+        struct ncclInfo info1 = { ncclFuncAllReduce, "AllReduce",
+          sendbuff, recvbuff, mainCount, datatype, op, 0, comm, stream, /* Args */
+          ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
+        NCCLCHECK(ncclEnqueueCheck(&info1));
+        // Calculate offset for remaining data
+        size_t offset = mainCount * elementSize;
+        const void* bcastSendbuff = (const char*)sendbuff + offset;
+        void* bcastRecvbuff = (char*)recvbuff + offset;
+        
+        struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
+          bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
+          BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
+        NCCLCHECK(ncclEnqueueCheck(&info2));
+        NCCLCHECK(ncclGroupEnd());
+      }
+      else if(mode == 3 and !parallel){
+	      NCCLCHECK(ncclGroupStart());
+        struct ncclInfo info1 = { ncclFuncAllReduce, "AllReduce",
+          sendbuff, recvbuff, mainCount, datatype, op, 0, comm, stream, /* Args */
+          ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
+        NCCLCHECK(ncclEnqueueCheck(&info1));
+        NCCLCHECK(ncclGroupEnd());
+
+
+	      NCCLCHECK(ncclGroupStart());
+        // Calculate offset for remaining data
+        size_t offset = mainCount * elementSize;
+        const void* bcastSendbuff = (const char*)sendbuff + offset;
+        void* bcastRecvbuff = (char*)recvbuff + offset;
+
+        struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
+          bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
+          BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
+        NCCLCHECK(ncclEnqueueCheck(&info2));
+        NCCLCHECK(ncclGroupEnd());
+
+      }
+      else if(mode == 4){
+        // Phase 1: AllReduce with reduced data
+        NCCLCHECK(ncclGroupStart());
+        struct ncclInfo info1 = { ncclFuncAllReduce, "AllReduce",
+          sendbuff, recvbuff, mainCount, datatype, op, 0, comm, stream, /* Args */
+          ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
+        NCCLCHECK(ncclEnqueueCheck(&info1));
+        NCCLCHECK(ncclGroupEnd());
+      }else if(mode == 5){
+        // Phase 2: Broadcast remaining data from "failed" node
+        NCCLCHECK(ncclGroupStart());
+        // Calculate offset for remaining data
+        size_t offset = mainCount * elementSize;
+        const void* bcastSendbuff = (const char*)sendbuff + offset;
+        void* bcastRecvbuff = (char*)recvbuff + offset;
+        
+        struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
+          bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
+          BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
+        NCCLCHECK(ncclEnqueueCheck(&info2));
+        NCCLCHECK(ncclGroupEnd());
+      }
+    }
+  }else{
+    // Normal AllReduce operation
+    struct ncclInfo info = { ncclFuncAllReduce, "AllReduce",
+      sendbuff, recvbuff, count, datatype, op, 0, comm, stream, /* Args */
+      ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
+    NCCLCHECK(ncclEnqueueCheck(&info));
+  }
+
+  //CUDACHECK(cudaStreamSynchronize(stream));
+  // auto t1 = std::chrono::high_resolution_clock::now();
+  // double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+  // if (comm->rank == 0) {
+  //  printf("[R2CC] mode=%d bytes=%zu time=%.3f ms\n",
+  //         mode, totalUserBytes, ms);
+  // }
+ 
+
+
   return ncclSuccess;
 }
 

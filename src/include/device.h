@@ -269,6 +269,11 @@ struct alignas(16) ncclDevWorkColl {
   uint32_t nWarps:8;
   uint32_t redOpArgIsPtr:1, regUsed:2, oneNode:1, direct:4;
   uint32_t root;
+  // Bitmask of channels participating in *this* work item. This enables sparse
+  // channel sets (e.g., exclude failed NIC channels in R2CC_MODE=2) while
+  // keeping existing "continuous-byte-distribution" (CBD) scheduling logic.
+  // When zero, device code falls back to the legacy contiguous [channelLo..channelHi] range.
+  uint32_t channelMask;
   void* recvbuff;
   void* sendbuff;
   uintptr_t sendbuffOffset;
@@ -292,6 +297,25 @@ struct alignas(16) ncclDevWorkColl {
   uint64_t redOpArg;
 };
 
+__host__ __device__ inline uint32_t ncclCollWorkChannelMask(const struct ncclDevWorkColl* work) {
+  uint32_t mask = work->channelMask;
+  if (mask == 0) {
+    uint64_t lo = (uint64_t)1 << work->channelLo;
+    uint64_t hi = (uint64_t)1 << (work->channelHi + 1);
+    mask = (uint32_t)(hi - lo);
+  }
+  return mask;
+}
+
+__host__ __device__ inline int ncclCollWorkNChannels(const struct ncclDevWorkColl* work) {
+  return countOneBits(ncclCollWorkChannelMask(work));
+}
+
+__host__ __device__ inline int ncclCollWorkChannelToPart(const struct ncclDevWorkColl* work, uint32_t channelId) {
+  uint32_t mask = ncclCollWorkChannelMask(work);
+  return countOneBits(mask & (uint32_t)(((uint64_t)1 << channelId) - 1));
+}
+
 
 __host__ __device__ constexpr int ncclProtoGrainSize(int proto) {
   return proto == NCCL_PROTO_LL ? 16 :
@@ -306,22 +330,30 @@ __host__ __device__ inline void ncclCollCbdPart(
     Int* count, Int* partOffset, Int* partCount, Int* chunkCount
   ) {
   int eltPerGrain = ncclProtoGrainSize(proto)/eltSize;
-  int nMidChannels = work->channelHi - work->channelLo - 1;
-  // We can assum that nMidChannels<0 implies countMid==0, which let's us assume
+
+  // Compute ordering among participating channels.
+  // Legacy behavior uses the contiguous [channelLo..channelHi] range.
+  uint32_t mask = ncclCollWorkChannelMask(work);
+  int nChannels = countOneBits(mask);
+  // "bid" is this channel's index in the sorted set of participating channels.
+  int bid = ncclCollWorkChannelToPart(work, channelId);
+  int nMidChannels = nChannels - 2;
+
+  // We can assume that nMidChannels<0 implies countMid==0, which lets us assume
   // that countMid*nMidChannels == 0.
   if (count != nullptr) {
     *count = work->cbd.countLo + work->cbd.countMid*nMidChannels + work->cbd.countHi;
   }
-  if (channelId == work->channelLo) {
+  if (bid == 0) {
     *partOffset = 0;
     *partCount = work->cbd.countLo;
     *chunkCount = work->cbd.chunkGrainsLo*eltPerGrain;
-  } else if (channelId == work->channelHi) {
+  } else if (bid == nChannels - 1) {
     *partOffset = work->cbd.countLo + nMidChannels*work->cbd.countMid;
     *partCount = work->cbd.countHi;
     *chunkCount = work->cbd.chunkGrainsHi*eltPerGrain;
   } else {
-    int mid = channelId - work->channelLo - 1;
+    int mid = bid - 1;
     *partOffset = work->cbd.countLo + mid*work->cbd.countMid;
     *partCount = work->cbd.countMid;
     *chunkCount = work->cbd.chunkGrainsMid*eltPerGrain;

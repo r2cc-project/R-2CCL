@@ -15,6 +15,7 @@
 #include "coll_net.h"
 #include "enqueue.h"
 #include "graph.h"
+#include "r2cc/oob/oob_udp.h"
 #include "argcheck.h"
 #include "tuner.h"
 #include <fcntl.h>
@@ -262,6 +263,8 @@ static ncclResult_t commFree(ncclComm_t comm) {
   NCCLCHECK(ncclProfilerPluginFinalize(comm));
   NCCLCHECK(ncclNetFinalize(comm));
   NCCLCHECK(ncclNetPluginUnload(comm));
+  // R2CC: Clear memory before freeing to prevent state pollution
+  memset(comm, 0, sizeof(struct ncclComm));
   free(comm);
 
   return ncclSuccess;
@@ -787,6 +790,10 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
   // AllGather1 - end
   timers[TIMER_INIT_ALLGATHER] = clockNano() - timers[TIMER_INIT_ALLGATHER];
+
+  // R2CC: Initialize OOB UDP Network (Includes internal verification)
+  NCCLCHECKGOTO(OobNet::Get().Init(rank, nranks, comm->bootstrap), ret, fail);
+
 
   // MNNVL support
   if (nNodes > 1 && !checkMNNVL(comm) && ncclParamMNNVLEnable() == 1) {
@@ -1406,6 +1413,8 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   int cudaArch;
   double sum_timers = 0;
   uint64_t timers[TIMERS_INIT_COUNT] = {0};
+  
+  INFO(NCCL_R2CC, "R2CC log system is active - ncclCommInitRankFunc starting for rank %d", comm->rank);
   unsigned long long commIdHash;
 
   timers[TIMER_INIT_TOTAL] = clockNano();
@@ -1459,6 +1468,9 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   }
   comm->cudaArch = cudaArch;
 
+  INFO(NCCL_R2CC_LEVEL_1, "NCCL_R2CC_LEVEL_1: Communicator Creating - rank %d/%d, comm %p, commHash 0x%lx", 
+       comm->rank, comm->nRanks, comm, comm->commHash);
+
   NCCLCHECKGOTO(initTransportsRank(comm, job->parent, timers), res, fail);
   NCCLCHECKGOTO(ncclTunerPluginLoad(comm), res, fail);
   if (comm->tuner) {
@@ -1467,6 +1479,9 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
 
   // update communicator state
   comm->initState = ncclSuccess;
+  
+  INFO(NCCL_R2CC_LEVEL_1, "NCCL_R2CC_LEVEL_1: Communicator creation Complete - rank %d/%d, comm %p, commHash 0x%lx", 
+       comm->rank, comm->nRanks, comm, comm->commHash);
   timers[TIMER_INIT_TOTAL] = clockNano() - timers[TIMER_INIT_TOTAL];
 
   // Trace this call for replay tool
@@ -1959,6 +1974,27 @@ static ncclResult_t commDestroySync(struct ncclAsyncJob* job_) {
     }
   }
 
+  // R2CC: Send barrier message to proxy to ensure all operations complete before stopping
+  // NOTE: Temporarily disabled to avoid potential deadlock
+  // TODO: Find better synchronization mechanism
+  /*
+  if (comm->proxyState && comm->proxyState->peerSocks) {
+    struct ncclSocket* sock = comm->proxyState->peerSocks + comm->topParentLocalRanks[comm->localRank];
+    if (sock && sock->fd >= 0) {
+      int type = ncclProxyMsgBarrier;
+      INFO(NCCL_R2CC, "R2CC: Sending barrier message to proxy before stop");
+      (void)ncclSocketSend(sock, &type, sizeof(int));
+      
+      // Wait for acknowledgment
+      int ack = 0;
+      ncclResult_t sockRes = ncclSocketRecv(sock, &ack, sizeof(int));
+      if (sockRes == ncclSuccess && ack == ncclProxyMsgBarrier) {
+        INFO(NCCL_R2CC, "R2CC: Received barrier acknowledgment from proxy");
+      }
+    }
+  }
+  */
+  
   if ((ret = ncclProxyStop(comm)) != ncclSuccess) {
     WARN("ncclProxyStop: comm %p (rank = %d) destroys proxy resource error %d", comm, comm->rank, ret);
   }

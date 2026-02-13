@@ -89,6 +89,12 @@ static void ncclDebugInit() {
         mask = NCCL_REG;
       } else if (strcasecmp(subsys, "PROFILE") == 0) {
         mask = NCCL_PROFILE;
+      } else if (strcasecmp(subsys, "R2CC") == 0) {
+        mask = NCCL_R2CC;
+      } else if (strcasecmp(subsys, "MODE1") == 0) {
+        mask = NCCL_MODE1;
+      } else if (strcasecmp(subsys, "R2CC_LEVEL_1") == 0) {
+        mask = NCCL_R2CC_LEVEL_1;
       } else if (strcasecmp(subsys, "ALL") == 0) {
         mask = NCCL_ALL;
       }
@@ -163,6 +169,13 @@ static void ncclDebugInit() {
 
   ncclEpoch = std::chrono::steady_clock::now();
   __atomic_store_n(&ncclDebugLevel, tempNcclDebugLevel, __ATOMIC_RELEASE);
+  
+  // Print startup message if R2CC_LEVEL_1 is enabled
+  if (ncclDebugMask & NCCL_R2CC_LEVEL_1) {
+    ncclDebugLog(NCCL_LOG_INFO, NCCL_R2CC_LEVEL_1, __FILE__, __LINE__, 
+                 "NCCL_R2CC_LEVEL_1: R2CC Level 1 debugging enabled - will show connection establishment logs");
+  }
+  
   pthread_mutex_unlock(&ncclDebugLock);
 }
 

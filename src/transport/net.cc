@@ -13,8 +13,12 @@
 #include "shmutils.h"
 #include "p2p.h"
 #include "profiler.h"
+#include <time.h>
+#include <inttypes.h>
 #include "transport.h"
 #include "shm.h"
+#include "r2cc/oob/oob_udp.h"
+#include <cctype>
 
 static_assert(sizeof(ncclNetHandle_t) <= CONNECT_SIZE, "NET Connect info is too large");
 
@@ -81,19 +85,30 @@ struct connectMap {
   } offsets;
 };
 
+
 struct sendNetResources {
   struct connectMap map;
   void* netSendComm;
+  
+
   struct ncclSendMem* sendMem;
   struct ncclRecvMem* recvMem;
 
   int tpRank;
   int tpLocalRank;
   int tpRemoteRank;
+
+
   int netDev;
   int useGdr;
   int useDmaBuf;
   int maxRecvs;
+  int netDeviceVersion;
+  ncclNetDeviceType netDeviceType;
+  ncclNetDeviceHandle_t* netDeviceHandle;
+  void* mhandles[NCCL_NUM_PROTOCOLS];
+
+
   uint64_t* gdcSync;
   void* gdrDesc;
   int shared;
@@ -101,12 +116,30 @@ struct sendNetResources {
   int connIndex;
   char* buffers[NCCL_NUM_PROTOCOLS];
   int buffSizes[NCCL_NUM_PROTOCOLS];
-  void* mhandles[NCCL_NUM_PROTOCOLS];
   uint64_t step;
+  
+  // R2CC: Track connection log state
+  int primaryConnStartLogged;
+  int backupConnStartLogged;
+  int connectInitLogged;
   uint64_t llLastCleaning;
-  int netDeviceVersion;
-  ncclNetDeviceType netDeviceType;
-  ncclNetDeviceHandle_t* netDeviceHandle;
+
+
+  void *netSendCommBackup;
+  void *mhandlesBackup[NCCL_NUM_PROTOCOLS];
+  int netDevBackup;
+  int useGdrBackup;
+  int useDmaBufBackup;
+  int maxRecvsBackup;
+  int netDeviceVersionBackup;
+  ncclNetDeviceType netDeviceTypeBackup;
+  ncclNetDeviceHandle_t *netDeviceHandleBackup;
+
+  int useBackup;
+  int forceBackup;
+  int forceBackupNotified;
+  int stepSyncRequested;
+  int state;
 };
 
 struct recvNetResources {
@@ -139,7 +172,69 @@ struct recvNetResources {
   int netDeviceVersion;
   ncclNetDeviceType netDeviceType;
   ncclNetDeviceHandle_t* netDeviceHandle;
+  
+  // R2CC: Track accept log state
+  int primaryAcceptStartLogged;
+  int backupAcceptStartLogged;
+  int connectInitLogged;
+
+  // Variables related to the backup netDev
+  void *netListenCommBackup;
+  void *netRecvCommBackup;
+
+  int netDevBackup;
+  int useGdrBackup;
+  int useDmaBufBackup;
+  int needFlushBackup;
+  int maxRecvsBackup;
+  int netDeviceVersionBackup;
+  ncclNetDeviceType netDeviceTypeBackup;
+  ncclNetDeviceHandle_t *netDeviceHandleBackup;
+  void *mhandlesBackup[NCCL_NUM_PROTOCOLS];
+
+  int useBackup;
+  int forceBackup;
+  int forceBackupNotified;
+  int state;
 };
+
+static bool r2ccTokenMatchesHca(const char* start, int len, const char* netName, int netDev) {
+  if (len <= 0) return false;
+  if (netName && (int)strlen(netName) == len && strncmp(start, netName, len) == 0) return true;
+  // Numeric token: match netDev or suffix in netName (e.g. mlx5_2)
+  int value = 0;
+  bool numeric = true;
+  for (int i = 0; i < len; i++) {
+    if (!std::isdigit(static_cast<unsigned char>(start[i]))) { numeric = false; break; }
+    value = value * 10 + (start[i] - '0');
+  }
+  if (!numeric) return false;
+  if (value == netDev) return true;
+  if (netName) {
+    const char* underscore = strrchr(netName, '_');
+    if (underscore && *(underscore + 1) != '\0') {
+      int suffix = atoi(underscore + 1);
+      if (suffix == value) return true;
+    }
+  }
+  return false;
+}
+
+static bool r2ccMatchDisconnectedHca(int netDev, const char* netName) {
+  const char* env = getenv("R2CC_DISCONNECTED_HCA");
+  if (!env || env[0] == '\0') env = getenv("R2CC_Disconnected_HCA");
+  if (!env || env[0] == '\0') return false;
+  const char* p = env;
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == ',') p++;
+    if (*p == '\0') break;
+    const char* start = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != ',') p++;
+    int len = (int)(p - start);
+    if (r2ccTokenMatchesHca(start, len, netName, netDev)) return true;
+  }
+  return false;
+}
 
 /* Determine if two peers can communicate with NET */
 static ncclResult_t canConnect(int* ret, struct ncclComm* comm, struct ncclTopoGraph* graph, struct ncclPeerInfo* info1, struct ncclPeerInfo* info2) {
@@ -166,6 +261,11 @@ struct setupReq {
   int connIndex;
 };
 
+NCCL_PARAM(RecvTimeout, "IB_TIMEOUT", 20);
+NCCL_PARAM(RecvRetryCnt, "IB_RETRY_CNT", 7);
+NCCL_PARAM(R2CCFailoverTimeoutMs, "R2CC_FAILOVER_TIMEOUT_MS", -1);
+
+
 // Forward declaration
 static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct ncclProxyArgs* args);
 
@@ -181,6 +281,8 @@ static ncclResult_t sendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
   int proxyRank;
   int64_t netId;
   NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, peerInfo->rank, &netId, &req.netDev, &proxyRank));
+  INFO(NCCL_R2CC, "sendSetup: rank %d->%d, channel %d, got netDev=%d", 
+       myInfo->rank, peerInfo->rank, channelId, req.netDev);
   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->busId, netId, 1, &req.useGdr));
   send->conn.flags |= req.useGdr ? NCCL_DIRECT_NIC : 0;
 
@@ -218,6 +320,22 @@ static ncclResult_t recvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
   int proxyRank;
   int64_t netId;
   NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, myInfo->rank, &netId, &req.netDev, &proxyRank));
+  INFO(NCCL_R2CC, "recvSetup: rank %d<-%d, channel %d, got netDev=%d from topology", 
+       myInfo->rank, peerInfo->rank, channelId, req.netDev);
+  
+  // Debug: Also check what device sender would use
+  int senderDev;
+  int64_t senderNetId;
+  int senderProxyRank;
+  NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, peerInfo->rank, &senderNetId, &senderDev, &senderProxyRank));
+  INFO(NCCL_R2CC, "recvSetup: Checking sender's device selection - senderDev=%d, myDev=%d", senderDev, req.netDev);
+  if (senderDev != req.netDev) {
+    WARN("R2CC: Device mismatch! Receiver rank %d selected dev=%d, but sender rank %d would select dev=%d for channel %d", 
+         myInfo->rank, req.netDev, peerInfo->rank, senderDev, channelId);
+    INFO(NCCL_R2CC, "R2CC: Device mismatch detected - receiver uses dev=%d, sender would use dev=%d for channel %d", 
+         req.netDev, senderDev, channelId);
+  }
+  
   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->busId, netId, 0, &req.useGdr));
 
   // Determine whether we need to flush the GDR buffer on recv or not
@@ -229,7 +347,9 @@ static ncclResult_t recvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
   req.tpLocalRank = comm->topParentLocalRanks[comm->localRank];
   req.tpRank = comm->topParentRanks[myInfo->rank];
   req.tpRemoteRank = comm->topParentRanks[peerInfo->rank];
-  NCCLCHECK(ncclProxyCallBlocking(comm, &recv->proxyConn, ncclProxyMsgSetup, &req, sizeof(req), connectInfo, sizeof(ncclNetHandle_t)));
+  TRACE(NCCL_INIT,"before recvSetup ncclProxyCallBlocking");
+  NCCLCHECK(ncclProxyCallBlocking(comm, &recv->proxyConn, ncclProxyMsgSetup, &req, sizeof(req), connectInfo, 2*sizeof(ncclNetHandle_t)));
+  TRACE(NCCL_INIT,"after recvSetup ncclProxyCallBlocking");
   INFO(NCCL_INIT|NCCL_NET,"Channel %02d/%d : %d[%d] -> %d[%d] [receive] via NET/%s/%d%s%s", channelId, connIndex, peerInfo->rank, peerInfo->nvmlDev, myInfo->rank, myInfo->nvmlDev, comm->ncclNet->name, req.netDev,
       req.useGdr ? "/GDRDMA" : "", req.shared ? "/Shared" : "");
   return ncclSuccess;
@@ -293,9 +413,12 @@ static ncclResult_t sendConnect(struct ncclComm* comm, struct ncclConnect* conne
     send->transportResources = map;
     opId = send;
     INFO(NCCL_PROXY, "sendConnect ncclProxyCallAsync opId=%p", opId);
-    netSendConnectArgs args = {0};
-    memcpy(&args.handle, connectInfo, sizeof(ncclNetHandle_t));
-    NCCLCHECK(ncclProxyCallAsync(comm, &send->proxyConn, ncclProxyMsgConnect, &args, sizeof(netSendConnectArgs), sizeof(struct connectMap), opId));
+    netSendConnectArgs args[2] = {0};
+    memcpy(&args, connectInfo, 2*sizeof(ncclNetHandle_t));
+    TRACE(NCCL_INIT, "netSendConnectArgs size is %lu", sizeof(netSendConnectArgs));
+    INFO(NCCL_R2CC, "sendConnect: Sending 2 handles to proxy, first at %p, second at %p", 
+         &args[0], &args[1]);
+    NCCLCHECK(ncclProxyCallAsync(comm, &send->proxyConn, ncclProxyMsgConnect, &args, 2*sizeof(netSendConnectArgs), sizeof(struct connectMap), opId));
   } else {
     opId =  send;
   }
@@ -568,18 +691,38 @@ static ncclResult_t sendProxySetup(struct ncclProxyConnection* connection, struc
   struct setupReq* req = (struct setupReq*) reqBuff;
   if (reqSize != sizeof(struct setupReq)) return ncclInternalError;
 
+  // R2CC: Track setup calls
+  static int sendSetupCount = 0;
+  sendSetupCount++;
+  
+  // Check for extra setup calls
+  static int sendExtraDetected = 0;
+  if (sendSetupCount > 24 && !sendExtraDetected) {
+    sendExtraDetected = 1;
+    INFO(NCCL_R2CC, "WARNING: Extra sendProxySetup detected! count=%d, channel=%d, netDev=%d", 
+         sendSetupCount, req->channelId, req->netDev);
+  }
+  
   struct sendNetResources* resources;
   NCCLCHECK(ncclCalloc(&resources, 1));
   connection->transportResources = resources;
 
+  // Initialize common variables
   resources->tpRank = req->tpRank;
   resources->tpLocalRank = req->tpLocalRank;
   resources->tpRemoteRank = req->tpRemoteRank;
-  resources->netDev = req->netDev;
   resources->shared = connection->shared = req->shared;
-  resources->useGdr = req->useGdr;
   resources->channelId = req->channelId;
   resources->connIndex = req->connIndex;
+  
+  // R2CC: Initialize log state tracking
+  resources->primaryConnStartLogged = 0;
+  resources->backupConnStartLogged = 0;
+  resources->connectInitLogged = 0;
+
+  // Initialize default netDev variable
+  resources->netDev = req->netDev;
+  resources->useGdr = req->useGdr;
   ncclNetProperties_t props;
   NCCLCHECK(proxyState->ncclNet->getProperties(req->netDev, &props));
   /* DMA-BUF support */
@@ -588,8 +731,63 @@ static ncclResult_t sendProxySetup(struct ncclProxyConnection* connection, struc
   resources->netDeviceVersion = props.netDeviceVersion;
   resources->netDeviceType = props.netDeviceType;
 
-  resources->netDeviceVersion = props.netDeviceVersion;
-  resources->netDeviceType = props.netDeviceType;
+  // Initialize backup netDev variables (assuming req->netDev^1, same req->useGdr, etc.)
+  int nNetDevs = 0;
+  NCCLCHECK(proxyState->ncclNet->devices(&nNetDevs));
+  // if (nNetDevs > 1) {
+  //   resources->netDevBackup = (req->netDev == 0) ? 1 : 0;
+  // } else {
+  //   resources->netDevBackup = req->netDev;
+  // }
+  if (nNetDevs % 2 == 0)
+    resources->netDevBackup = req->netDev^1;
+  else{
+    if(req->netDev == nNetDevs - 1){
+      resources->netDevBackup = req->netDev; // demo doesn't support odd number of devices
+    } else {
+      resources->netDevBackup = req->netDev^1; 
+    }
+  }
+
+  resources->useGdrBackup = req->useGdr;
+  
+  INFO(NCCL_R2CC, "sendProxySetup: Channel %d, netDev=%d, netDevBackup=%d", 
+       resources->channelId, resources->netDev, resources->netDevBackup);
+  
+  ncclNetProperties_t propsBackup;
+  NCCLCHECK(proxyState->ncclNet->getProperties(resources->netDevBackup, &propsBackup));
+  resources->useDmaBufBackup = resources->useGdrBackup && proxyState->dmaBufSupport && (propsBackup.ptrSupport & NCCL_PTR_DMABUF);
+  resources->maxRecvsBackup = propsBackup.maxRecvs;
+  resources->netDeviceVersionBackup = propsBackup.netDeviceVersion;
+  resources->netDeviceTypeBackup = propsBackup.netDeviceType;
+
+  const char* r2ccMode = getenv("R2CC_MODE");
+  if (r2ccMode && atoi(r2ccMode) == 1) {
+    // Simulate disable of device 1 (second device)
+    if (resources->netDev == 0) {
+      resources->useBackup = 1;
+      // Get device names and log
+      INFO(NCCL_R2CC, "R2CC_MODE=1 (SEND): Channel %d will simulate disable of device %d (%s) and use backup device %d (%s)", 
+           resources->channelId, resources->netDev, props.name, resources->netDevBackup, propsBackup.name);
+    }
+  }
+
+  resources->forceBackup = 0;
+  resources->forceBackupNotified = 0;
+  resources->stepSyncRequested = 0;
+  if (r2ccMatchDisconnectedHca(resources->netDev, props.name)) {
+    resources->forceBackup = 1;
+    INFO(NCCL_R2CC, "R2CC_DISCONNECTED_HCA: RECV channel %d primary dev=%d (%s) will inject failure at step 10",
+         resources->channelId, resources->netDev, props.name);
+  }
+
+  resources->forceBackup = 0;
+  resources->forceBackupNotified = 0;
+  if (r2ccMatchDisconnectedHca(resources->netDev, props.name)) {
+    resources->forceBackup = 1;
+    INFO(NCCL_R2CC, "R2CC_DISCONNECTED_HCA: SEND channel %d primary dev=%d (%s) will inject failure at step 10",
+         resources->channelId, resources->netDev, props.name);
+  }
 
   // We don't return any data
   if (respSize != 0) return ncclInternalError;
@@ -614,6 +812,11 @@ static ncclResult_t recvProxySetup(struct ncclProxyConnection* connection, struc
   resources->needFlush = req->needFlush;
   resources->channelId = req->channelId;
   resources->connIndex = req->connIndex;
+  
+  // R2CC: Initialize log state tracking
+  resources->primaryAcceptStartLogged = 0;
+  resources->backupAcceptStartLogged = 0;
+
   ncclNetProperties_t props;
   NCCLCHECK(proxyState->ncclNet->getProperties(req->netDev, &props));
   /* DMA-BUF support */
@@ -622,8 +825,125 @@ static ncclResult_t recvProxySetup(struct ncclProxyConnection* connection, struc
   resources->netDeviceVersion = props.netDeviceVersion;
   resources->netDeviceType = props.netDeviceType;
 
-  if (respSize != sizeof(ncclNetHandle_t)) return ncclInternalError;
-  NCCLCHECK(proxyState->ncclNet->listen(req->netDev, respBuff, &resources->netListenComm));
+
+  // Initialize backup netDev variables
+  int nNetDevs = 0;
+  NCCLCHECK(proxyState->ncclNet->devices(&nNetDevs));
+  // if (nNetDevs > 1) {
+  //   resources->netDevBackup = (req->netDev == 0) ? 1 : 0;
+  // } else {
+  //   resources->netDevBackup = req->netDev;
+  // }
+
+  if (nNetDevs % 2 == 0)
+    resources->netDevBackup = req->netDev^1;
+  else{
+    if(req->netDev == nNetDevs - 1){
+      resources->netDevBackup = req->netDev; // demo doesn't support odd number of devices
+    } else {
+      resources->netDevBackup = req->netDev^1; 
+    }
+  }
+
+  resources->useGdrBackup = req->useGdr;
+  resources->needFlushBackup = req->needFlush;
+  
+  INFO(NCCL_R2CC, "recvProxySetup: Channel %d, netDev=%d, netDevBackup=%d", 
+       resources->channelId, resources->netDev, resources->netDevBackup);
+  
+    // Get properties for backup netDev
+  ncclNetProperties_t propsBackup;
+  NCCLCHECK(proxyState->ncclNet->getProperties(resources->netDevBackup, &propsBackup));
+  resources->useDmaBufBackup = resources->useGdrBackup && proxyState->dmaBufSupport && (propsBackup.ptrSupport & NCCL_PTR_DMABUF);
+  resources->maxRecvsBackup = propsBackup.maxRecvs;
+  resources->netDeviceVersionBackup = propsBackup.netDeviceVersion;
+  resources->netDeviceTypeBackup = propsBackup.netDeviceType;
+
+  const char* r2ccMode = getenv("R2CC_MODE");
+  if (r2ccMode && atoi(r2ccMode) == 1) {
+    // Simulate disable of device 1 (second device)
+  if (resources->netDev == 0) {
+      resources->useBackup = 1;
+      // Get device names and log
+      INFO(NCCL_R2CC, "R2CC_MODE=1 (RECV): Channel %d will simulate disable of device %d (%s) and use backup device %d (%s)", 
+           resources->channelId, resources->netDev, props.name, resources->netDevBackup, propsBackup.name);
+    }
+  }
+
+  TRACE(NCCL_INIT, "listen 1");
+  // if (respSize != sizeof(ncclNetHandle_t)) return ncclInternalError;
+  
+  // R2CC: Log detailed listen setup
+  static int setupCount = 0;
+  setupCount++;
+  
+  // R2CC: Check if this is being called after communicator creation
+  static int lastCommCount = 0;
+  static int extraSetupDetected = 0;
+  int currentCommCount = 0; // This would ideally come from comm object if available
+  
+  // Simple heuristic: if setupCount > 12*2 (6 channels * 2 comms * 2 for send/recv), it's extra
+  if (setupCount > 24 && !extraSetupDetected) {
+    extraSetupDetected = 1;
+    INFO(NCCL_R2CC, "WARNING: Extra recvProxySetup detected after communicator creation! setupCount=%d", setupCount);
+  }
+  
+  INFO(NCCL_R2CC, "recvProxySetup[%d]: START channel=%d, primary dev=%d, backup dev=%d%s", 
+       setupCount, resources->channelId, resources->netDev, resources->netDevBackup,
+       extraSetupDetected ? " [EXTRA]" : "");
+  
+  // R2CC DEBUG: Log before first listen
+  INFO(NCCL_R2CC, "DEBUG: Channel %d calling listen for PRIMARY dev=%d", 
+       resources->channelId, resources->netDev);
+  NCCLCHECK(proxyState->ncclNet->listen(resources->netDev, respBuff, &resources->netListenComm));
+  INFO(NCCL_R2CC, "DEBUG: Channel %d PRIMARY listen SUCCESS, listenComm=%p", 
+       resources->channelId, resources->netListenComm);
+  
+  // R2CC: Log primary handle details with Connection prefix
+  ncclNetHandle_t* primaryHandle = (ncclNetHandle_t*)respBuff;
+  uint8_t* h1bytes = (uint8_t*)primaryHandle;
+  INFO(NCCL_R2CC, "Connection: ListenComm at rank=%d channel=%d type=PRIMARY dev=%d listenComm=%p handle=[%02x%02x%02x%02x%02x%02x%02x%02x]",
+       resources->tpRank, resources->channelId, resources->netDev, resources->netListenComm,
+       h1bytes[0], h1bytes[1], h1bytes[2], h1bytes[3], h1bytes[4], h1bytes[5], h1bytes[6], h1bytes[7]);
+  
+  TRACE(NCCL_INIT, "listen 2");
+
+  // R2CC: Create backup listen socket (now protected by mutex in ncclIbListen)
+  INFO(NCCL_R2CC, "DEBUG: Channel %d calling listen for BACKUP dev=%d", 
+       resources->channelId, resources->netDevBackup);
+  NCCLCHECK(proxyState->ncclNet->listen(resources->netDevBackup,
+                                         ((char*)respBuff) + sizeof(ncclNetHandle_t),
+                                         &resources->netListenCommBackup));
+  INFO(NCCL_R2CC, "DEBUG: Channel %d BACKUP listen SUCCESS, listenCommBackup=%p", 
+       resources->channelId, resources->netListenCommBackup);
+  
+  // R2CC: Log backup handle details with Connection prefix
+  ncclNetHandle_t* backupHandle = (ncclNetHandle_t*)(((char*)respBuff) + sizeof(ncclNetHandle_t));
+  uint8_t* h2bytes = (uint8_t*)backupHandle;
+  INFO(NCCL_R2CC, "Connection: ListenComm at rank=%d channel=%d type=BACKUP dev=%d listenComm=%p handle=[%02x%02x%02x%02x%02x%02x%02x%02x]",
+       resources->tpRank, resources->channelId, resources->netDevBackup, resources->netListenCommBackup,
+       h2bytes[0], h2bytes[1], h2bytes[2], h2bytes[3], h2bytes[4], h2bytes[5], h2bytes[6], h2bytes[7]);
+  
+  // Debug: Print handle addresses and content
+  ncclNetHandle_t* handle1 = (ncclNetHandle_t*)respBuff;
+  ncclNetHandle_t* handle2 = (ncclNetHandle_t*)(((char*)respBuff) + sizeof(ncclNetHandle_t));
+  INFO(NCCL_R2CC, "recvProxySetup[%d]: Channel %d created handles - primary at %p, backup at %p", 
+       setupCount, resources->channelId, handle1, handle2);
+  
+  // Debug: Log first 8 bytes of each handle as identifier
+  uint64_t* h1 = (uint64_t*)handle1;
+  uint64_t* h2 = (uint64_t*)handle2;
+  INFO(NCCL_R2CC, "recvProxySetup[%d]: Channel %d handle IDs - primary=%lx, backup=%lx", 
+       setupCount, resources->channelId, *h1, *h2);
+
+  // char line[SOCKET_NAME_MAXLEN+1];
+  // char line2[SOCKET_NAME_MAXLEN+1];
+  // if(resources->channelId == 0){
+  //   TRACE(NCCL_INIT, "resources->channelId == 0 && check the handle 1 addr %s magic %lu", ncclSocketToString((ncclSocketAddress*)respBuff, line), *((uint64_t*)((char*)respBuff + sizeof(ncclSocketAddress))));
+  //   TRACE(NCCL_INIT, "resources->channelId == 0 && check the handle 2 addr %s magic %lu", ncclSocketToString((ncclSocketAddress*)((char*)respBuff+128), line2), *((uint64_t*)((char*)respBuff+128) +sizeof(ncclSocketAddress) ));
+  // }
+  // TRACE(NCCL_INIT, "sizeof ncclNetHandle_t %lu, sizeof ncclConnect %lu", sizeof(ncclNetHandle_t), sizeof(ncclConnect));
+
   *done = 1;
 
   return ncclSuccess;
@@ -653,9 +973,41 @@ static ncclResult_t ncclNetGetDeviceHandle(ncclNetDeviceType type, int version, 
 
 static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState, void* reqBuff, int reqSize, void* respBuff, int respSize, int* done) {
   struct sendNetResources* resources = (struct sendNetResources*)(connection->transportResources);
-  if (reqSize != sizeof(netSendConnectArgs)) return ncclInternalError;
+  resources->useBackup = 0;
+  
+  // R2CC: Log detailed connect info
+  static int connectCount = 0;
+  connectCount++;
+  
+  // Check R2CC_MODE environment variable
+  const char* r2ccMode = getenv("R2CC_MODE");
+  if (r2ccMode && atoi(r2ccMode) == 1) {
+    // Simulate disable of device 1 (second device)
+    if (resources->netDev == 0) {
+      resources->useBackup = 1;
+      INFO(NCCL_R2CC, "R2CC_MODE=1 (SEND-CONNECT): Channel %d will use backup for device %d", 
+           resources->channelId, resources->netDev);
+    }
+  }
+  // if (reqSize != sizeof(netSendConnectArgs)) return ncclInternalError;
   ncclResult_t ret = ncclSuccess;
+  ncclResult_t ret2 = ncclSuccess;
   netSendConnectArgs* req = (netSendConnectArgs*) reqBuff;
+  
+  // R2CC: Log received handles only once at the beginning
+  if (!resources->connectInitLogged) {
+    uint8_t* hbytes = (uint8_t*)req->handle;
+    uint8_t* hbytes2 = (uint8_t*)((req+1)->handle);
+    INFO(NCCL_R2CC, "Connection: Connecting from rank=%d channel=%d type=PRIMARY dev=%d to handle=[%02x%02x%02x%02x%02x%02x%02x%02x] remoteRank=%d",
+         resources->tpRank, resources->channelId, resources->netDev,
+         hbytes[0], hbytes[1], hbytes[2], hbytes[3], hbytes[4], hbytes[5], hbytes[6], hbytes[7],
+         resources->tpRemoteRank);
+    INFO(NCCL_R2CC, "Connection: Connecting from rank=%d channel=%d type=BACKUP dev=%d to handle=[%02x%02x%02x%02x%02x%02x%02x%02x] remoteRank=%d",
+         resources->tpRank, resources->channelId, resources->netDevBackup,
+         hbytes2[0], hbytes2[1], hbytes2[2], hbytes2[3], hbytes2[4], hbytes2[5], hbytes2[6], hbytes2[7],
+         resources->tpRemoteRank);
+    resources->connectInitLogged = 1;
+  }
   NCCLCHECK(ncclNetGetDeviceHandle(resources->netDeviceType, resources->netDeviceVersion, false /*isRecv*/, &resources->netDeviceHandle));
   if (resources->shared) {
     // Shared buffers
@@ -683,16 +1035,112 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
     }
   } else {
     // Connect to remote peer
-    ret = proxyState->ncclNet->connect(resources->netDev, req->handle, &resources->netSendComm, &resources->netDeviceHandle);
+    // TRACE(NCCL_INIT, "before netSendComm");
+    // ret = proxyState->ncclNet->connect(resources->netDev, req->handle, &resources->netSendComm, &resources->netDeviceHandle);
+    // TRACE(NCCL_INIT, "after netSendComm, before netSendCommBackup");
+    // TRACE(NCCL_INIT, "ret = %d", ret);
+
+    // ret2 = proxyState->ncclNet->connect(resources->netDevBackup, (req+1)->handle, &resources->netSendCommBackup, &resources->netDeviceHandleBackup);
+    // TRACE(NCCL_INIT, "after netSendCommBackup");
+    // TRACE(NCCL_INIT, "ret2 = %d", ret2);
     connection->proxyAppendPtr = &connection->proxyAppend;
   }
+  // char line[SOCKET_NAME_MAXLEN+1];
+  // char line2[SOCKET_NAME_MAXLEN+1];
+  // if(resources->channelId == 0){
+  //   TRACE(NCCL_INIT, "resources->channelId == 0 && check the handle 1 addr %s magic %lu", ncclSocketToString((ncclSocketAddress*)req, line), *((uint64_t*)((char*)req + sizeof(ncclSocketAddress))));
+  //   TRACE(NCCL_INIT, "resources->channelId == 0 && check the handle 2 addr %s magic %lu", ncclSocketToString((ncclSocketAddress*)(req+1), line2), *((uint64_t*)((char*)(req+1) +sizeof(ncclSocketAddress) )));
+  // }
 
-  NCCLCHECK(ret);
+
+
+  // NCCLCHECK(ret);
+  // NCCLCHECK(ret2);
+
+  // if(resources->netSendComm == NULL && resources->netSendCommBackup == NULL){
+  //   TRACE(NCCL_INIT, "default dev %d == NULL, backup  dev %d == NULL channelId %d", resources->netDev, resources->netDevBackup, resources->channelId);
+  // }
+
+  // if(resources->netSendComm != NULL && resources->netSendCommBackup == NULL){
+  //   TRACE(NCCL_INIT, "default dev %d done, backup  dev %d == NULL channelId %d", resources->netDev, resources->netDevBackup, resources->channelId);
+  // }
+  //   if(resources->netSendComm == NULL && resources->netSendCommBackup != NULL){
+  //   TRACE(NCCL_INIT, "default dev %d == NULL, backup  dev %d done channelId %d", resources->netDev, resources->netDevBackup, resources->channelId);
+  // }
+
+  // if (resources->netSendComm == NULL) {
+  // //if (resources->netSendComm == NULL || resources->netSendCommBackup == NULL) {
+  //   *done = 0;
+  //   return ncclInProgress;
+  // }
+
+  // R2CC: Parallel connect - try both connections simultaneously
+  int primaryDone = 0;
+  int backupDone = 0;
+  
+  // Try to connect PRIMARY
   if (resources->netSendComm == NULL) {
+    if (!resources->primaryConnStartLogged) {
+      uint8_t* hbytes = (uint8_t*)req->handle;
+      INFO(NCCL_R2CC, "Connection: Connect START rank=%d channel=%d type=PRIMARY dev=%d to handle=[%02x%02x%02x%02x%02x%02x%02x%02x]", 
+           resources->tpRank, resources->channelId, resources->netDev,
+           hbytes[0], hbytes[1], hbytes[2], hbytes[3], hbytes[4], hbytes[5], hbytes[6], hbytes[7]);
+      resources->primaryConnStartLogged = 1;
+    }
+    // R2CC DEBUG: Log before connect
+    INFO(NCCL_R2CC, "DEBUG: Channel %d calling connect for PRIMARY dev=%d, handle=%p", 
+         resources->channelId, resources->netDev, req->handle);
+    ret = proxyState->ncclNet->connect(resources->netDev, req->handle, &resources->netSendComm, &resources->netDeviceHandle);
+    INFO(NCCL_R2CC, "DEBUG: Channel %d PRIMARY connect returned %d, sendComm=%p", 
+         resources->channelId, ret, resources->netSendComm);
+    NCCLCHECK(ret);
+    if (resources->netSendComm != NULL) {
+      INFO(NCCL_R2CC, "Connection: Connect COMPLETED rank=%d channel=%d type=PRIMARY dev=%d sendComm=%p", 
+           resources->tpRank, resources->channelId, resources->netDev, resources->netSendComm);
+      primaryDone = 1;
+    }
+  } else {
+    primaryDone = 1;
+  }
+
+  // Try to connect BACKUP (parallel with primary)
+  if (resources->netSendCommBackup == NULL) {
+    if (!resources->backupConnStartLogged) {
+      uint8_t* hbytes2 = (uint8_t*)((req+1)->handle);
+      INFO(NCCL_R2CC, "Connection: Connect START rank=%d channel=%d type=BACKUP dev=%d to handle=[%02x%02x%02x%02x%02x%02x%02x%02x]", 
+           resources->tpRank, resources->channelId, resources->netDevBackup,
+           hbytes2[0], hbytes2[1], hbytes2[2], hbytes2[3], hbytes2[4], hbytes2[5], hbytes2[6], hbytes2[7]);
+      resources->backupConnStartLogged = 1;
+    }
+    // R2CC DEBUG: Log before backup connect
+    INFO(NCCL_R2CC, "DEBUG: Channel %d calling connect for BACKUP dev=%d, handle=%p", 
+         resources->channelId, resources->netDevBackup, (req+1)->handle);
+    ret2 = proxyState->ncclNet->connect(resources->netDevBackup, (req+1)->handle, &resources->netSendCommBackup, &resources->netDeviceHandleBackup);
+    INFO(NCCL_R2CC, "DEBUG: Channel %d BACKUP connect returned %d, sendCommBackup=%p", 
+         resources->channelId, ret2, resources->netSendCommBackup);
+    NCCLCHECK(ret2);
+    if (resources->netSendCommBackup != NULL) {
+      INFO(NCCL_R2CC, "Connection: Connect COMPLETED rank=%d channel=%d type=BACKUP dev=%d sendComm=%p", 
+           resources->tpRank, resources->channelId, resources->netDevBackup, resources->netSendCommBackup);
+      backupDone = 1;
+    }
+  } else {
+    backupDone = 1;
+  }
+
+  // Check if both connections are complete
+  if (primaryDone && backupDone) {
+    *done = 1;
+    INFO(NCCL_R2CC, "PARALLEL CONNECT: Channel %d - Both connections COMPLETE", resources->channelId);
+  } else {
     *done = 0;
+    const char* primaryStatus = primaryDone ? "DONE" : "CONNECTING";
+    const char* backupStatus = backupDone ? "DONE" : "CONNECTING";
+    INFO(NCCL_R2CC, "PARALLEL CONNECT: Channel %d - PRIMARY=%s, BACKUP=%s", 
+         resources->channelId, primaryStatus, backupStatus);
     return ncclInProgress;
   }
-  *done = 1;
+  TRACE(NCCL_INIT, "sendProxyConnect done with two comm channelId %d", resources->channelId);
 
   if (resources->netDeviceHandle) {
     connection->netDeviceHandle = resources->netDeviceHandle;
@@ -700,6 +1148,15 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
   } else {
     connection->needsProxyProgress = 1;
   }
+
+  if (resources->netDeviceHandleBackup) {
+    connection->netDeviceHandleBackup = resources->netDeviceHandleBackup;
+    connection->needsProxyProgress = connection->netDeviceHandleBackup->needsProxyProgress;
+  } else {
+    connection->needsProxyProgress = 1;
+  }
+
+
 
   // Create structures
   struct connectMap* map = &resources->map;
@@ -783,16 +1240,20 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
         int dmabuf_fd;
         CUCHECK(cuMemGetHandleForAddressRange((void *)&dmabuf_fd, (CUdeviceptr)resources->buffers[p], resources->buffSizes[p], CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0));
         NCCLCHECK(proxyState->ncclNet->regMrDmaBuf(resources->netSendComm, resources->buffers[p], resources->buffSizes[p], type, 0ULL, dmabuf_fd, &resources->mhandles[p]));
+        NCCLCHECK(proxyState->ncclNet->regMrDmaBuf(resources->netSendCommBackup, resources->buffers[p], resources->buffSizes[p], type, 0ULL, dmabuf_fd, &resources->mhandlesBackup[p]));
         (void)close(dmabuf_fd);
       } else // FALL-THROUGH to nv_peermem GDR path
 #endif
       {
         NCCLCHECK(proxyState->ncclNet->regMr(resources->netSendComm, resources->buffers[p], resources->buffSizes[p], NCCL_NET_MAP_DEV_MEM(map, buffs[p]) ? NCCL_PTR_CUDA : NCCL_PTR_HOST, &resources->mhandles[p]));
+        NCCLCHECK(proxyState->ncclNet->regMr(resources->netSendCommBackup, resources->buffers[p], resources->buffSizes[p], NCCL_NET_MAP_DEV_MEM(map, buffs[p]) ? NCCL_PTR_CUDA : NCCL_PTR_HOST, &resources->mhandlesBackup[p]));
       }
 
       // Copy the mhandle dptr, if implemented
       if (resources->netDeviceHandle && proxyState->ncclNet->getDeviceMr)
         NCCLCHECK(proxyState->ncclNet->getDeviceMr(resources->netSendComm, resources->mhandles[p], &connection->mhandles[p]));
+      if (resources->netDeviceHandleBackup && proxyState->ncclNet->getDeviceMr)
+        NCCLCHECK(proxyState->ncclNet->getDeviceMr(resources->netSendCommBackup, resources->mhandlesBackup[p], &connection->mhandlesBackup[p]));
     }
   }
 
@@ -807,10 +1268,28 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
   struct recvNetResources* resources = (struct recvNetResources*)(connection->transportResources);
   netRecvConnectArgs* req = (netRecvConnectArgs*) reqBuff;
   resources->tpRemoteProxyRank = req->proxyRank;
+  resources->useBackup = 0;
+  
+  // Check R2CC_MODE environment variable
+  const char* r2ccMode = getenv("R2CC_MODE");
+  if (r2ccMode && atoi(r2ccMode) == 1) {
+    // Simulate disable of device 1 (second device)
+    if (resources->netDev == 0) {
+      resources->useBackup = 1;
+      INFO(NCCL_R2CC, "R2CC_MODE=1 (RECV-CONNECT): Channel %d will use backup for device %d", 
+           resources->channelId, resources->netDev);
+      // R2CC DEBUG: Log listen handles state
+      INFO(NCCL_R2CC, "DEBUG: Channel %d in recvProxyConnect - netListenComm=%p, netListenCommBackup=%p", 
+           resources->channelId, resources->netListenComm, resources->netListenCommBackup);
+    }
+  }
   ncclResult_t ret = ncclSuccess;
+  ncclResult_t ret2 = ncclSuccess;
 
   NCCLCHECK(ncclNetGetDeviceHandle(resources->netDeviceType, resources->netDeviceVersion, true /*isRecv*/, &resources->netDeviceHandle));
+  NCCLCHECK(ncclNetGetDeviceHandle(resources->netDeviceTypeBackup, resources->netDeviceVersionBackup, true /*isRecv*/, &resources->netDeviceHandleBackup));
   // Finish connection establishment from remote peer
+  // TRACE(NCCL_INIT, "resources->shared %d", resources->shared);
   if (resources->shared) {
     // Shared buffers
     struct ncclProxyProgressState* progressState = &proxyState->progressState;
@@ -837,16 +1316,102 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
     }
   } else {
     // Connect to remote peer
-    ret = proxyState->ncclNet->accept(resources->netListenComm, &resources->netRecvComm, &resources->netDeviceHandle);
+    // TRACE(NCCL_INIT, "accept netListenComm 1 net name %s", proxyState->ncclNet->name);
+    // ret = proxyState->ncclNet->accept(resources->netListenComm, &resources->netRecvComm, &resources->netDeviceHandle);
+    // TRACE(NCCL_INIT, "accept netListenCommBackup 2 net name %s", proxyState->ncclNet->name);
+    // ret2 = proxyState->ncclNet->accept(resources->netListenCommBackup, &resources->netRecvCommBackup, &resources->netDeviceHandleBackup);
     connection->proxyAppendPtr = &connection->proxyAppend;
   }
 
-  NCCLCHECK(ret);
+
+  // TRACE(NCCL_INIT, "ret = %d", ret);
+  // TRACE(NCCL_INIT, "ret2 = %d", ret2);
+  // if(resources->netRecvComm == NULL && resources->netRecvCommBackup == NULL){
+  //   TRACE(NCCL_INIT, "default dev %d == NULL, backup  dev %d == NULL channelId %d", resources->netDev, resources->netDevBackup, resources->channelId);
+  // }
+
+  // if(resources->netRecvComm != NULL && resources->netRecvCommBackup == NULL){
+  //   TRACE(NCCL_INIT, "default dev %d done, backup  dev %d == NULL channelId %d", resources->netDev, resources->netDevBackup, resources->channelId);
+  // }
+  //   if(resources->netRecvComm == NULL && resources->netRecvCommBackup != NULL){
+  //   TRACE(NCCL_INIT, "default dev %d == NULL, backup  dev %d done channelId %d", resources->netDev, resources->netDevBackup, resources->channelId);
+  // }
+  
+
+
+  // NCCLCHECK(ret);
+  // NCCLCHECK(ret2);
+  //if (resources->netRecvComm == NULL || resources->netRecvCommBackup == NULL) {
+  // if (resources->netRecvComm == NULL) {
+  //   *done = 0;
+  //   return ncclInProgress;
+  // }
+
+  // R2CC: Parallel accept - try both connections simultaneously
+  int primaryDone = 0;
+  int backupDone = 0;
+  
+  // Try to accept PRIMARY
   if (resources->netRecvComm == NULL) {
+    if (!resources->primaryAcceptStartLogged) {
+      INFO(NCCL_R2CC, "Connection: Accept START rank=%d channel=%d type=PRIMARY dev=%d listenComm=%p", 
+           resources->tpRank, resources->channelId, resources->netDev, resources->netListenComm);
+      resources->primaryAcceptStartLogged = 1;
+    }
+    // R2CC DEBUG: Log before accept
+    INFO(NCCL_R2CC, "DEBUG: Channel %d calling accept for PRIMARY, listenComm=%p", 
+         resources->channelId, resources->netListenComm);
+    ret = proxyState->ncclNet->accept(resources->netListenComm, &resources->netRecvComm, &resources->netDeviceHandle);
+    INFO(NCCL_R2CC, "DEBUG: Channel %d PRIMARY accept returned %d, recvComm=%p", 
+         resources->channelId, ret, resources->netRecvComm);
+    NCCLCHECK(ret);
+    if (resources->netRecvComm != NULL) {
+      INFO(NCCL_R2CC, "Connection: Accept COMPLETED rank=%d channel=%d type=PRIMARY dev=%d recvComm=%p from remoteRank=%d", 
+           resources->tpRank, resources->channelId, resources->netDev, resources->netRecvComm, resources->tpRemoteRank);
+      primaryDone = 1;
+    }
+  } else {
+    primaryDone = 1;
+  }
+
+  // Try to accept BACKUP (parallel with primary)
+  if (resources->netRecvCommBackup == NULL) {
+    if (!resources->backupAcceptStartLogged) {
+      INFO(NCCL_R2CC, "Connection: Accept START rank=%d channel=%d type=BACKUP dev=%d listenComm=%p", 
+           resources->tpRank, resources->channelId, resources->netDevBackup, resources->netListenCommBackup);
+      resources->backupAcceptStartLogged = 1;
+    }
+    // R2CC DEBUG: Log before backup accept
+    INFO(NCCL_R2CC, "DEBUG: Channel %d calling accept for BACKUP, listenCommBackup=%p", 
+         resources->channelId, resources->netListenCommBackup);
+    ret2 = proxyState->ncclNet->accept(resources->netListenCommBackup, &resources->netRecvCommBackup, &resources->netDeviceHandleBackup);
+    INFO(NCCL_R2CC, "DEBUG: Channel %d BACKUP accept returned %d, recvCommBackup=%p", 
+         resources->channelId, ret2, resources->netRecvCommBackup);
+    NCCLCHECK(ret2);
+    if (resources->netRecvCommBackup != NULL) {
+      INFO(NCCL_R2CC, "Connection: Accept COMPLETED rank=%d channel=%d type=BACKUP dev=%d recvComm=%p from remoteRank=%d", 
+           resources->tpRank, resources->channelId, resources->netDevBackup, resources->netRecvCommBackup, resources->tpRemoteRank);
+      backupDone = 1;
+    }
+  } else {
+    backupDone = 1;
+  }
+
+  // Check if both connections are complete
+  if (primaryDone && backupDone) {
+    *done = 1;
+    INFO(NCCL_R2CC, "PARALLEL ACCEPT: Channel %d - Both connections COMPLETE", resources->channelId);
+  } else {
     *done = 0;
+    const char* primaryStatus = primaryDone ? "DONE" : "ACCEPTING";
+    const char* backupStatus = backupDone ? "DONE" : "ACCEPTING";
+    INFO(NCCL_R2CC, "PARALLEL ACCEPT: Channel %d - PRIMARY=%s, BACKUP=%s", 
+         resources->channelId, primaryStatus, backupStatus);
     return ncclInProgress;
   }
+
   *done = 1;
+  TRACE(NCCL_INIT, "recvProxyConnect done with two comm channelId %d", resources->channelId);
 
   if (resources->netDeviceHandle) {
     connection->netDeviceHandle = resources->netDeviceHandle;
@@ -855,7 +1420,15 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
     connection->needsProxyProgress = 1;
   }
 
-  NCCLCHECK(proxyState->ncclNet->closeListen(resources->netListenComm));
+  if (resources->netDeviceHandleBackup) {
+    connection->netDeviceHandleBackup = resources->netDeviceHandleBackup;
+    connection->needsProxyProgress = connection->netDeviceHandleBackup->needsProxyProgress;
+  } else {
+    connection->needsProxyProgress = 1;
+  }
+
+  // R2CC: Do NOT close listen comms here - they may be needed for backup connections
+  // The listen comms will be properly closed during resource cleanup
 
   // Create structures
   struct connectMap* map = &resources->map;
@@ -926,16 +1499,28 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
         int dmabuf_fd;
         CUCHECK(cuMemGetHandleForAddressRange((void *)&dmabuf_fd, (CUdeviceptr)resources->buffers[p], resources->buffSizes[p], CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0));
         NCCLCHECK(proxyState->ncclNet->regMrDmaBuf(resources->netRecvComm, resources->buffers[p], resources->buffSizes[p], type, 0ULL, dmabuf_fd, &resources->mhandles[p]));
+        NCCLCHECK(proxyState->ncclNet->regMrDmaBuf(resources->netRecvCommBackup, resources->buffers[p], resources->buffSizes[p], type, 0ULL, dmabuf_fd, &resources->mhandlesBackup[p]));
         (void)close(dmabuf_fd);
       } else // FALL-THROUGH to nv_peermem GDR path
 #endif
       {
+        INFO(NCCL_R2CC, "Channel %d: Registering buffer[%d] addr=%p size=%ld with PRIMARY comm=%p (dev=%d)", 
+             resources->channelId, p, resources->buffers[p], resources->buffSizes[p], resources->netRecvComm, resources->netDev);
         NCCLCHECK(proxyState->ncclNet->regMr(resources->netRecvComm, resources->buffers[p], resources->buffSizes[p], NCCL_NET_MAP_DEV_MEM(map, buffs[p]) ? NCCL_PTR_CUDA : NCCL_PTR_HOST, &resources->mhandles[p]));
+        INFO(NCCL_R2CC, "Channel %d: PRIMARY registration successful, mhandle[%d]=%p", resources->channelId, p, resources->mhandles[p]);
+        
+        INFO(NCCL_R2CC, "Channel %d: Registering buffer[%d] addr=%p size=%ld with BACKUP comm=%p (dev=%d)", 
+             resources->channelId, p, resources->buffers[p], resources->buffSizes[p], resources->netRecvCommBackup, resources->netDevBackup);
+        NCCLCHECK(proxyState->ncclNet->regMr(resources->netRecvCommBackup, resources->buffers[p], resources->buffSizes[p], NCCL_NET_MAP_DEV_MEM(map, buffs[p]) ? NCCL_PTR_CUDA : NCCL_PTR_HOST, &resources->mhandlesBackup[p]));
+        INFO(NCCL_R2CC, "Channel %d: BACKUP registration successful, mhandleBackup[%d]=%p", resources->channelId, p, resources->mhandlesBackup[p]);
       }
 
       // Copy the mhandle dptr
       if (resources->netDeviceType != NCCL_NET_DEVICE_HOST && proxyState->ncclNet->getDeviceMr)
         NCCLCHECK(proxyState->ncclNet->getDeviceMr(resources->netRecvComm, resources->mhandles[p], &connection->mhandles[p]));
+
+      if (resources->netDeviceType != NCCL_NET_DEVICE_HOST && proxyState->ncclNet->getDeviceMr)
+        NCCLCHECK(proxyState->ncclNet->getDeviceMr(resources->netRecvCommBackup, resources->mhandlesBackup[p], &connection->mhandlesBackup[p]));
     }
   }
 
@@ -953,9 +1538,15 @@ static ncclResult_t sendProxyFree(struct ncclProxyConnection* connection, struct
   }
 
   if (connection->state == connConnected) {
+    // R2CC: Deregister memory for both primary and backup paths
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
       if (resources->buffers[p]) {
-        NCCLCHECK(proxyState->ncclNet->deregMr(resources->netSendComm, resources->mhandles[p]));
+        if (resources->netSendComm) {
+          NCCLCHECK(proxyState->ncclNet->deregMr(resources->netSendComm, resources->mhandles[p]));
+        }
+        if (resources->netSendCommBackup) {
+          NCCLCHECK(proxyState->ncclNet->deregMr(resources->netSendCommBackup, resources->mhandlesBackup[p]));
+        }
       }
     }
     struct connectMapMem* mems = resources->map.mems;
@@ -977,16 +1568,37 @@ static ncclResult_t sendProxyFree(struct ncclProxyConnection* connection, struct
       if (resources->maxRecvs > 1 && ncclParamNetSharedComms()) {
         struct ncclSharedNetComms* comms = proxyState->progressState.netComms[resources->netDev]+resources->tpRemoteRank;
         comms->sendRefCount[resources->channelId]--;
-        if (comms->sendRefCount[resources->channelId] == 0) NCCLCHECK(proxyState->ncclNet->closeSend(comms->sendComm[resources->channelId]));
+        if (comms->sendRefCount[resources->channelId] == 0) {
+          if (comms->sendComm[resources->channelId]) {
+            NCCLCHECK(proxyState->ncclNet->closeSend(comms->sendComm[resources->channelId]));
+            comms->sendComm[resources->channelId] = NULL;
+          }
+        }
       } else {
-        NCCLCHECK(proxyState->ncclNet->closeSend(resources->netSendComm));
+        if (resources->netSendComm) {
+          NCCLCHECK(proxyState->ncclNet->closeSend(resources->netSendComm));
+        }
+        if (resources->netSendCommBackup) {
+          NCCLCHECK(proxyState->ncclNet->closeSend(resources->netSendCommBackup));
+        }
       }
     } else {
-      NCCLCHECK(proxyState->ncclNet->closeSend(resources->netSendComm));
+      // R2CC: Close both primary and backup send comms
+      if (resources->netSendComm) {
+        NCCLCHECK(proxyState->ncclNet->closeSend(resources->netSendComm));
+      }
+      if (resources->netSendCommBackup) {
+        NCCLCHECK(proxyState->ncclNet->closeSend(resources->netSendCommBackup));
+      }
     }
   }
 
-  if (resources) free(resources);
+  // R2CC: Clear the connection's transport resources pointer
+  if (resources) {
+    INFO(NCCL_R2CC, "sendProxyFree: Freeing resources for channel %d", resources->channelId);
+    connection->transportResources = NULL;
+    free(resources);
+  }
   return ncclSuccess;
 }
 
@@ -998,9 +1610,15 @@ static ncclResult_t recvProxyFree(struct ncclProxyConnection* connection, struct
   }
 
   if (connection->state == connConnected) {
+    // R2CC: Deregister memory for both primary and backup paths
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
       if (resources->buffers[p]) {
-        NCCLCHECK(proxyState->ncclNet->deregMr(resources->netRecvComm, resources->mhandles[p]));
+        if (resources->netRecvComm) {
+          NCCLCHECK(proxyState->ncclNet->deregMr(resources->netRecvComm, resources->mhandles[p]));
+        }
+        if (resources->netRecvCommBackup) {
+          NCCLCHECK(proxyState->ncclNet->deregMr(resources->netRecvCommBackup, resources->mhandlesBackup[p]));
+        }
       }
     }
     struct connectMapMem* mems = resources->map.mems;
@@ -1018,43 +1636,198 @@ static ncclResult_t recvProxyFree(struct ncclProxyConnection* connection, struct
       if (resources->maxRecvs > 1 && ncclParamNetSharedComms()) {
         struct ncclSharedNetComms* comms = proxyState->progressState.netComms[resources->netDev] + resources->tpRemoteProxyRank;
         comms->recvRefCount[resources->channelId]--;
-        if (comms->recvRefCount[resources->channelId] == 0) NCCLCHECK(proxyState->ncclNet->closeRecv(comms->recvComm[resources->channelId]));
+        if (comms->recvRefCount[resources->channelId] == 0) {
+          if (comms->recvComm[resources->channelId]) {
+            NCCLCHECK(proxyState->ncclNet->closeRecv(comms->recvComm[resources->channelId]));
+            comms->recvComm[resources->channelId] = NULL;
+          }
+        }
       } else {
-        NCCLCHECK(proxyState->ncclNet->closeRecv(resources->netRecvComm));
+        if (resources->netRecvComm) {
+          NCCLCHECK(proxyState->ncclNet->closeRecv(resources->netRecvComm));
+        }
+        if (resources->netRecvCommBackup) {
+          NCCLCHECK(proxyState->ncclNet->closeRecv(resources->netRecvCommBackup));
+        }
       }
     } else {
-      NCCLCHECK(proxyState->ncclNet->closeRecv(resources->netRecvComm));
+      // R2CC: Close both primary and backup recv comms
+      if (resources->netRecvComm) {
+        NCCLCHECK(proxyState->ncclNet->closeRecv(resources->netRecvComm));
+      }
+      if (resources->netRecvCommBackup) {
+        NCCLCHECK(proxyState->ncclNet->closeRecv(resources->netRecvCommBackup));
+      }
+    }
+    
+    // R2CC: Close listen comms if they still exist
+    if (resources->netListenComm) {
+      INFO(NCCL_R2CC, "recvProxyFree: Closing netListenComm for channel %d", resources->channelId);
+      NCCLCHECK(proxyState->ncclNet->closeListen(resources->netListenComm));
+      resources->netListenComm = NULL;
+    }
+    if (resources->netListenCommBackup) {
+      INFO(NCCL_R2CC, "recvProxyFree: Closing netListenCommBackup for channel %d", resources->channelId);
+      NCCLCHECK(proxyState->ncclNet->closeListen(resources->netListenCommBackup));
+      resources->netListenCommBackup = NULL;
     }
   }
 
-  if (resources) free(resources);
+  // R2CC: Clear the connection's transport resources pointer
+  if (resources) {
+    INFO(NCCL_R2CC, "recvProxyFree: Freeing resources for channel %d", resources->channelId);
+    connection->transportResources = NULL;
+    free(resources);
+  }
   return ncclSuccess;
 }
 
 static_assert(NCCL_STEPS <= NCCL_NET_MAX_REQUESTS, "Not enough net requests to cover for steps");
 #define MAX_NET_SIZE (1024*1024*1024L) // Rather than send INT_MAX which is 2G-1, send a power of two.
 
+
+#include <thread>
+#include <chrono>
+
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+
+int send_total_count = 0;
+int log_counter = 0;
+int isend_counter=0;
+int if_posted_counter=0;
+int if_transmitted_counter=0;
+int if_reg_counter=0;
+
 static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
+  // for (int s=0; s<args->nsubs; s++) {
+  //   struct ncclProxySubArgs* sub = args->subs+s;
+  //   struct sendNetResources* resources = (struct sendNetResources*) (sub->connection->transportResources);
+  //   int change = 0;
+  //   //proxyState->ncclNet->checkSwitchToBackup(resources->netSendComm, &change);
+  //   //TRACE(NCCL_NET, "netSendComm change %d", change);
+  //   proxyState->ncclNet->checkSwitchToBackup(resources->netSendCommBackup, &change);
+  //   TRACE(NCCL_NET, "netSendCommBackup change %d", change);
+  //   exit(0);
+  // }
+
+
+
+
   if (args->state == ncclProxyOpReady) {
+    // Add timestamp for send start
+    struct timespec start_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    if (args->subs && args->nsubs > 0) {
+      INFO(NCCL_R2CC, "[TIMESTAMP] SendProxy START: channel=%d peer=%d time=%ld.%09ld", 
+           args->subs[0].channelId, args->subs[0].peer, start_time.tv_sec, start_time.tv_nsec);
+    }
+    send_total_count++;
+    args->id = send_total_count;  
+    // TRACE(NCCL_NET, "sendproxyprogress: [%s] id=%d 1. ncclProxyOpReady", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), args->id);
     for (int s=0; s<args->nsubs; s++) {
       struct ncclProxySubArgs* sub = args->subs+s;
-      struct sendNetResources* resources = (struct sendNetResources*) (sub->connection->transportResources);
+      struct sendNetResources* resources =  (struct sendNetResources*) (sub->connection->transportResources);
+
       // Round to next multiple of sliceSteps
       sub->base = ROUNDUP(resources->step, args->chunkSteps);
       // Set step base for next op
       resources->step = sub->base + sub->nsteps;
       sub->posted = sub->transmitted = sub->done = 0;
       ncclProfilerStartSendProxyOpEvent(s, args);
+
+
+      static int forceSendBackupChannels = -1;
+      if (forceSendBackupChannels == -1) {
+        const char* env = getenv("NCCL_FORCE_BACKUP_CHANNELS");
+        forceSendBackupChannels = env ? atoi(env) : 0;
+      }
+      
+      if (forceSendBackupChannels) {
+        if(sub->channelId == 0 || sub->channelId == 8){
+          resources->useBackup = 1;
+        }
+      }
+
+
       if (sub->reg && sub->nbytes > 0) {
+        // Register with both comms for consistency
         NCCLCHECK(proxyState->ncclNet->regMr(resources->netSendComm, sub->recvbuff, sub->nbytes, NCCL_PTR_CUDA, &sub->mhandle));
+        NCCLCHECK(proxyState->ncclNet->regMr(resources->netSendCommBackup, sub->recvbuff, sub->nbytes, NCCL_PTR_CUDA, &sub->mhandleBackup));
+        INFO(NCCL_R2CC, "SEND: Channel %d registered memory with both PRIMARY and BACKUP comms, buffer=%p, size=%ld", 
+             sub->channelId, sub->recvbuff, sub->nbytes);
       } else {
+        // For pre-registered buffers, copy both handles from resources  
         sub->mhandle = resources->mhandles[args->protocol];
+        sub->mhandleBackup = resources->mhandlesBackup[args->protocol];
       }
     }
+    struct ncclProxySubArgs* sub = args->subs+0;
+    struct sendNetResources* resources =  (struct sendNetResources*) (sub->connection->transportResources);
+    TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d: init ncclProxyOpReady", args->id, sub->channelId, sub->base+sub->transmitted, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
     args->state = ncclProxyOpProgress;
   }
   args->idle = 1;
   if (args->state == ncclProxyOpProgress) {
+    // Process any pending OOB step-sync messages and align sender progress before continuing.
+    OobNet& oob = OobNet::Get();
+    oob.PollHotRepair();
+    for (int s=0; s<args->nsubs; s++) {
+      struct ncclProxySubArgs* sub = args->subs+s;
+      uint64_t syncAbs = 0;
+      if (oob.ConsumeStepSync(sub->channelId, &syncAbs)) {
+        struct sendNetResources* resources = (struct sendNetResources*) (sub->connection->transportResources);
+        resources->stepSyncRequested = 0;
+        if (syncAbs >= sub->base && syncAbs <= sub->base + sub->nsteps) {
+          uint64_t syncRel = syncAbs - sub->base;
+          // Ignore if receiver claims progress beyond what we've posted.
+          if (syncRel <= sub->posted) {
+            uint64_t oldDone = sub->done;
+            // Clear in-flight requests >= syncRel to avoid stale completions.
+            for (uint64_t i = syncRel; i < sub->transmitted; i++) {
+              int buffSlot = (sub->base + i) % NCCL_STEPS;
+              sub->requests[buffSlot] = NULL;
+            }
+            sub->transmitted = syncRel;
+            sub->done = syncRel;
+            sub->mhandle = resources->mhandlesBackup[args->protocol];
+            resources->useBackup = 1;
+            if (resources->shared == 0 && syncRel > oldDone) {
+              volatile uint64_t* sendHead = resources->gdcSync ? resources->gdcSync : &resources->sendMem->head;
+              if (sub->reg) {
+                // reg operations only have one net step w.r.t. GPU
+                *sendHead = sub->base + args->sliceSteps;
+              } else {
+                *sendHead = sub->base + sub->done;
+              }
+              if (resources->gdcSync) wc_store_fence();
+            }
+            INFO(NCCL_R2CC, "SEND: Step-sync applied channel=%d absStep=%" PRIu64 " (rel=%" PRIu64 "), switch to backup",
+                 sub->channelId, syncAbs, syncRel);
+          } else {
+            INFO(NCCL_R2CC, "SEND: Step-sync ignored (ahead of posted) channel=%d absStep=%" PRIu64,
+                 sub->channelId, syncAbs);
+          }
+        } else {
+          INFO(NCCL_R2CC, "SEND: Step-sync ignored (out of range) channel=%d absStep=%" PRIu64
+               " base=%" PRIu64 " nsteps=%" PRIu64,
+               sub->channelId, syncAbs, sub->base, (uint64_t)sub->nsteps);
+        }
+      }
+    }
+
+    // If any sub is waiting for step sync response, pause progress.
+    for (int s=0; s<args->nsubs; s++) {
+      struct ncclProxySubArgs* sub = args->subs+s;
+      struct sendNetResources* resources = (struct sendNetResources*) (sub->connection->transportResources);
+      if (resources->stepSyncRequested) {
+        args->idle = 1;
+        return ncclSuccess;
+      }
+    }
+
+
     int p = args->protocol;
     int maxDepth = std::min(NCCL_STEPS, NCCL_SHARED_STEPS/args->nsubs);
     for (int s=0; s<args->nsubs; s++) {
@@ -1066,6 +1839,11 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       char* localBuff = NCCL_NET_MAP_GET_POINTER(&resources->map, cpu, buffs[p]);
       // Post buffers to the GPU
       if (sub->posted < sub->nsteps && sub->posted < sub->done + maxDepth) {
+        if_posted_counter++;
+        if(if_posted_counter %1000007==0){
+          TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d, if_posted_counter++", args->id, sub->channelId, sub->base+sub->transmitted, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
+        }
+        // TRACE(NCCL_NET, "sendproxyprogress: [%s] id=%d 2. Post buffers to shared buffer", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), args->id);
         ncclProfilerStartSendProxyStepEvents(s, args, sub->posted, sub->posted+args->sliceSteps);
         int buffSlot = (sub->base+sub->posted)%NCCL_STEPS;
         if (resources->shared) {
@@ -1089,10 +1867,29 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       }
       // Check whether we received data from the GPU and send it to the network
       if (sub->transmitted < sub->posted && sub->transmitted < sub->done + NCCL_STEPS) {
+        // TRACE(NCCL_NET, "sendproxyprogress: [%s] id=%d 2. iSend it to the network", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), args->id);
         int buffSlot = (sub->base+sub->transmitted)%NCCL_STEPS;
         volatile uint64_t* recvTail = &resources->recvMem->tail;
         uint64_t tail = sub->base + (sub->reg ? 0 : sub->transmitted);
+
+        if_transmitted_counter++;
+        if(if_transmitted_counter %1000007==0){
+          TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d, if_transmitted_counter++", args->id, sub->channelId, sub->base+sub->transmitted, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
+          int a = (sub->reg || connFifo[buffSlot].size != -1);
+          int b = ((*recvTail > tail) || p == NCCL_PROTO_LL);
+
+          TRACE(NCCL_NET, "sub->reg=%d, connFifo[buffSlot].size=%ld, (*recvTail > tail)=%d, (p == NCCL_PROTO_LL)=%d, a=%d, b=%d, done=%ld, trasnmitted=%ld, recvTail=%ld", sub->reg, connFifo[buffSlot].size, (*recvTail > tail), (p == NCCL_PROTO_LL), a, b, sub->done, sub->transmitted, (*recvTail));
+        }
+
+
+        // transmitted == recvTail && transmitted all allocated successful, but didn't got a 
         if ((sub->reg || connFifo[buffSlot].size != -1) && ((*recvTail > tail) || p == NCCL_PROTO_LL)) {
+
+          if_reg_counter++;
+          if(if_reg_counter %1000007==0){
+            TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d, if_reg_counter++", args->id, sub->channelId, sub->base+sub->transmitted, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
+          }
+
           // We have something to receive, let's check if it's completely ready.
           int size = sub->reg ? std::min(MAX_NET_SIZE, sub->nbytes) : connFifo[buffSlot].size;
           bool shared = (p == NCCL_PROTO_SIMPLE) && resources->shared;
@@ -1129,9 +1926,37 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
             // Coverity complains about the size here as pointing to an out-of-scope temporary.  Which is nonsense,
             // since size is a plain integer.
             // coverity[use_invalid:FALSE]
-            NCCLCHECK(proxyState->ncclNet->isend(resources->netSendComm, buff, size, resources->tpRank, sub->mhandle, sub->requests+buffSlot));
+          
+
+            // if(sub->channelId%2==0)
+            //  NCCLCHECK(proxyState->ncclNet->isend(resources->netSendComm, buff, size, resources->tpRank, sub->mhandle, sub->requests+buffSlot));
+            //else
+            // std::this_thread::sleep_for(std::chrono::milliseconds(10));
+              // if(resources->useBackup)
+              //   TRACE(NCCL_NET, "sendProxy [%ld/%d] prepare to send, req %p, size %d, proto %d, myRank %d, channelId %d through backupComm", sub->transmitted, buffSlot, sub->requests[buffSlot], size, p, proxyState->tpRank, sub->channelId);
+              // else
+              //   TRACE(NCCL_NET, "sendProxy [%ld/%d] prepare to send, req %p, size %d, proto %d, myRank %d, channelId %d", sub->transmitted, buffSlot, sub->requests[buffSlot], size, p, proxyState->tpRank, sub->channelId);
+      
+            isend_counter++;
+            if(isend_counter %1000007==0){
+              TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d: do isend", args->id, sub->channelId, sub->base+sub->transmitted, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
+            }
+            // Log which comm is being used for isend (only when MODE1 subsystem is enabled)
+            if (resources->useBackup) {
+              INFO(NCCL_MODE1, "SEND: Channel %d using BACKUP comm for isend, size=%d", sub->channelId, size);
+            }
+            INFO(NCCL_R2CC, "SEND: Calling isend for channel=%d, buffSlot=%d, useBackup=%d", sub->channelId, buffSlot, resources->useBackup);
+            void* mhandleToUse = resources->useBackup ? sub->mhandleBackup : sub->mhandle;
+            NCCLCHECK(proxyState->ncclNet->isend(resources->useBackup ? resources->netSendCommBackup : resources->netSendComm , buff, size, resources->tpRank, mhandleToUse, sub->requests+buffSlot));
+            
             if (sub->requests[buffSlot] != NULL) {
-              TRACE(NCCL_NET, "sendProxy [%ld/%d] Isend posted, req %p, size %d, proto %d, myRank %d, channelId %d", sub->transmitted, buffSlot, sub->requests[buffSlot], size, p, proxyState->tpRank, sub->channelId);
+              INFO(NCCL_R2CC, "SEND: isend allocated request %p for channel=%d, buffSlot=%d", sub->requests[buffSlot], sub->channelId, buffSlot);
+              TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d: allocate request success", args->id, sub->channelId, sub->base+sub->transmitted, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
+              proxyState->ncclNet->setRequestChannel(&(sub->requests[buffSlot]), sub->channelId);
+              proxyState->ncclNet->setRequestId(&(sub->requests[buffSlot]), args->id);
+              proxyState->ncclNet->setRequestComm(&(sub->requests[buffSlot]), resources->useBackup ? (void*)(resources->netSendCommBackup) : (void*)(resources->netSendComm));
+              proxyState->ncclNet->setRequestStep(&(sub->requests[buffSlot]), sub->base+sub->transmitted);
+              proxyState->ncclNet->setRequestOperation(&(sub->requests[buffSlot]), 2);
               sub->transmitted += args->sliceSteps;
               ncclProfilerRecordProxyOpEventState(s, args, sub->transmitted, sub->transSize, ncclProfilerProxyOpSendTransmitted);
               ncclProfilerRecordProxyStepEventStates(s, args, sub->transmitted-args->sliceSteps, sub->transmitted, ncclProfilerProxyStepSendWait);
@@ -1139,16 +1964,99 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
               args->idle = 0;
               continue;
             }
+            else{
+              log_counter++;
+              if(log_counter %1000007==0){
+                TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d: allocate request failed", args->id, sub->channelId, sub->base+sub->transmitted, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
+              }
+
+              if(!resources->useBackup){
+                    int change = 0;
+                    proxyState->ncclNet->checkSwitchToBackup(resources->netSendCommBackup, &change);
+                    if(change == 1){
+                      int done;
+                      int size;
+                      int buffSlot = (sub->base+sub->done)%NCCL_STEPS;
+                      // std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                      // NCCLCHECK(proxyState->ncclNet->test(sub->requests[buffSlot], &done, &size));
+                      TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d: got message from receiver, need to switch to backup", args->id, sub->channelId, sub->base+sub->done, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
+                      for (int s=0; s<args->nsubs; s++) {
+                        struct ncclProxySubArgs* sub = args->subs+s;
+                        for(int i = sub->done; i < sub->transmitted; i++){
+                          int buffSlot = (sub->base + i)%NCCL_STEPS;
+                          sub->requests[buffSlot] = NULL;
+                          // ((struct ncclIbRequest*)(sub->requests[buffSlot]))->type = NCCL_NET_IB_REQ_UNUSED;;
+                        }
+                        sub->transmitted = sub->done;
+                        // sub->transSize -= size;
+                        // std::min(MAX_NET_SIZE, sub->nbytes) : connFifo[buffSlot].size;
+                        sub->mhandle = resources->mhandlesBackup[args->protocol];
+                      }
+                      // R2CC: First time we switch to the backup path, record failed channel and notify
+                      // peers via OOB so they can switch to a balanced schedule (R2CC_MODE=2).
+                      OobNet::Get().ReportFailedChannel(sub->channelId);
+                      OobNet::Get().NotifyHotRepairOnce();
+                      resources->useBackup = 1;
+                      return ncclSuccess;
+                    } else {
+                      // Prevent busy-waiting
+                      // std::this_thread::sleep_for(std::chrono::microseconds(1));
+                    }
+                  }
+
+            }
           }
         }
       }
       // Check whether the network has completed some send operations.
       if (sub->done < sub->transmitted) {
+        //TRACE(NCCL_NET, "sendproxyprogress: [%s] id=%d 3. Check whether the network has completed some send operations.", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), args->id);
         int done;
         int size;
         int buffSlot = (sub->base+sub->done)%NCCL_STEPS;
+        // std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        INFO(NCCL_R2CC, "SEND: Testing request %p for channel=%d, buffSlot=%d", sub->requests[buffSlot], sub->channelId, buffSlot);
         NCCLCHECK(proxyState->ncclNet->test(sub->requests[buffSlot], &done, &size));
+        INFO(NCCL_R2CC, "SEND: Test result done=%d for request %p, channel=%d", done, sub->requests[buffSlot], sub->channelId);
+        if (done == -1){
+          // std::this_thread::sleep_for(std::chrono::milliseconds(120000));
+
+          // std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+          //if(!resources->useBackup)
+          //  NCCLCHECK(proxyState->ncclNet->setBackup(resources->netSendCommBackup));
+
+          // return ncclInternalError;
+          INFO(NCCL_R2CC, "SEND ERROR PATH: test returned -1, channel=%d, useBackup=%d - THIS SHOULD NOT HAPPEN WITH MODE=1", sub->channelId, resources->useBackup);
+          TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d: test done=-1", args->id, sub->channelId, sub->base+sub->done, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
+          for (int s=0; s<args->nsubs; s++) {
+            struct ncclProxySubArgs* sub = args->subs+s;
+            for(int i = sub->done; i < sub->transmitted; i++){
+              int buffSlot = (sub->base + i)%NCCL_STEPS;
+              sub->requests[buffSlot] = NULL;
+              // ((struct ncclIbRequest*)(sub->requests[buffSlot]))->type = NCCL_NET_IB_REQ_UNUSED;;
+            }
+            sub->transmitted = sub->done;
+            // sub->transSize -= size;
+            // std::min(MAX_NET_SIZE, sub->nbytes) : connFifo[buffSlot].size;
+            sub->mhandle = resources->mhandlesBackup[args->protocol];
+          }
+          if (!resources->useBackup) {
+            OobNet::Get().SendStepSyncRequest(resources->tpRemoteRank, sub->channelId);
+            resources->stepSyncRequested = 1;
+            OobNet::Get().ReportFailedChannel(sub->channelId);
+            OobNet::Get().NotifyHotRepairOnce();
+          }
+          resources->useBackup = 1;
+          break;
+        }
         if (done) {
+          // Add step completion timestamp for accurate measurement
+          struct timespec step_time;
+          clock_gettime(CLOCK_MONOTONIC, &step_time);
+          INFO(NCCL_R2CC, "[TIMESTAMP] Channel %d Step %ld COMPLETE: time=%ld.%09ld",
+               sub->channelId, sub->base+sub->done, step_time.tv_sec, step_time.tv_nsec);
+          
+          TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d: test done=1", args->id, sub->channelId, sub->base+sub->done, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
           if (sub->reg) {
             if (size < sub->nbytes) {
               sub->recvbuff += size;
@@ -1163,6 +2071,13 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           // Make sure size is reset to -1 before we update the head.
           if (sub->reg == 0) connFifo[buffSlot].size = -1;
           __sync_synchronize();
+          
+          // Add request completion timestamp
+          struct timespec req_time;
+          clock_gettime(CLOCK_MONOTONIC, &req_time);
+          INFO(NCCL_R2CC, "[TIMESTAMP] Channel %d Request [%ld/%d] DONE: time=%ld.%09ld",
+               sub->channelId, sub->done, buffSlot, req_time.tv_sec, req_time.tv_nsec);
+          
           TRACE(NCCL_NET, "sendProxy [%ld/%d] request %p done", sub->done, buffSlot, sub->requests[buffSlot]);
           sub->done += args->sliceSteps;
           ncclProfilerStopProxyStepEvents(s, args, sub->done-args->sliceSteps, sub->done);
@@ -1180,8 +2095,16 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           }
           args->idle = 0;
           if (sub->done == sub->nsteps) {
+            // Add timestamp for channel send completion (before sync)
+            struct timespec complete_time;
+            clock_gettime(CLOCK_MONOTONIC, &complete_time);
+            INFO(NCCL_R2CC, "[TIMESTAMP] Channel %d SEND_DONE: time=%ld.%09ld", 
+                 sub->channelId, complete_time.tv_sec, complete_time.tv_nsec);
             if (sub->reg && sub->nbytes > 0) {
+              // Deregister from both comms
               NCCLCHECK(proxyState->ncclNet->deregMr(resources->netSendComm, sub->mhandle));
+              NCCLCHECK(proxyState->ncclNet->deregMr(resources->netSendCommBackup, sub->mhandleBackup));
+              INFO(NCCL_R2CC, "SEND: Channel %d deregistered memory from both PRIMARY and BACKUP comms", sub->channelId);
             }
             args->done++;
           }
@@ -1189,6 +2112,8 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       }
     }
     if (args->done == args->nsubs) {
+      sendNetResources* resources = (struct sendNetResources*) ((args->subs+0)->connection->transportResources);
+      TRACE(NCCL_NET, "id=%d, channel=%d, useBackup=%d, comm=%p, rank=%d, remoteRank=%d: args done", args->id, (args->subs+0)->channelId, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
       for (int s=0; s<args->nsubs; s++) {
         ncclProfilerStopProxyOpEvent(s, args);
       }
@@ -1198,21 +2123,50 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
   return ncclSuccess;
 }
 
+int recv_total_count = 0;
+
+static inline void r2ccForceUngroup(struct ncclProxyArgs* args) {
+  for (int i = 0; i < args->nsubs; ++i) args->subs[i].groupSize = 1;
+}
+
+static inline void r2ccRecvRollbackAllSubs(struct ncclProxyArgs* args) {
+  for (int s = 0; s < args->nsubs; ++s) {
+    struct ncclProxySubArgs* sub = args->subs + s;
+    for (int i = 0; i < NCCL_STEPS; ++i) {
+      sub->requests[i] = NULL;
+      sub->timeStamp[i] = -1;
+      sub->recvRequestsCache[i] = NULL;
+    }
+    sub->recvRequestsSubCount = 0;
+    sub->posted = sub->received;
+  }
+}
+
 static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
+  
   if (args->state == ncclProxyOpReady) {
     // Initialize subs and group them by same recvComm.
+
+
+    recv_total_count++;
+    args->id = recv_total_count;  
+    // TRACE(NCCL_NET, "recvProxyProgress: [%s] id=%d 1. ncclProxyOpReady", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), args->id);
     void* recvComm;
     int groupSize = 0;
     int maxRecvs = 1;
     for (int s=0; s<args->nsubs; s++) {
       struct ncclProxySubArgs* sub = args->subs+s;
+      for(int i = 0; i < NCCL_STEPS; i++){
+        sub->timeStamp[i] = -1;
+      }
       if (groupSize == maxRecvs) {
         groupSize = 0;
       } else if (s>0) { // Find next sub with the same recvComm
         int next;
         for (next=s; next<args->nsubs; next++) {
           struct recvNetResources* nextRes = (struct recvNetResources*) (args->subs[next].connection->transportResources);
-          if (nextRes->netRecvComm == recvComm) break;
+          void* nextComm = nextRes->useBackup ? nextRes->netRecvCommBackup : nextRes->netRecvComm;
+          if (nextComm == recvComm) break;
         }
         if (next == args->nsubs) { // Not found
           groupSize = 0;
@@ -1225,8 +2179,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       }
       groupSize++;
       struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
-      maxRecvs = resources->maxRecvs;
-      recvComm = resources->netRecvComm;
+      maxRecvs = resources->useBackup ? resources->maxRecvsBackup : resources->maxRecvs;
+      recvComm = resources->useBackup ? resources->netRecvCommBackup : resources->netRecvComm;
+
       // Round to next multiple of sliceSteps
       sub->base = ROUNDUP(resources->step, args->chunkSteps);
       // Set step base for next op
@@ -1234,17 +2189,73 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->posted = sub->received = sub->transmitted = sub->done = 0;
       for (int i=0; i<groupSize; i++) sub[-i].groupSize = groupSize;
       ncclProfilerStartRecvProxyOpEvent(s, args);
+
+
+      static int forceRecvBackupChannels = -1;
+      if (forceRecvBackupChannels == -1) {
+        const char* env = getenv("NCCL_FORCE_BACKUP_CHANNELS");
+        forceRecvBackupChannels = env ? atoi(env) : 0;
+      }
+      
+      if (forceRecvBackupChannels) {
+        if(sub->channelId == 0 || sub->channelId == 8){
+          resources->useBackup = 1;
+        }
+      }
+
       if (sub->reg && sub->nbytes > 0) {
-        // Register buffer
+        // Register buffer with both comms for consistency
         NCCLCHECK(proxyState->ncclNet->regMr(resources->netRecvComm, sub->recvbuff, sub->nbytes, NCCL_PTR_CUDA, &sub->mhandle));
+        NCCLCHECK(proxyState->ncclNet->regMr(resources->netRecvCommBackup, sub->recvbuff, sub->nbytes, NCCL_PTR_CUDA, &sub->mhandleBackup));
+        INFO(NCCL_R2CC, "RECV: Channel %d registered memory with both PRIMARY and BACKUP comms, buffer=%p, size=%ld", 
+             sub->channelId, sub->recvbuff, sub->nbytes);
       } else {
+        // For pre-registered buffers, copy both handles from resources  
         sub->mhandle = resources->mhandles[args->protocol];
+        sub->mhandleBackup = resources->mhandlesBackup[args->protocol];
       }
     }
     args->state = ncclProxyOpProgress;
   }
   args->idle = 1;
   if (args->state == ncclProxyOpProgress) {
+    // Process any pending OOB step-sync from sender and align receiver state.
+    OobNet& oob = OobNet::Get();
+    oob.PollHotRepair();
+    bool syncApplied = false;
+    for (int s=0; s<args->nsubs; s++) {
+      struct ncclProxySubArgs* sub = args->subs+s;
+      uint64_t syncAbs = 0;
+      if (oob.ConsumeStepSync(sub->channelId, &syncAbs)) {
+        struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
+        if (syncAbs >= sub->base && syncAbs <= sub->base + sub->nsteps) {
+          uint64_t syncRel = syncAbs - sub->base;
+          if (syncRel <= sub->posted) {
+            for (uint64_t i = syncRel; i < sub->posted; ++i) {
+              int buffSlot = i % NCCL_STEPS;
+              sub->requests[buffSlot] = NULL;
+              sub->timeStamp[buffSlot] = -1;
+              sub->recvRequestsCache[buffSlot] = NULL;
+            }
+            sub->posted = syncRel;
+          }
+          if (sub->received > syncRel) sub->received = syncRel;
+          if (sub->transmitted > syncRel) sub->transmitted = syncRel;
+          if (sub->done > syncRel) sub->done = syncRel;
+          resources->useBackup = 1;
+          syncApplied = true;
+          INFO(NCCL_R2CC, "RECV: Step-sync applied channel=%d absStep=%" PRIu64 " (rel=%" PRIu64 "), switch to backup",
+               sub->channelId, syncAbs, syncRel);
+        } else {
+          INFO(NCCL_R2CC, "RECV: Step-sync ignored (out of range) channel=%d absStep=%" PRIu64
+               " base=%" PRIu64 " nsteps=%" PRIu64,
+               sub->channelId, syncAbs, sub->base, (uint64_t)sub->nsteps);
+        }
+      }
+    }
+    // If any step-sync was applied, force ungrouping to avoid comm mixing.
+    if (syncApplied) r2ccForceUngroup(args);
+
     int p = args->protocol;
     int maxDepth = std::min(NCCL_STEPS, NCCL_SHARED_STEPS/args->nsubs);
     for (int s=0; s<args->nsubs; s+=args->subs[s].groupSize) {
@@ -1284,18 +2295,52 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           }
           if (sub->nbytes < sizes[subCount]) sizes[subCount] = sub->nbytes;
           tags[subCount] = resources->tpRemoteRank;
-          mhandles[subCount] = sub->mhandle;
+          mhandles[subCount] = resources->useBackup ? sub->mhandleBackup : sub->mhandle;
           subCount++;
         }
       }
       if (subCount) {
-        uint64_t step = subGroup->posted;
         struct recvNetResources* resources = (struct recvNetResources*) (subGroup->connection->transportResources);
+        uint64_t step = subGroup->posted;
+        //TRACE(NCCL_NET, "[%s] id=%d channel_id=%d, step=%d, [prepare recv], tpRank=%d tpLocalRank=%d tpRemoteRank=%d tpRemoteProxyRank=%d 2. irecv from network", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), 
+        //args->id, subGroup->channelId, int(step % NCCL_STEPS), resources->tpRank, resources->tpLocalRank, resources->tpRemoteRank, resources->tpRemoteProxyRank);
+        
+        
         void** requestPtr = subGroup->requests+(step%NCCL_STEPS);
-        NCCLCHECK(proxyState->ncclNet->irecv(resources->netRecvComm, subCount, ptrs, sizes, tags, mhandles, requestPtr));
+
+        // if(subGroup->channelId%2==0)
+        //     NCCLCHECK(proxyState->ncclNet->irecv(resources->netRecvComm, subCount, ptrs, sizes, tags, mhandles, requestPtr));
+        //   else
+
+
+        // std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // Log which comm is being used for irecv (only when MODE1 subsystem is enabled)
+        if (resources->useBackup) {
+          INFO(NCCL_MODE1, "RECV: Channel %d using BACKUP comm for irecv", subGroup->channelId);
+        }
+        INFO(NCCL_R2CC, "RECV: Calling irecv for channel=%d, step=%ld, useBackup=%d", subGroup->channelId, step, resources->useBackup);
+        NCCLCHECK(proxyState->ncclNet->irecv(resources->useBackup ? resources->netRecvCommBackup : resources->netRecvComm, subCount, ptrs, sizes, tags, mhandles, requestPtr));
+
         if (*requestPtr) {
+          INFO(NCCL_R2CC, "RECV: irecv allocated request %p for channel=%d, step=%ld", *requestPtr, subGroup->channelId, step);
           subGroup->recvRequestsCache[step%NCCL_STEPS] = *requestPtr;
+          proxyState->ncclNet->setRequestChannel(requestPtr, subGroup->channelId);
+          proxyState->ncclNet->setRequestId(requestPtr, args->id);
+          proxyState->ncclNet->setRequestComm(requestPtr, resources->useBackup ? (void*)(resources->netRecvCommBackup) : (void*)(resources->netRecvComm));
+          proxyState->ncclNet->setRequestStep(requestPtr, step);
+          proxyState->ncclNet->setRequestOperation(requestPtr, 1);
+
           subGroup->recvRequestsSubCount = subCount;
+          subGroup->timeStamp[step % NCCL_STEPS] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::system_clock::now().time_since_epoch()).count();
+           
+          
+          TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld, useBackup=%d, comm=%p, rank=%d, remoteRank=%d: allocate request success", args->id, subGroup->channelId, step, resources->useBackup,  resources->useBackup ? (void*)(resources->netRecvCommBackup) : (void*)(resources->netRecvComm), resources->tpRank, resources->tpRemoteRank); 
+           
+          // TRACE(NCCL_NET, "[%s] id=%d channel_id=%d, step=%d, timeStamp: %ld, [allocate recv request] tpRank=%d tpLocalRank=%d tpRemoteRank=%d tpRemoteProxyRank=%d 2. irecv from network", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), 
+          // args->id, subGroup->channelId, int(step % NCCL_STEPS), subGroup->timeStamp[step % NCCL_STEPS], resources->tpRank, resources->tpLocalRank, resources->tpRemoteRank, resources->tpRemoteProxyRank);
+       
+                  
           for (int i=0; i<subGroup->groupSize; i++) {
             struct ncclProxySubArgs* sub = subGroup+i;
             sub->posted += args->sliceSteps;
@@ -1311,14 +2356,105 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
     for (int s=0; s<args->nsubs; s+=args->subs[s].groupSize) {
       struct ncclProxySubArgs* subGroup = args->subs+s;
       if (subGroup->posted > subGroup->received) {
+        // TRACE(NCCL_NET, "recvProxyProgress: [%s] id=%d 3. Test if the receive has completed.", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), args->id);
         uint64_t step = subGroup->received;
         int done;
         void* ptrs[NCCL_PROXY_MAX_SUBS];
         int sizes[NCCL_PROXY_MAX_SUBS];
         void* mhandles[NCCL_PROXY_MAX_SUBS];
         for (int i=0; i<NCCL_PROXY_MAX_SUBS; i++) sizes[i] = 0;
+        struct recvNetResources* resources = (struct recvNetResources*) (subGroup->connection->transportResources);
+        // std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        done = 0;
+        INFO(NCCL_R2CC, "RECV: Testing request %p for channel=%d, step=%ld", subGroup->requests[step%NCCL_STEPS], subGroup->channelId, step);
         NCCLCHECK(proxyState->ncclNet->test(subGroup->requests[step%NCCL_STEPS], &done, sizes));
-        if (done) {
+        INFO(NCCL_R2CC, "RECV: Test result done=%d for request %p, channel=%d", done, subGroup->requests[step%NCCL_STEPS], subGroup->channelId);
+        
+        //if(done == 0 && !resources->useBackup)
+        //  NCCLCHECK(proxyState->ncclNet->testBackup(resources->netRecvCommBackup, &done));
+        
+
+        if (done == 2){ // update timer.
+          subGroup->timeStamp[step % NCCL_STEPS] = std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch()).count();
+        }
+        else if (done == 0) { // check timeout.
+          auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch()).count();
+          int64_t timeoutMs = ncclParamR2CCFailoverTimeoutMs();
+          if (timeoutMs <= 0) {
+            int64_t timeout = 1;
+            for (int i = 0; i < ncclParamRecvTimeout() - 20; i++) {
+              timeout *= 2;
+            }
+            timeout *= 4 * (ncclParamRecvRetryCnt() + 1);
+            timeoutMs = timeout * 1000;
+          }
+          // if(subGroup->channelId%2==1)continue;
+          if (now - subGroup->timeStamp[step % NCCL_STEPS] > timeoutMs) {
+            TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld, useBackup=%d, comm=%p, rank=%d, remoteRank=%d: set timeout request", args->id, subGroup->channelId, step, resources->useBackup,  resources->useBackup ? (void*)(resources->netRecvCommBackup) : (void*)(resources->netRecvComm), resources->tpRank, resources->tpRemoteRank); 
+            
+            NCCLCHECK(proxyState->ncclNet->ncclIbTimeoutPost(resources->useBackup ? resources->netRecvCommBackup : resources->netRecvComm, subGroup->requests[step%NCCL_STEPS]));
+            // Trigger step-sync and failover immediately on timeout to avoid in-flight corruption.
+            if (!resources->useBackup) {
+              uint64_t syncAbs = subGroup->base + subGroup->received;
+              OobNet::Get().SendStepSync(resources->tpRemoteRank, subGroup->channelId, syncAbs);
+              OobNet::Get().ReportFailedChannel(subGroup->channelId);
+              OobNet::Get().NotifyHotRepairOnce();
+            }
+            // Roll back posted to received and switch to backup.
+            r2ccRecvRollbackAllSubs(args);
+            resources->useBackup = 1;
+            r2ccForceUngroup(args);
+            subGroup->timeStamp[step % NCCL_STEPS] = std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch()).count();
+            //TRACE(NCCL_NET, "current time: %ld", now);
+            //TRACE(NCCL_NET, "timeStamp: %ld", subGroup->timeStamp[step % NCCL_STEPS]);
+            //TRACE(NCCL_NET, "recvProxyProgress: ncclParamRecvTimeout %ld  ncclParamRecvRetryCnt %ld, timeout %ld TimeStamp Timeout", ncclParamRecvTimeout(), ncclParamRecvRetryCnt(), timeout);
+            //TRACE(NCCL_NET, "recvProxyProgress: ncclParamRecvTimeout %ld  ncclParamRecvRetryCnt %ld, timeout %ld TimeStamp Timeout", ncclParamRecvTimeout(), ncclParamRecvRetryCnt(), timeout);
+            // TRACE(NCCL_NET, "[%s] test done = -1, id=%d channel_id=%d, step=%d, timeStamp: %ld, [allocate recv request] tpRank=%d tpLocalRank=%d tpRemoteRank=%d tpRemoteProxyRank=%d 2. irecv from network", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), 
+            //args->id, subGroup->channelId, int(step % NCCL_STEPS), subGroup->timeStamp[step % NCCL_STEPS], resources->tpRank, resources->tpLocalRank, resources->tpRemoteRank, resources->tpRemoteProxyRank);
+            args->idle = 0;
+            return ncclSuccess;
+          }
+        }
+        else if (done == -1){ // disconnect
+          // return ncclInternalError;
+          INFO(NCCL_R2CC, "RECV ERROR PATH: test returned -1, channel=%d, useBackup=%d - THIS SHOULD NOT HAPPEN WITH MODE=1", subGroup->channelId, resources->useBackup);
+          TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld, useBackup=%d, comm=%p, rank=%d, remoteRank=%d: test done = -1", args->id, subGroup->channelId, step, resources->useBackup,  resources->useBackup ? (void*)(resources->netRecvCommBackup) : (void*)(resources->netRecvComm), resources->tpRank, resources->tpRemoteRank); 
+        
+          // Send step-sync to peer so sender can align to the first missing step.
+          uint64_t syncAbs = subGroup->base + subGroup->received;
+          OobNet::Get().SendStepSync(resources->tpRemoteRank, subGroup->channelId, syncAbs);
+
+          //TRACE(NCCL_INIT, "test done = -1, channelId %d, netDev=%d, netDevBackup=%d, useBackup=%d", resources->channelId, resources->netDev, resources->netDevBackup, resources->useBackup);
+          r2ccRecvRollbackAllSubs(args);
+          if (!resources->useBackup) {
+            OobNet::Get().ReportFailedChannel(subGroup->channelId);
+            OobNet::Get().NotifyHotRepairOnce();
+          }
+          resources->useBackup = 1;
+          r2ccForceUngroup(args);
+
+          
+
+          //TRACE(NCCL_NET, "recvProxyProgress: [%s] id=%d done=%d, useBackup=%d, channel_id=%d tpRank=%d tpLocalRank=%d tpRemoteRank=%d tpRemoteProxyRank=%d 2. irecv from network", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), 
+          //args->id, done, resources->useBackup, subGroup->channelId, resources->tpRank, resources->tpLocalRank, resources->tpRemoteRank, resources->tpRemoteProxyRank);
+        
+          args->idle = 0;
+          return ncclSuccess;
+        }
+        //TRACE(NCCL_NET, "recvProxyProgress: done=%d, useBackup=%d, channel_id=%d ", done, resources->useBackup, subGroup->channelId);
+        // Does the size need to be changed?
+        else if (done == 1) { // work done
+          TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld, useBackup=%d, comm=%p, rank=%d, remoteRank=%d:  done=1", args->id, subGroup->channelId, step, resources->useBackup,  resources->useBackup ? (void*)(resources->netRecvCommBackup) : (void*)(resources->netRecvComm), resources->tpRank, resources->tpRemoteRank); 
+        
+          // TRACE(NCCL_NET, "recvProxyProgress: [%s] id=%d done=%d, useBackup=%d, channel_id=%d tpRank=%d tpLocalRank=%d tpRemoteRank=%d tpRemoteProxyRank=%d 2. irecv from network", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), args->id, done, resources->useBackup, subGroup->channelId, resources->tpRank, resources->tpLocalRank, resources->tpRemoteRank, resources->tpRemoteProxyRank);
+        
+         // TRACE(NCCL_INIT, "test done = 1 , channelId %d, netDev=%d, netDevBackup=%d, useBackup=%d", resources->channelId, resources->netDev, resources->netDevBackup, resources->useBackup);
+         // TRACE(NCCL_NET, "recvProxyProgress: [%s] id=%d done=%d, useBackup=%d, channel_id=%d tpRank=%d tpLocalRank=%d tpRemoteRank=%d tpRemoteProxyRank=%d 2. irecv from network", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), args->id, done, resources->useBackup, subGroup->channelId, resources->tpRank, resources->tpLocalRank, resources->tpRemoteRank, resources->tpRemoteProxyRank);
+        
+          //TRACE(NCCL_NET, "recvProxyProgress: [%s] id=%d 4. Flush", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), args->id);
           int needFlush = 0;
           int totalSize = 0;
           int subIndex = 0;
@@ -1352,6 +2488,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             }
           }
           subGroup->requests[step%NCCL_STEPS] = NULL;
+          subGroup->timeStamp[step%NCCL_STEPS] = -1;
           if (totalSize > 0 && p == NCCL_PROTO_SIMPLE && needFlush) {
             // GDRCOPY support
             struct recvNetResources* resources = (struct recvNetResources*) (subGroup->connection->transportResources);
@@ -1375,12 +2512,15 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
                   ptrs[subCount] = resources->shared ?
                     (sub->reg ? (char*)sub->recvbuff : localBuff+resources->recvMem->connFifo[buffSlot].offset) :
                     localBuff+buffSlot*stepSize;
-                  mhandles[subCount] = sub->mhandle;
+                  mhandles[subCount] = resources->useBackup ? sub->mhandleBackup : sub->mhandle;
                   subCount++;
                 }
               }
               struct recvNetResources* resources = (struct recvNetResources*) (subGroup->connection->transportResources);
-              NCCLCHECK(proxyState->ncclNet->iflush(resources->netRecvComm, subCount, ptrs, sizes, mhandles, subGroup->requests+(step%NCCL_STEPS)));
+              // if(subGroup->channelId%2==0)
+              //     NCCLCHECK(proxyState->ncclNet->iflush(resources->netRecvComm, subCount, ptrs, sizes, mhandles, subGroup->requests+(step%NCCL_STEPS)));
+              //   else
+              NCCLCHECK(proxyState->ncclNet->iflush(resources->useBackup ? resources->netRecvCommBackup : resources->netRecvComm, subCount, ptrs, sizes, mhandles, subGroup->requests+(step%NCCL_STEPS)));
             }
           }
           args->idle = 0;
@@ -1392,6 +2532,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
     for (int s=0; s<args->nsubs; s+=args->subs[s].groupSize) {
       struct ncclProxySubArgs* subGroup = args->subs+s;
       if (subGroup->received > subGroup->transmitted) {
+        //TRACE(NCCL_NET, "recvProxyProgress: [%s] id=%d 5. Test if the flush has completed", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), args->id);
         uint64_t step = subGroup->transmitted;
         int done = 1;
         void* request = subGroup->requests[step%NCCL_STEPS];
@@ -1435,8 +2576,15 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               sub->transmitted > sub->done) {
             if (subGroup->recvRequestsCache[sub->done%NCCL_STEPS]) {
               // the multirecv requests are only cached in the first sub.
-              if (proxyState->ncclNet->irecvConsumed)
-                NCCLCHECK(proxyState->ncclNet->irecvConsumed(resources->netRecvComm, subGroup->recvRequestsSubCount, subGroup->recvRequestsCache[sub->done%NCCL_STEPS]));
+              if (proxyState->ncclNet->irecvConsumed){
+                TRACE(NCCL_NET, "recvProxyProgress: [%s] id=%d 6. irecvConsumed", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), args->id);
+        
+                // if(subGroup->channelId%2==0)
+                //   NCCLCHECK(proxyState->ncclNet->irecvConsumed(resources->netRecvComm, subGroup->recvRequestsSubCount, subGroup->recvRequestsCache[sub->done%NCCL_STEPS]));
+                // else
+                NCCLCHECK(proxyState->ncclNet->irecvConsumed(resources->useBackup ? resources->netRecvCommBackup : resources->netRecvComm, subGroup->recvRequestsSubCount, subGroup->recvRequestsCache[sub->done%NCCL_STEPS]));
+                // NCCLCHECK(proxyState->ncclNet->irecvConsumed(resources->netRecvComm, subGroup->recvRequestsSubCount, subGroup->recvRequestsCache[sub->done%NCCL_STEPS]));
+              }
               subGroup->recvRequestsCache[sub->done%NCCL_STEPS] = NULL;
             }
             sub->done += args->sliceSteps;
@@ -1446,7 +2594,10 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             if (sub->done == sub->nsteps) {
               struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
               if (sub->reg && sub->nbytes > 0) {
+                // Deregister from both comms
                 NCCLCHECK(proxyState->ncclNet->deregMr(resources->netRecvComm, sub->mhandle));
+                NCCLCHECK(proxyState->ncclNet->deregMr(resources->netRecvCommBackup, sub->mhandleBackup));
+                INFO(NCCL_R2CC, "RECV: Channel %d deregistered memory from both PRIMARY and BACKUP comms", sub->channelId);
               }
               args->done++;
               break;
@@ -1456,6 +2607,10 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       }
     }
     if (args->done == args->nsubs) {
+      //TRACE(NCCL_NET, "recvProxyProgress: [%s] id=%d args done", ([]() { std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()); static char buffer[100]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now)); return buffer; })(), args->id);
+      
+      struct recvNetResources* resources = (struct recvNetResources*) ((args->subs+0)->connection->transportResources);
+      TRACE(NCCL_NET, "id=%d, comm=%p, rank=%d, remoteRank=%d, args done", args->id, resources->useBackup? resources->netRecvCommBackup : resources->netRecvComm, resources->tpRank, resources->tpRemoteRank); 
       args->state = ncclProxyOpNone;
       for (int s=0; s<args->nsubs; s++) {
         ncclProfilerStopProxyOpEvent(s, args);

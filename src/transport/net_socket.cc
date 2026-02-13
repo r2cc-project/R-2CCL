@@ -165,6 +165,12 @@ struct ncclNetSocketRequest {
   struct ncclNetSocketComm* comm;
   struct ncclNetSocketTask* tasks[MAX_SOCKETS];
   int nSubs;
+  // R2CC fields for backup support
+  int channel;
+  int id;
+  void* netComm;
+  int step;
+  int operation;  // 1=recv, 2=send
 };
 
 struct ncclNetSocketTaskQueue {
@@ -613,6 +619,98 @@ ncclResult_t ncclNetSocketClose(void* opaqueComm) {
   return ncclSuccess;
 }
 
+// R2CC backup support functions for Socket transport
+ncclResult_t ncclNetSocketSetBackup(void* sendComm) {
+  // Socket doesn't need special backup setup
+  return ncclSuccess;
+}
+
+ncclResult_t ncclNetSocketTestBackup(void* recvComm, int* done) {
+  // For socket, we don't have a separate backup test mechanism
+  *done = 0;
+  return ncclSuccess;
+}
+
+ncclResult_t ncclNetSocketSetRequestChannel(void** request, int channel) {
+  if (request && *request) {
+    ((struct ncclNetSocketRequest*)(*request))->channel = channel;
+  }
+  return ncclSuccess;
+}
+
+int ncclNetSocketGetRequestChannel(void* request) {
+  if (request) {
+    return ((struct ncclNetSocketRequest*)(request))->channel;
+  }
+  return -1;
+}
+
+ncclResult_t ncclNetSocketSetRequestId(void** request, int id) {
+  if (request && *request) {
+    ((struct ncclNetSocketRequest*)(*request))->id = id;
+  }
+  return ncclSuccess;
+}
+
+int ncclNetSocketGetRequestId(void* request) {
+  if (request) {
+    return ((struct ncclNetSocketRequest*)(request))->id;
+  }
+  return -1;
+}
+
+ncclResult_t ncclNetSocketSetRequestComm(void** request, void* comm) {
+  if (request && *request) {
+    ((struct ncclNetSocketRequest*)(*request))->netComm = comm;
+  }
+  return ncclSuccess;
+}
+
+void* ncclNetSocketGetRequestComm(void* request) {
+  if (request) {
+    return ((struct ncclNetSocketRequest*)(request))->netComm;
+  }
+  return NULL;
+}
+
+ncclResult_t ncclNetSocketSetRequestStep(void** request, int step) {
+  if (request && *request) {
+    ((struct ncclNetSocketRequest*)(*request))->step = step;
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t ncclNetSocketSetRequestOperation(void** request, int op) {
+  if (request && *request) {
+    ((struct ncclNetSocketRequest*)(*request))->operation = op;
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t ncclNetSocketCheckSwitchToBackup(void* sendComm, int* change) {
+  // For Socket transport, we don't have automatic failure detection
+  // The application layer should handle connection failures
+  *change = 0;
+  if (sendComm == NULL) {
+    return ncclSuccess;
+  }
+  
+  struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)sendComm;
+  // Check if the control socket is still connected
+  int ready;
+  NCCLCHECK(ncclSocketReady(&comm->ctrlSock, &ready));
+  if (!ready) {
+    // Socket is closed, should switch to backup
+    *change = 1;
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t ncclNetSocketTimeoutPost(void* comm, void* mhandle) {
+  // Socket doesn't have timeout post mechanism
+  return ncclSuccess;
+}
+
 ncclNet_t ncclNetSocket = {
   "Socket",
   ncclNetSocketInit,
@@ -632,5 +730,17 @@ ncclNet_t ncclNetSocket = {
   ncclNetSocketClose,
   ncclNetSocketCloseListen,
   NULL /* getDeviceMr */,
-  NULL /* irecvConsumed */
+  NULL /* irecvConsumed */,
+  ncclNetSocketSetBackup,
+  ncclNetSocketTestBackup,
+  ncclNetSocketSetRequestChannel,
+  ncclNetSocketGetRequestChannel,
+  ncclNetSocketSetRequestId,
+  ncclNetSocketGetRequestId,
+  ncclNetSocketSetRequestComm,
+  ncclNetSocketGetRequestComm,
+  ncclNetSocketSetRequestStep,
+  ncclNetSocketSetRequestOperation,
+  ncclNetSocketCheckSwitchToBackup,
+  ncclNetSocketTimeoutPost
 };

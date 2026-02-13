@@ -13,6 +13,8 @@
 #include <math.h>
 
 NCCL_PARAM(CrossNic, "CROSS_NIC", 2);
+// P2pCrossNuma is defined in topo.cc
+extern int ncclParamP2pCrossNuma();
 
 // Initialize system->maxBw. This is the per-channel (i.e. per-SM)
 // max bw.
@@ -955,6 +957,25 @@ ncclResult_t ncclTopoCompute(ncclTopoSystem* system, struct ncclTopoGraph* graph
   int cpuArch, cpuVendor, cpuModel;
   NCCLCHECK(ncclTopoCpuType(system, &cpuArch, &cpuVendor, &cpuModel));
 
+  // Optional override: use all NICs even if they are farther (PHB/SYS).
+  const char* useAllNicEnv = getenv("R2CC_USE_ALL_NIC");
+  if (useAllNicEnv && atoi(useAllNicEnv) != 0 && system->nodes[NET].count > 0) {
+    graph->crossNic = 1;   // allow cross-ASIC/port NICs
+    graph->typeInter = PATH_SYS; // allow SYS/PHB/PIX paths
+    // Use all NETs reachable from GPU 0 (common single-GPU case).
+    int targetChannels = 0;
+    if (system->nodes[GPU].count > 0) {
+      struct ncclTopoLinkList* paths = system->nodes[GPU].nodes[0].paths[NET];
+      for (int n = 0; n < system->nodes[NET].count; n++) {
+        if (paths[n].bw > 0) targetChannels++;
+      }
+    }
+    if (targetChannels > 0) {
+      graph->minChannels = std::max(graph->minChannels, targetChannels);
+      graph->maxChannels = std::max(graph->maxChannels, targetChannels);
+    }
+  }
+
   const char* str = ncclGetEnv("NCCL_GRAPH_FILE");
   if (str) {
     INFO(NCCL_ENV, "NCCL_GRAPH_FILE set by environment to %s", str);
@@ -1217,15 +1238,50 @@ ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoG
   } else if (peerRank == -1) {
     return ncclInternalError;
   } else {
-    // Start with our local NIC and local Rank
+    // R2CC: For P2P connections without graph, we need to ensure device matching
+    // across nodes. To handle environments where devices can only communicate
+    // with matching devices (e.g., mlx5_0 to mlx5_0, mlx5_2 to mlx5_2)
+    
+    // R2CC: Force consistent device selection for P2P across all ranks
+    // This is critical for cross-node compatibility when devices can only
+    // communicate with matching devices (mlx5_0 to mlx5_0, etc)
+    
+    // For P2P connections, always use a deterministic device selection
+    // based on channel ID alone, not GPU dev number
+    // This ensures all ranks choose the same device
+    
+
+    // These are the channels that vLLM's P2P uses
+    // Force ALL ranks to use dev=0 (backup will be dev=1)
+    
     NCCLCHECK(ncclTopoGetLocalNet(comm->topo, rank, channelId, &netId, &netDev));
+    
+    // vllm test.
+    // int forcedDev = 0;
+    // p2p test.
+    // int forcedDev = channelId %3;
+    
+    // // Find the netId for the forced device
+    // for (int n = 0; n < comm->topo->nodes[NET].count; n++) {
+    //   if (comm->topo->nodes[NET].nodes[n].net.dev == forcedDev) {
+    //     netId = comm->topo->nodes[NET].nodes[n].id;
+    //     netDev = forcedDev;
+    //     INFO(NCCL_R2CC_LEVEL_1, "R2CC: P2P rank=%d forcing dev=%d for channel=%d (backup will be dev=%d)",
+    //           rank, forcedDev, channelId, forcedDev^1);
+    //     break;
+    //   }
+    // }
+
+    
+
     if (dev) *dev = netDev;
     if (id) *id = netId;
     *proxyRank = rank;
 
     int pxnLevel = ncclPxnDisable(comm) == 1 ? 0 : ncclParamP2pPxnLevel();
     // See whether we can use the remote rank preferred device.
-    if (ncclParamCrossNic() == 0 || (pxnLevel != 0)) {
+    // Skip this if P2P_CROSS_NUMA is enabled to avoid overriding channel-based selection
+    if ((ncclParamCrossNic() == 0 || (pxnLevel != 0)) && !ncclParamP2pCrossNuma()) {
       // Find local NIC number close to local nvmlDev
       int nvmlDev = comm->peerInfo[peerRank].nvmlDev;
       int localRank;

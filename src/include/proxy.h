@@ -95,6 +95,7 @@ struct ncclProxySubArgs {
   int reg;
   // p2p mhandle
   void* mhandle;
+  void* mhandleBackup;  // R2CC: backup mhandle for dynamic registration
   // collnet handles
   void* sendMhandle;
   void* recvMhandle;
@@ -126,6 +127,8 @@ struct ncclProxySubArgs {
 
   void* recvRequestsCache[NCCL_STEPS];
   int recvRequestsSubCount;
+
+  int64_t timeStamp[NCCL_STEPS];
 };
 
 struct ncclProxyArgs {
@@ -162,6 +165,9 @@ struct ncclProxyArgs {
   struct ncclProxyArgs** proxyAppendPtr;
 
   union ncclProxyOpSpecifics specifics;
+
+  int id;
+  int send_recv; // 1send 0recv
 };
 #define NCCL_MAX_NETDEVS 128
 
@@ -335,6 +341,10 @@ struct ncclProxyConnection {
   void* transportResources;
   ncclNetDeviceHandle_t* netDeviceHandle;
   void* mhandles[NCCL_NUM_PROTOCOLS];
+
+  ncclNetDeviceHandle_t* netDeviceHandleBackup;
+  void* mhandlesBackup[NCCL_NUM_PROTOCOLS];
+
   proxyConnectState state;
   struct ncclCollNetSharedRes* collNet;
   int needsProxyProgress;
@@ -365,7 +375,8 @@ enum ncclProxyMsgType {
   ncclProxyMsgGetFd = 9, // cuMem API support (UDS)
   ncclProxyMsgQueryFd = 10,
   ncclProxyMsgRegister = 11,
-  ncclProxyMsgDeregister = 12
+  ncclProxyMsgDeregister = 12,
+  ncclProxyMsgBarrier = 13 // R2CC: Barrier to ensure all operations complete
 };
 
 // This function is called by a client of the proxy that needs to invoke any of the non-progress proxyOp types

@@ -252,8 +252,8 @@ template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_COLLNET_DIRECT, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int/*nthreads*/, struct ncclDevWorkColl* work) {
     static constexpr int COLLNET_COPY_THREADS = 96;
-    const int bid = ncclShmem.channelId - work->channelLo;
-    const int nChannels = work->channelHi - work->channelLo + 1;
+    const int bid = ncclCollWorkChannelToPart(work, ncclShmem.channelId);
+    const int nChannels = ncclCollWorkNChannels(work);
     struct ncclDirect* direct = &ncclShmem.channel.collnetDirect;
     const ssize_t chunkSize = work->collnet.chunkCount;
     const ssize_t size = work->collnet.count;
@@ -439,8 +439,8 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_NVLS, NCCL_PROTO_SIMPL
         }
       }
     } else {
-      const int bid = ncclShmem.channelId - work->channelLo;
-      const int nChannels = work->channelHi - work->channelLo + 1;
+      const int bid = ncclCollWorkChannelToPart(work, ncclShmem.channelId);
+      const int nChannels = ncclCollWorkNChannels(work);
       const ssize_t chunkSize = work->collnet.chunkCount;
       const ssize_t loopSize = nChannels * nvls->nHeads * chunkSize;
       const ssize_t size = work->collnet.count;
@@ -627,8 +627,8 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_NVLS_TREE, NCCL_PROTO_
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_COLLNET_CHAIN, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
-    const int bid = ncclShmem.channelId - work->channelLo;
-    const int nChannels = work->channelHi - work->channelLo + 1;
+    const int bid = ncclCollWorkChannelToPart(work, ncclShmem.channelId);
+    const int nChannels = ncclCollWorkNChannels(work);
     ncclTree *tree = &ncclShmem.channel.collnetChain;
     ssize_t chunkSize = work->collnet.chunkCount;
     const ssize_t loopSize = int(nChannels*chunkSize);

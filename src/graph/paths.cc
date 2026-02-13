@@ -707,6 +707,16 @@ static ncclResult_t ncclTopoGetNchannels(struct ncclComm* comm, int g /*local gp
     }
   } else {
     // Remote rank, use network
+    const char* useAllNicEnv = getenv("R2CC_USE_ALL_NIC");
+    if (useAllNicEnv && atoi(useAllNicEnv) != 0) {
+      int localNetCount = 0;
+      struct ncclTopoLinkList* paths = system->nodes[GPU].nodes[g].paths[NET];
+      for (int i = 0; i < system->nodes[NET].count; i++) {
+        if (paths[i].bw > 0) localNetCount++;
+      }
+      *nChannels = localNetCount > 0 ? localNetCount : 1;
+      return ncclSuccess;
+    }
     int nNetChannels = ncclParamNChannelsPerNetPeer();
     if (nNetChannels == -1) {
        //start from 2 channels per NIC and reduce with scale
@@ -728,35 +738,106 @@ static ncclResult_t ncclTopoGetNchannels(struct ncclComm* comm, int g /*local gp
 
 NCCL_PARAM(MinP2pNChannels, "MIN_P2P_NCHANNELS", 1);
 NCCL_PARAM(MaxP2pNChannels, "MAX_P2P_NCHANNELS", MAXCHANNELS);
+NCCL_PARAM(P2pMinChannelsPerPeer, "P2P_MIN_CHANNELS_PER_PEER", -1);
 extern int64_t ncclParamWorkArgsBytes();
 
 ncclResult_t ncclTopoComputeP2pChannels(struct ncclComm* comm) {
   /* here we already honor comm->max/minCTAs for p2pnChannels. */
+  INFO(NCCL_INIT, "P2P: Starting ncclTopoComputeP2pChannels - nChannels=%d, MaxP2pNChannels=%d, MinP2pNChannels=%d", 
+       comm->nChannels, (int)ncclParamMaxP2pNChannels(), (int)ncclParamMinP2pNChannels());
+  
   if (comm->sharedRes->owner != comm) {
     comm->p2pnChannels = std::min(comm->nChannels, (int)ncclParamMaxP2pNChannels());
     comm->p2pnChannels = std::min(std::max(comm->p2pnChannels, (int)ncclParamMinP2pNChannels()), comm->sharedRes->tpP2pNChannels);
+    INFO(NCCL_INIT, "P2P: sharedRes not owner - p2pnChannels=%d", comm->p2pnChannels);
   } else {
     comm->p2pnChannels = std::min(comm->nChannels, (int)ncclParamMaxP2pNChannels());
     comm->p2pnChannels = std::max(comm->p2pnChannels, (int)ncclParamMinP2pNChannels());
+    INFO(NCCL_INIT, "P2P: sharedRes owner - p2pnChannels=%d", comm->p2pnChannels);
   }
 
   int minChannels = comm->p2pnChannels;
+  INFO(NCCL_INIT, "P2P: Initial minChannels=%d", minChannels);
   // We need to loop through all local GPUs to have a global picture
   for (int g=0; g<comm->topo->nodes[GPU].count; g++) {
     for (int r=0; r<comm->nRanks; r++) {
       int nChannels;
       NCCLCHECK(ncclTopoGetNchannels(comm, g, r, &nChannels));
-      if (nChannels >= 0) minChannels = std::min(minChannels, nChannels);
+      if (nChannels >= 0) {
+        INFO(NCCL_INIT, "P2P: GPU %d -> Rank %d: nChannels=%d", g, r, nChannels);
+        minChannels = std::min(minChannels, nChannels);
+      }
     }
   }
+  INFO(NCCL_INIT, "P2P: After GPU loop - minChannels=%d", minChannels);
 
+  // Allow override via environment variable
+  int p2pMinChannelsPerPeer = ncclParamP2pMinChannelsPerPeer();
+  if (p2pMinChannelsPerPeer > 0) {
+    INFO(NCCL_INIT, "P2P: P2pMinChannelsPerPeer=%d, adjusting minChannels", p2pMinChannelsPerPeer);
+    minChannels = std::max(minChannels, p2pMinChannelsPerPeer);
+  }
+
+  // R2CC P2P_TEST_MODE=1: Double channels for each NIC
+  const char* p2pTestModeEnv = ncclGetEnv("R2CC_P2P_TEST_MODE");
+  if (p2pTestModeEnv && atoi(p2pTestModeEnv) == 1) {
+    INFO(NCCL_INIT, "R2CC P2P_TEST_MODE=1: ENABLED");
+    
+    // Simple approach: count total NICs in the system
+    // Since we're on a single node, all NICs should be accessible
+    int totalNicCount = comm->topo->nodes[NET].count;
+    INFO(NCCL_INIT, "R2CC P2P_TEST_MODE=1: Total NICs in system = %d", totalNicCount);
+    
+    // For a more accurate count, we can check how many unique NICs a GPU can see
+    // Simply use the total NIC count from the topology
+    int maxLocalNetCount = totalNicCount;
+    INFO(NCCL_INIT, "R2CC P2P_TEST_MODE=1: Using NIC count from topology = %d", maxLocalNetCount);
+    
+    // Fallback: if we couldn't get NIC count from channel mapping, use total NIC count
+    if (maxLocalNetCount == 0) {
+      maxLocalNetCount = totalNicCount;
+      INFO(NCCL_INIT, "R2CC P2P_TEST_MODE=1: Using total NIC count as fallback: %d", maxLocalNetCount);
+    }
+    
+    if (maxLocalNetCount > 0) {
+      int targetChannels = 2 * maxLocalNetCount;  // 2x for PRIMARY/BACKUP
+      INFO(NCCL_INIT, "R2CC P2P_TEST_MODE=1: Target channels = %d (2 x %d NICs)", targetChannels, maxLocalNetCount);
+      INFO(NCCL_INIT, "R2CC P2P_TEST_MODE=1: Before adjustment - minChannels=%d, p2pnChannels=%d", 
+           minChannels, comm->p2pnChannels);
+      
+      int oldMinChannels = minChannels;
+      int oldP2pnChannels = comm->p2pnChannels;
+      
+      minChannels = std::max(minChannels, targetChannels);
+      // Also ensure p2pnChannels is large enough
+      comm->p2pnChannels = std::max(comm->p2pnChannels, targetChannels);
+      
+      INFO(NCCL_INIT, "R2CC P2P_TEST_MODE=1: After adjustment - minChannels: %d->%d, p2pnChannels: %d->%d", 
+           oldMinChannels, minChannels, oldP2pnChannels, comm->p2pnChannels);
+    }
+  } else {
+    INFO(NCCL_INIT, "R2CC P2P_TEST_MODE: Not enabled (env=%s)", p2pTestModeEnv ? p2pTestModeEnv : "NULL");
+  }
+  
+
+  INFO(NCCL_INIT, "P2P: Before pow2Up - minChannels=%d, p2pnChannels=%d", minChannels, comm->p2pnChannels);
+  
   // Make nChannelsPerPeer and nChannels powers of 2. This is relied on when
   // mapping p2p peers to channels.
   comm->p2pnChannelsPerPeer = pow2Up(minChannels);
   comm->p2pnChannels = pow2Up(comm->p2pnChannels);
 
-  comm->p2pnChannels = std::min(comm->p2pnChannels, pow2Down(ncclDevMaxChannelsForArgsBytes(ncclParamWorkArgsBytes())));
+  INFO(NCCL_INIT, "P2P: After pow2Up - p2pnChannelsPerPeer=%d, p2pnChannels=%d", 
+       comm->p2pnChannelsPerPeer, comm->p2pnChannels);
+
+  int maxChannelsFromWorkArgs = pow2Down(ncclDevMaxChannelsForArgsBytes(ncclParamWorkArgsBytes()));
+  INFO(NCCL_INIT, "P2P: maxChannelsFromWorkArgs=%d", maxChannelsFromWorkArgs);
+  
+  comm->p2pnChannels = std::min(comm->p2pnChannels, maxChannelsFromWorkArgs);
   comm->p2pnChannelsPerPeer = std::min(comm->p2pnChannelsPerPeer, comm->p2pnChannels);
+  
+  INFO(NCCL_INIT, "P2P: After applying limits - p2pnChannelsPerPeer=%d, p2pnChannels=%d", 
+       comm->p2pnChannelsPerPeer, comm->p2pnChannels);
 
   // Init channels that weren't used so far
   for (int c=comm->nChannels; c<comm->p2pnChannels; c++) NCCLCHECK(initChannel(comm, c));

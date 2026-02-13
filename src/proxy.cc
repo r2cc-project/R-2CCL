@@ -18,6 +18,7 @@
 #include <sys/syscall.h>
 #include <assert.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/time.h>
 #include <sched.h>
 
@@ -698,9 +699,23 @@ static ncclResult_t removeOp(struct ncclProxyProgressState* state, struct ncclPr
   return ncclSuccess;
 }
 
+int log_progressOps_counter = 0;
 static ncclResult_t progressOps(struct ncclProxyState* proxyState, struct ncclProxyProgressState* state, struct ncclProxyArgs* opStart, int* idle) {
   struct ncclProxyArgs* prevOp = NULL;
   struct ncclProxyArgs* op = opStart;
+
+  log_progressOps_counter++;
+  if(log_progressOps_counter %10000007==0){
+   TRACE(NCCL_NET, "sendProxyProgress: recvProxyProgress: Show Ops List"); 
+    while(op){
+      struct ncclProxyArgs* args = op;
+      TRACE(NCCL_NET, "sendProxyProgress: recvProxyProgress: id=%d, channel=%d", args->id, (args->subs+0)->channelId);     
+      op = op->next;
+    }
+    TRACE(NCCL_NET, "sendProxyProgress: recvProxyProgress: Ops List End"); 
+    op = opStart;
+  }
+
   while (op) {
     if (op->state == ncclProxyOpNone) return ncclInternalError;
     TIME_START(0); TIME_START(1);
@@ -708,6 +723,14 @@ static ncclResult_t progressOps(struct ncclProxyState* proxyState, struct ncclPr
     if (op->idle) { TIME_STOP(1); TIME_CANCEL(0); } else { TIME_CANCEL(1); TIME_STOP(0); }
     *idle &= op->idle;
     if (op->state == ncclProxyOpNone) {
+      // Add timestamp for operation completion
+      struct timespec end_time;
+      clock_gettime(CLOCK_MONOTONIC, &end_time);
+      if (op->subs && op->nsubs > 0) {
+        INFO(NCCL_R2CC, "[TIMESTAMP] ProxyOp COMPLETE: channel=%d peer=%d time=%ld.%09ld pattern=%s", 
+             op->subs[0].channelId, op->subs[0].peer, end_time.tv_sec, end_time.tv_nsec,
+             op->pattern == ncclPatternSend ? "Send" : "Recv");
+      }
       TIME_START(2);
       NCCLCHECK(removeOp(state, &op, &prevOp));
       TIME_STOP(2);
@@ -1009,6 +1032,25 @@ static ncclResult_t proxyFree(struct ncclProxyConnection* connection, struct ncc
       NCCLCHECK(ncclTransports[connection->transport]->recv.proxyFree(connection, proxyState));
     }
   }
+  // R2CC: Reset connection state to ensure clean state for reuse
+  connection->state = connUninitialized;
+  connection->transportResources = NULL;
+  return ncclSuccess;
+}
+
+// R2CC: Function to free peer connections before stopping proxy
+static ncclResult_t ncclProxyFreePeerConnections(struct ncclProxyConnectionPool* pool, struct ncclProxyState* proxyState) {
+  INFO(NCCL_R2CC, "R2CC: Freeing peer connections before proxy stop");
+  for (int b=0; b<pool->banks; b++) {
+    int max = b == pool->banks-1 ? pool->offset : NCCL_PROXY_CONN_POOL_SIZE;
+    for (int i=0; i<max; i++) {
+      ncclProxyConnection *connection = pool->pools[b]+i;
+      if (connection->state != connUninitialized) {
+        INFO(NCCL_R2CC, "R2CC: Freeing connection[%d][%d] state=%d", b, i, connection->state);
+        NCCLCHECK(proxyFree(connection, proxyState));
+      }
+    }
+  }
   return ncclSuccess;
 }
 
@@ -1095,6 +1137,7 @@ ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, in
     }
   }
   proxyConn->initialized = true;
+  INFO(NCCL_NET|NCCL_PROXY, "Rank %d connected to proxy localRank %d -> connection %p", comm->rank, proxyConn->tpLocalRank, proxyConn->connection);
   INFO(NCCL_NET|NCCL_PROXY, "Connected to proxy localRank %d -> connection %p", proxyConn->tpLocalRank, proxyConn->connection);
   return ncclSuccess;
 }
@@ -1484,7 +1527,9 @@ static ncclResult_t proxyServiceInitOp(int type, struct ncclProxyLocalPeer* peer
   // Store opId for completion response
   NCCLCHECKGOTO(ncclSocketRecv(sock, &asyncOp->opId, sizeof(asyncOp->opId)), ret, fail);
 
+  TRACE(NCCL_INIT, "proxyServiceInitOp  respSize is %d", asyncOp->respSize);
   if (asyncOp->respSize) NCCLCHECKGOTO(ncclCalloc(&asyncOp->respBuff, asyncOp->respSize), ret, fail);
+  TRACE(NCCL_INIT, "after calloc asyncOp->respBuff");
 
   asyncProxyOpEnqueue(peer, asyncOp);
 
@@ -1638,7 +1683,17 @@ void* ncclProxyService(void* _args) {
             stop = PROXY_STOP;
             closeConn = 1;
           } else if (type == ncclProxyMsgClose) {
+            // R2CC: Clean up peer connections before closing
+            INFO(NCCL_R2CC, "R2CC: Received ncclProxyMsgClose from localRank %d", peer->tpLocalRank);
+            ncclProxyFreePeerConnections(&connectionPool, proxyState);
             closeConn = 1;
+          } else if (type == ncclProxyMsgBarrier) {
+            // R2CC: Handle barrier message - wait for all operations to complete
+            INFO(NCCL_R2CC, "R2CC: Received ncclProxyMsgBarrier from localRank %d", peer->tpLocalRank);
+            // Send acknowledgment back
+            int ack = ncclProxyMsgBarrier;
+            (void)ncclSocketSend(sock, &ack, sizeof(int));
+            INFO(NCCL_R2CC, "R2CC: Sent barrier acknowledgment to localRank %d", peer->tpLocalRank);
           } else if (proxyMatchOpType(type)) {
             res = proxyServiceInitOp(type, peers+s, &connectionPool, proxyState, &asyncOpCount);
           } else {

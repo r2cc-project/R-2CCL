@@ -13,9 +13,12 @@
 #include "cudawrap.h"
 #include "profiler.h"
 #include "transport.h"
+#include "graph/topo.h"
+#include "r2cc/oob/oob_udp.h"
 
 #include <cstring> // std::memcpy
 #include <cinttypes> // PRIx64
+#include <unistd.h> // gethostname
 
 NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
 
@@ -212,7 +215,19 @@ static void finishPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
     if (op) channelUbound = c+1;
   }
   // Phase 2: Dequeue from planner->channels[c], enqueue in merged order to plan
+  int loopCount = 0;
+  const int maxLoops = 1000; // Safety limit
   while (nHeads != 0) {
+    if (++loopCount > maxLoops) {
+      WARN("finishPlan: DEADLOCK detected after %d iterations! nHeads=%d", loopCount, nHeads);
+      for (int c1=0; c1 < channelUbound; c1++) {
+        WARN("  Channel %d: headIds=%lu, queue.head=%p", c1, headIds[c1], 
+             wipChannels[c1].proxyOpQueue.head);
+      }
+      // Cannot return error from void function, just break to avoid infinite loop
+      break;
+    }
+    
     int c = -1;
     uint64_t minId = uint64_t(-1);
     // Find channel with least proxy-op id. We store the heads[c]->opCount in
@@ -222,6 +237,12 @@ static void finishPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
       id = (id>>1 | id<<63); // Move tag bit to order collectives before p2p's
       if (id < minId) { c = c1; minId = id; }
     }
+    
+    if (loopCount <= 10 || loopCount % 100 == 0) {
+      INFO(NCCL_R2CC, "finishPlan[%d]: selected channel=%d, minId=%lu, nHeads=%d", 
+           loopCount, c, minId, nHeads);
+    }
+    
     struct ncclProxyOp* op = ncclIntruQueueDequeue(&wipChannels[c].proxyOpQueue);
     struct ncclProxyOp* opNext = ncclIntruQueueHead(&wipChannels[c].proxyOpQueue);
     headIds[c] = opNext ? opNext->opCount : uint64_t(-1);
@@ -718,8 +739,78 @@ static ncclResult_t scheduleCollTasksToPlan(
   int nPlanColls = 0;
   size_t trafficBytes[2*2] = {0, 0, 0, 0}; // [collnet][nvls]
   int nChannels[2*2] = {0, 0, 0, 0}; // [collnet][nvls]
-  int const nMaxChannels[2*2] = {comm->nChannels, comm->nvlsChannels, // [collnet][nvls]
-                                 comm->nChannels, comm->nvlsChannels};
+
+
+
+  // NCCL_FORCE_DISTRIBUTE_CHANNELS
+  // 1. reduce maxchannel num. (actually if a dev has error, should reduce 2 channels)
+  // 2. need to change channel mapping. (minimum channel set to 8, equal to 8 devices)
+  static int forceDistributeChannels = -1;
+  if (forceDistributeChannels == -1) {
+    const char* env = getenv("NCCL_FORCE_DISTRIBUTE_CHANNELS");
+    forceDistributeChannels = env ? atoi(env) : 0;
+  }
+  
+  // Base channel set we may schedule collectives onto.
+  int mxchannelsRaw = comm->nChannels;
+  if (forceDistributeChannels) mxchannelsRaw = std::max(0, comm->nChannels - 2);
+  uint32_t availMask = (mxchannelsRaw >= MAXCHANNELS) ? 0xffffffffu : ((1u << mxchannelsRaw) - 1);
+
+  // failure2SameServer
+  const char* failure2SameServer_str = getenv("FAILURE2_SAME_SERVER");
+  int failure_num = 0;
+
+  // R2CC_MODE=2,3: Exclude channels for failed NIC(s). Channels are assumed to be
+  // distributed round-robin over net devices, so all channels mapping to a failed
+  // netDev must be removed (sparse channel set).
+  const char* r2ccMode = getenv("R2CC_MODE");
+  int mode = r2ccMode ? atoi(r2ccMode) : 0;
+  int nNetDevs = 0;
+  uint32_t failedMask = 0;
+  // Prefer global failed-channel mask if present (computed via bootstrapAllGather).
+  uint64_t globalFailed = OobNet::Get().GlobalFailedChannelMask();
+  if (globalFailed) {
+    uint64_t validMask = (mxchannelsRaw >= 64) ? ~0ull : ((1ull << mxchannelsRaw) - 1);
+    failedMask = (uint32_t)(globalFailed & validMask);
+    availMask &= ~failedMask;
+  } else if (mode > 1) {
+    failure_num = (failure2SameServer_str && atoi(failure2SameServer_str) == 1) ? 2 : 1;
+    NCCLCHECK(comm->ncclNet->devices(&nNetDevs));
+    if (nNetDevs > 0 && failure_num > 0) {
+      int failedStartDev = std::max(0, nNetDevs - failure_num);
+      for (int c = 0; c < mxchannelsRaw; c++) {
+        int dev = c % nNetDevs;
+        if (dev >= failedStartDev) failedMask |= (1u << c);
+      }
+      availMask &= ~failedMask;
+    }
+  }
+
+  // Ordered list of available (healthy) channels for standard/collnet collectives.
+  int availChans[MAXCHANNELS];
+  int availCount = 0;
+  for (int c = 0; c < mxchannelsRaw && c < MAXCHANNELS; c++) {
+    if (availMask & (1u << c)) availChans[availCount++] = c;
+  }
+  int mxchannels = availCount;
+  if (mxchannels == 0 && mxchannelsRaw > 0) {
+    // Should never happen in normal setups, but avoid hard failure if masking logic
+    // ends up excluding all channels.
+    WARN("R2CC_MODE=%d: all channels were masked off (mxchannelsRaw=%d nNetDevs=%d failure_num=%d). Falling back to use all channels.",
+         mode, mxchannelsRaw, nNetDevs, failure_num);
+    for (int c = 0; c < mxchannelsRaw && c < MAXCHANNELS; c++) availChans[availCount++] = c;
+    mxchannels = availCount;
+  }
+  // if (comm->rank == 0 && failure_num > 0) {
+  //  printf("failure_num: %d\n", failure_num);
+ //  }
+
+  size_t totalUserBytes = 0;
+  bool hasAllReduce = false;
+  bool hasBroadcast = false;
+
+  int const nMaxChannels[2*2] = {mxchannels, comm->nvlsChannels, // [collnet][nvls]
+                                 mxchannels, comm->nvlsChannels};
   constexpr size_t MinTrafficPerChannel = 16 << 10; // 16K traffic as minimal
   do {
     size_t workBytes = 0;
@@ -735,11 +826,239 @@ static ncclResult_t scheduleCollTasksToPlan(
       trafficBytes[kind] += std::max(MinTrafficPerChannel, task->trafficBytes);
       nChannels[kind] += task->nMaxChannels;
       nChannels[kind] = std::min(nChannels[kind], nMaxChannels[kind]);
+
+      if (task->func == ncclFuncAllReduce) hasAllReduce = true;
+      if (task->func == ncclFuncBroadcast) hasBroadcast = true;
+      // Accumulate total user bytes to check against threshold
+      totalUserBytes += task->count * ncclTypeSize(task->datatype);
+
       task = task->next;
       workNode = workNode->next;
+
     }
   plan_full:;
   } while (0);
+
+
+  // ---------------- R2CC: fixed channel partition for fused AllReduce + Broadcast ----------------
+  static int envFixedSplit = -1;
+  if (envFixedSplit == -1) {
+    const char* env = getenv("R2CC_FIXED_CHANNEL_SPLIT");
+    envFixedSplit = env ? atoi(env) : 0;
+  }
+  int r2ccFixedSplit = (totalUserBytes <= 134217728 && hasAllReduce && hasBroadcast) ? envFixedSplit : 0;
+  // Fixed split assumes contiguous channel ranges; disable it when MODE=2 introduces sparse channel sets.
+  if (mode > 1 && failedMask != 0) r2ccFixedSplit = 0;
+
+   // if (comm->rank == 0 && hasAllReduce ) {
+   //  printf("\nDEBUG: [Rank 0] Total User Bytes: %zu, r2ccFixedSplit: %d\n hasAllReduce: %d, hasBroadcast: %d\n", totalUserBytes, r2ccFixedSplit, hasAllReduce, hasBroadcast);
+   //  fflush(stdout);
+   // }
+
+  if (r2ccFixedSplit && planner->nTasksColl == 2 && nPlanColls == 2) {
+    struct ncclTaskColl* t0 = ncclIntruQueueHead(&planner->collTaskQueue);
+    struct ncclTaskColl* t1 = t0 ? t0->next : nullptr;
+    struct ncclWorkList* w0 = ncclIntruQueueHead(&planner->collWorkQueue);
+    struct ncclWorkList* w1 = w0 ? w0->next : nullptr;
+
+    auto isPair = [&](struct ncclTaskColl* a, struct ncclTaskColl* b) {
+      if (a == nullptr || b == nullptr) return false;
+      if (b->next != nullptr) return false;
+      bool ab = (a->func == ncclFuncAllReduce && b->func == ncclFuncBroadcast);
+      bool ba = (a->func == ncclFuncBroadcast && b->func == ncclFuncAllReduce);
+      return ab || ba;
+    };
+
+    if (isPair(t0, t1) && w0 && w1 && w1->next == nullptr) {
+      // Only handle "standard" (non CollNet/NVLS) to keep it simple & safe:
+      int kind0 = 2*t0->isCollnet + t0->isNvls;
+      int kind1 = 2*t1->isCollnet + t1->isNvls;
+      if (kind0 == kind1 && kind0 == 0) {
+        int totalCh = nMaxChannels[kind0];
+        if (totalCh >= 2) {
+          // traffic weights (already includes AllReduce x2 via trafficBytes)
+          size_t wAR = 0, wBC = 0;
+          if (t0->func == ncclFuncAllReduce) wAR = t0->trafficBytes;
+          if (t0->func == ncclFuncBroadcast) wBC = t0->trafficBytes;
+          if (t1->func == ncclFuncAllReduce) wAR = t1->trafficBytes;
+          if (t1->func == ncclFuncBroadcast) wBC = t1->trafficBytes;
+
+          size_t denom = wAR + wBC;
+          if (denom == 0) denom = 1;
+
+          // bcCh = round(totalCh * wBC / (wAR+wBC)), clamp to [1, totalCh-1]
+          uint64_t numer = (uint64_t)totalCh * (uint64_t)wBC + (uint64_t)(denom/2);
+          int bcCh = (int)(numer / (uint64_t)denom);
+          if (bcCh < 1) bcCh = 1;
+          if (bcCh > totalCh-1) bcCh = totalCh-1;
+
+          // ---------------- R2CC: override bcCh by failure-induced channel reduction ----------------
+          // Your machine: 16->14 (remove 2 ch) means 1 NIC failed; 16->12 (remove 4 ch) means 2 NIC failed.
+          // Force bcast to use the last (removed-1) channels: removed=2 => 1 ch; removed=4 => 3 ch.
+          const int origCh = comm->nChannels;          // typically 16
+          const int removedCh = origCh - totalCh;      // 2 or 4 in your setup
+          int bcChForced = 0;
+          if (removedCh == 2) bcChForced = 1;          // failure=1 => bcast uses last 1 channel
+          else if (removedCh == 4) bcChForced = 3;     // failure=2 => bcast uses last 3 channels (10/11/12th)
+
+          // Apply override if matched
+          if (bcChForced) {
+            bcCh = bcChForced;
+            if (bcCh < 1) bcCh = 1;
+            if (bcCh > totalCh-1) bcCh = totalCh-1;
+          }
+
+          int arCh = totalCh - bcCh;
+
+          if (comm->rank == 0) {
+            INFO(NCCL_INIT,
+                "R2CC_FIXED_CHANNEL_SPLIT: origCh=%d totalCh=%d removedCh=%d arCh=%d bcCh=%d (forced=%d) wAR=%zu wBC=%zu",
+                origCh, totalCh, removedCh, arCh, bcCh, bcChForced, wAR, wBC);
+          }
+
+
+
+          auto scheduleOneFixed = [&](struct ncclTaskColl* task, struct ncclWorkList* workNode,
+                                      int baseChan, int nAvail) -> ncclResult_t {
+            struct ncclDevWorkColl* devWork = (struct ncclDevWorkColl*)(workNode+1);
+            size_t elementSize = ncclTypeSize(task->datatype);
+
+            // Local per-task "trafficPerChannel": prevents the 2nd op being packed into last channel tail.
+            size_t trafficPerChan = task->trafficBytes / (size_t)nAvail;
+            trafficPerChan = std::max<size_t>(MinTrafficPerChannel, trafficPerChan);
+
+            int trafficPerByte = ncclFuncTrafficPerByte(task->func, comm->nRanks);
+            size_t cellSize = divUp(divUp(MinTrafficPerChannel, (size_t)trafficPerByte), 16) * 16;
+            int elementsPerCell = (int)(cellSize/elementSize);
+            size_t cells = divUp(task->count*elementSize, cellSize);
+            size_t trafficPerCell = cellSize*(size_t)trafficPerByte;
+
+            int channelId = 0;
+            size_t currentTraffic = 0;
+
+            // This is basically your existing logic, but scoped to [0..nAvail-1] and then offset by baseChan.
+            size_t cellsPerChannel = std::min(cells, divUp(trafficPerChan, trafficPerCell));
+            size_t cellsLo;
+            if (channelId+1 == nAvail) {
+              cellsLo = cells;
+            } else {
+              cellsLo = std::min(cells, divUp((trafficPerChan-currentTraffic), trafficPerCell));
+            }
+            int nMidChannels = (int)((cells-cellsLo)/cellsPerChannel);
+            size_t cellsHi = (cells-cellsLo)%cellsPerChannel;
+            int nChannels = (cellsLo!=0 ? 1 : 0) + nMidChannels + (cellsHi!=0 ? 1 : 0);
+
+            if (nAvail < channelId + nChannels) {
+              nMidChannels = nAvail - channelId - 2;
+              cellsPerChannel = (cells-cellsLo)/(size_t)(nMidChannels+1);
+              cellsHi = cellsPerChannel + (cells-cellsLo)%(size_t)(nMidChannels+1);
+            }
+            if (cellsHi == 0 && nMidChannels != 0) {
+              cellsHi = cellsPerChannel;
+              nMidChannels -= 1;
+            }
+            if (cellsLo == 0) {
+              channelId += 1;
+              if (nMidChannels == 0) { cellsLo = cellsHi; cellsHi = 0; }
+              else { cellsLo = cellsPerChannel; nMidChannels -= 1; }
+            }
+
+            size_t countMid = nMidChannels!=0 ? cellsPerChannel*(size_t)elementsPerCell : 0;
+            size_t countLo  = cellsLo*(size_t)elementsPerCell;
+            size_t countHi  = cellsHi*(size_t)elementsPerCell;
+            (countHi != 0 ? countHi : countLo) -= cells*(size_t)elementsPerCell - task->count;
+
+            nChannels = (countLo!=0 ? 1 : 0) + nMidChannels + (cellsHi!=0 ? 1 : 0);
+
+          // Bookkeeping & emit batches/proxy ops (same as your current code)
+            devWork->channelLo = baseChan + channelId;
+            devWork->channelHi = baseChan + channelId + nChannels - 1;
+            devWork->channelMask = 0;
+            devWork->cbd.countLo  = countLo;
+            devWork->cbd.countMid = countMid;
+            devWork->cbd.countHi  = countHi;
+
+            size_t globalBytesPerElement = elementSize*ncclFuncMaxSendRecvCount(task->func, comm->nRanks, 1);
+            struct ncclProxyOp proxyOpLo, proxyOpMid, proxyOpHi;
+            uint32_t chunkSize, directFlags=0;
+            size_t grainSize = ncclProtoGrainSize(task->protocol);
+
+            if (countLo != 0) {
+              NCCLCHECK(calcCollChunking(comm, task, 1, globalBytesPerElement*countLo, &chunkSize, &directFlags, &proxyOpLo));
+              devWork->cbd.chunkGrainsLo = chunkSize/grainSize;
+            }
+            if (countHi != 0) {
+              NCCLCHECK(calcCollChunking(comm, task, 1, globalBytesPerElement*countHi, &chunkSize, &directFlags, &proxyOpHi));
+              devWork->cbd.chunkGrainsHi = chunkSize/grainSize;
+            }
+            if (nMidChannels != 0) {
+              NCCLCHECK(calcCollChunking(comm, task, 1, globalBytesPerElement*countMid, &chunkSize, &directFlags, &proxyOpMid));
+              devWork->cbd.chunkGrainsMid = chunkSize/grainSize;
+            }
+            devWork->direct = directFlags;
+
+            uint64_t proxyOpId = uint64_t(plan->collOpCount++)<<1 | 0;
+            for (int c = devWork->channelLo; c <= (int)devWork->channelHi; c++) {
+              struct ncclProxyOp* proxyOp;
+              if (c == (int)devWork->channelLo) proxyOp = &proxyOpLo;
+              else if (c == (int)devWork->channelHi) proxyOp = &proxyOpHi;
+              else proxyOp = &proxyOpMid;
+
+              proxyOp->channelId = c;
+              proxyOp->opCount = proxyOpId;
+              proxyOp->task.coll = task;
+              proxyOp->rank = comm->rank;
+
+              addWorkBatchToPlan(comm, plan, c, workNode->workType, task->devFuncId, plan->workBytes);
+              NCCLCHECK(addProxyOpIfNeeded(comm, plan, proxyOp));
+            }
+
+            plan->channelMask |= (2ull<<devWork->channelHi) - (1ull<<devWork->channelLo);
+            plan->threadPerBlock = std::max(plan->threadPerBlock, task->nWarps*WARP_SIZE);
+            if (!plan->kernelSpecialized) {
+              plan->kernelFn = ncclDevKernelForFunc[task->devFuncId];
+              plan->kernelSpecialized = ncclDevKernelForFuncIsSpecialized[task->devFuncId];
+            }
+
+            // cleanup queue elements
+            for (int i=0; i < task->nCleanupQueueElts; i++) {
+              ncclIntruQueueEnqueue(&plan->cleanupQueue, ncclIntruQueueDequeue(&planner->collCleanupQueue));
+            }
+
+            // move task/work from planner queues to plan queues (same as original loop end)
+            ncclIntruQueueDequeue(&planner->collTaskQueue);
+            ncclIntruQueueDequeue(&planner->collWorkQueue);
+            planner->nTasksColl -= 1;
+            nPlanColls -= 1;
+            ncclIntruQueueEnqueue(&plan->collTaskQueue, task);
+            ncclIntruQueueEnqueue(&plan->workQueue, workNode);
+            plan->workBytes += workNode->size;
+
+            return ncclSuccess;
+          };
+
+          // Schedule the two tasks in queue order, but force each into its own channel range.
+          for (int i = 0; i < 2; i++) {
+            struct ncclTaskColl* task = ncclIntruQueueHead(&planner->collTaskQueue);
+            struct ncclWorkList* workNode = ncclIntruQueueHead(&planner->collWorkQueue);
+            int base = (task->func == ncclFuncBroadcast) ? arCh : 0;
+            int nav  = (task->func == ncclFuncBroadcast) ? bcCh : arCh;
+            NCCLCHECK(scheduleOneFixed(task, workNode, base, nav));
+          }
+
+          return ncclSuccess; // done: bypass the default channel packer
+        }
+      }
+    }
+  }
+  // ---------------- end of R2CC_FIXED_CHANNEL_SPLIT ----------------
+
+
+
+
+
+
+
 
   int kindPrev = -1;
   size_t trafficPerChannel = 0;
@@ -760,7 +1079,8 @@ static ncclResult_t scheduleCollTasksToPlan(
     }
 
     if (task->isCollnet) {
-      int nChannels = task->nMaxChannels;
+      int nChannels = std::min(task->nMaxChannels, nMaxChannels[kind]);
+      if (nChannels < 1) nChannels = 1;
       // Ensure room for worst case of one new batch per channel
       if (!testBudget(budget, plan->nWorkBatches + nChannels, plan->workBytes + workNode->size)) {
         return ncclSuccess;
@@ -770,14 +1090,35 @@ static ncclResult_t scheduleCollTasksToPlan(
       struct ncclProxyOp proxyOp;
       uint32_t chunkSize, directFlags=0;
       NCCLCHECK(calcCollChunking(comm, task, nChannels, globalBytesPerElement*task->count, &chunkSize, &directFlags, &proxyOp));
-      devWork->channelLo = 0;
-      devWork->channelHi = nChannels-1;
+      // For network collectives (non-NVLS), channel IDs may be sparse in MODE=2.
+      // We keep scheduling logic in terms of "slots" [0..nChannels-1] but map each slot
+      // to an actual channelId via availChans[].
+      uint32_t workMask = 0;
+      int chanLo = 0, chanHi = 0;
+      if (task->isNvls) {
+        devWork->channelMask = 0;
+        devWork->channelLo = 0;
+        devWork->channelHi = nChannels-1;
+      } else {
+        for (int s = 0; s < nChannels; s++) {
+          int c = availChans[s];
+          workMask |= (1u << c);
+          if (s == 0) chanLo = c;
+          chanHi = c;
+        }
+        devWork->channelMask = workMask;
+        devWork->channelLo = chanLo;
+        devWork->channelHi = chanHi;
+      }
       devWork->collnet.count = task->count;
       devWork->collnet.chunkCount = chunkSize/ncclTypeSize(task->datatype);
       devWork->direct = directFlags;
 
       uint64_t proxyOpId = uint64_t(plan->collOpCount++)<<1 | 0;
-      for (int c=devWork->channelLo; c <= (int)devWork->channelHi; c++) {
+      INFO(NCCL_INIT, "Creating proxy ops: plan->collOpCount=%d, proxyOpId=%lu, channelLo=%d, channelHi=%d", 
+           plan->collOpCount-1, proxyOpId, devWork->channelLo, devWork->channelHi);
+      for (int s = 0; s < nChannels; s++) {
+        int c = task->isNvls ? s : availChans[s];
         proxyOp.channelId = c;
         proxyOp.opCount = proxyOpId;
         proxyOp.task.coll = task;
@@ -792,6 +1133,10 @@ static ncclResult_t scheduleCollTasksToPlan(
       size_t cells = divUp(task->count*elementSize, cellSize);
       size_t trafficPerElement = elementSize*trafficPerByte;
       size_t trafficPerCell = cellSize*trafficPerByte;
+      
+      // Note: We keep the existing CBD scheduler but interpret channelId as a "slot" index
+      // into the active channel list for this kind. For network collectives in MODE=2,
+      // that list is sparse in terms of actual channel IDs.
       size_t cellsPerChannel = std::min(cells, divUp(trafficPerChannel, trafficPerCell));
       size_t cellsLo;
       if (channelId+1 == nMaxChannels[kind]) { // On last channel everything goes to "lo"
@@ -829,6 +1174,27 @@ static ncclResult_t scheduleCollTasksToPlan(
 
       devWork->channelLo = channelId;
       devWork->channelHi = channelId + nChannels-1;
+
+      // Map slot range [channelId .. channelId+nChannels-1] to actual channels and build channelMask.
+      const int slotLo = channelId;
+      uint32_t workMask = 0;
+      int chanLo = 0, chanHi = 0;
+      if (task->isNvls) {
+        devWork->channelMask = 0;
+        devWork->channelLo = slotLo;
+        devWork->channelHi = slotLo + nChannels - 1;
+      } else {
+        for (int s = 0; s < nChannels; s++) {
+          int c = availChans[slotLo + s];
+          workMask |= (1u << c);
+          if (s == 0) chanLo = c;
+          chanHi = c;
+        }
+        devWork->channelMask = workMask;
+        devWork->channelLo = chanLo;
+        devWork->channelHi = chanHi;
+      }
+
       devWork->cbd.countLo = countLo;
       devWork->cbd.countMid = countMid;
       devWork->cbd.countHi = countHi;
@@ -871,11 +1237,14 @@ static ncclResult_t scheduleCollTasksToPlan(
       }
 
       uint64_t proxyOpId = uint64_t(plan->collOpCount++)<<1 | 0;
-      for (int c=devWork->channelLo; c <= (int)devWork->channelHi; c++) {
+      INFO(NCCL_INIT, "Creating proxy ops (2): plan->collOpCount=%d, proxyOpId=%lu, channelLo=%d, channelHi=%d", 
+           plan->collOpCount-1, proxyOpId, devWork->channelLo, devWork->channelHi);
+      for (int s = 0; s < nChannels; s++) {
+        int c = task->isNvls ? (slotLo + s) : availChans[slotLo + s];
         struct ncclProxyOp* proxyOp;
-        if (c == (int)devWork->channelLo) {
+        if (s == 0) {
           proxyOp = &proxyOpLo;
-        } else if (c == (int)devWork->channelHi) {
+        } else if (s + 1 == nChannels) {
           proxyOp = &proxyOpHi;
         } else {
           proxyOp = &proxyOpMid;
@@ -892,7 +1261,11 @@ static ncclResult_t scheduleCollTasksToPlan(
       }
     }
 
-    plan->channelMask |= (2ull<<devWork->channelHi) - (1ull<<devWork->channelLo);
+    if (devWork->channelMask) {
+      plan->channelMask |= (uint64_t)devWork->channelMask;
+    } else {
+      plan->channelMask |= (2ull<<devWork->channelHi) - (1ull<<devWork->channelLo);
+    }
     plan->threadPerBlock = std::max(plan->threadPerBlock, task->nWarps*WARP_SIZE);
     if (!plan->kernelSpecialized) {
       plan->kernelFn = ncclDevKernelForFunc[task->devFuncId];
@@ -956,7 +1329,36 @@ static ncclResult_t addP2pToPlan(
   bool protoLL[2] = {!selfSend, !selfSend};
   bool network[2] = {false, false};
   bool proxySameProcess[2] = {true, true};
+
+  int gpuIndex = -1;
+  if (comm->topo) {
+    ncclTopoRankToIndex(comm->topo, comm->rank, &gpuIndex);
+  }
+
+  // R2CC P2P Test Mode: Check environment variables
+  const char* p2pTestMode = getenv("R2CC_P2P_TEST_MODE");
+  const char* r2ccMode = getenv("R2CC_MODE");
+
+  const char* failure2SameServer=getenv("FAILURE2_SAME_SERVER");
+  int failure2 = failure2SameServer ? atoi(failure2SameServer) : 0;
+
+  int testMode = p2pTestMode ? atoi(p2pTestMode) : 0;
+  int mode = r2ccMode ? atoi(r2ccMode) : 0;
+  bool useTestChannels = (testMode == 1);
+  
   uint8_t base = ncclP2pChannelBaseForRound(comm, p2pRound);
+  if (useTestChannels){
+    base = 0;
+  }
+  const char* targetBusIdEnv = getenv("GPUBUSID");
+  char currentBusId[20];
+  int64ToBusId(comm->busId, currentBusId);
+  if (useTestChannels && (strncmp(currentBusId, targetBusIdEnv, strlen(targetBusIdEnv)) == 0) ) {
+    WARN("P2P Test Mode: Enabled, R2CC_MODE=%d, will redistribute data across channels", mode);
+  } else {
+    WARN("P2P Channel Selection: p2pRound=%d, base=%d, p2pnChannels=%d, nNodes=%d, maxLocalRanks=%d, sendRank=%d, recvRank=%d", 
+         p2pRound, base, comm->p2pnChannels, comm->nNodes, comm->maxLocalRanks, sendRank, recvRank);
+  }
   if (!selfSend) {
     for (int part=0; part < nChannelsMax; part++) {
       int channelId = ncclP2pChannelForPart(comm->p2pnChannels, base, part);
@@ -1031,6 +1433,7 @@ static ncclResult_t addP2pToPlan(
       ipcRegistered[dir] = regFlag ? true : false;
     }
 
+    // Original logic - calculate channel count
     if (bytes[dir] == -1) nChannels[dir] = 0;
     else if (bytes[dir] == 0) nChannels[dir] = 1;
     else {
@@ -1042,8 +1445,77 @@ static ncclResult_t addP2pToPlan(
         nChannels[dir] *= 2;
         partSize = divUp(bytes[dir], nChannels[dir]);
       }
+      
+      // bit revise
+      // Part -> Binary -> Reversed -> Channel -> NIC (channel % 8)
+      // --------------------------------------------------------------
+      // Part 0  -> 0b0000 -> 0b0000 -> Channel 0  -> NIC 0
+      // Part 1  -> 0b0001 -> 0b1000 -> Channel 8  -> NIC 0
+      // Part 2  -> 0b0010 -> 0b0100 -> Channel 4  -> NIC 4
+      // Part 3  -> 0b0011 -> 0b1100 -> Channel 12 -> NIC 4
+      // Part 4  -> 0b0100 -> 0b0010 -> Channel 2  -> NIC 2
+      // Part 5  -> 0b0101 -> 0b1010 -> Channel 10 -> NIC 2
+      // Part 6  -> 0b0110 -> 0b0110 -> Channel 6  -> NIC 6
+      // Part 7  -> 0b0111 -> 0b1110 -> Channel 14 -> NIC 6
+      // Part 8  -> 0b1000 -> 0b0001 -> Channel 1  -> NIC 1
+      // Part 9  -> 0b1001 -> 0b1001 -> Channel 9  -> NIC 1
+      // Part 10 -> 0b1010 -> 0b0101 -> Channel 5  -> NIC 5
+      // Part 11 -> 0b1011 -> 0b1101 -> Channel 13 -> NIC 5
+      // Part 12 -> 0b1100 -> 0b0011 -> Channel 3  -> NIC 3
+      // Part 13 -> 0b1101 -> 0b1011 -> Channel 11 -> NIC 3
+      // Part 14 -> 0b1110 -> 0b0111 -> Channel 7  -> NIC 7
+      // Part 15 -> 0b1111 -> 0b1111 -> Channel 15 -> NIC 7
+
+      // R2CC P2P Test Mode: Force the channel count to use only NIC 0
+      // P2P mode2 ==7
+
+      // printf("localrank=%d, failure2=%d, useTestChannels=%d, bytes=%d, reduce_channel=%d\n", localrank, failure2, useTestChannels, bytes[dir], reduce_channel);
+
+      if (useTestChannels && bytes[dir] > 0 && targetBusIdEnv) {
+      // TODO: should add another env to specific NIC failure location.
+        char currentBusId[20];
+        int64ToBusId(comm->busId, currentBusId);
+
+        // Get Peer Bus ID
+        char peerBusId[20] = "0000:00:00.0"; // Default
+        int myPeer = (dir == 1) ? recvRank : sendRank;
+        if (comm->peerInfo) {
+            int64ToBusId(comm->peerInfo[myPeer].busId, peerBusId);
+        }
+
+        // Check if EITHER Local OR Peer is one of the failed GPUs
+        bool localIs45 = (strncmp(currentBusId, "0000:45:00.0", 12) == 0);
+        bool peerIs45 = (strncmp(peerBusId, "0000:45:00.0", 12) == 0);
+        
+        bool localIsC2 = (strncmp(currentBusId, "0000:c2:00.0", 12) == 0);
+        bool peerIsC2 = (strncmp(peerBusId, "0000:c2:00.0", 12) == 0);
+
+        if (localIs45 || peerIs45 || localIsC2 || peerIsC2) {
+          int originalChannels = nChannels[dir];
+          int targetChannels = originalChannels;
+          
+          // Force failure2=1 behavior (reduce by 4) to ensure agreement across nodes
+          // regardless of local env var.
+          int effectiveFailure2 = 1; 
+          
+          if (originalChannels > 2) targetChannels = originalChannels-2*(1+effectiveFailure2);
+          nChannels[dir] = targetChannels;
+          
+          WARN("P2P Test Mode: Failure Detected (Local=%s, Peer=%s). Reduced nChannels[%d] from %d to %d", 
+               currentBusId, peerBusId, dir, originalChannels, nChannels[dir]);
+        }
+      }
     }
   }
+
+  // Log nChannels for ALL GPUs to detect mismatch
+  // Only log when the state (nChannels or peers) changes
+  static int prevSendCh = -1, prevRecvCh = -1;
+  static int prevSendRank = -1, prevRecvRank = -1;
+  //printf("mode=%d, useTestChannels=%d, testmode=%d\n", mode, useTestChannels, testMode);
+  
+  //INFO(NCCL_INIT, "mode=%d, useTestChannels=%d, testmode=%d\n", mode, useTestChannels, testMode);
+
 
   struct ncclWorkList* workNode = ncclMemoryStackAllocInlineArray<ncclWorkList, ncclDevWorkP2p>(&comm->memScoped, 1);
   workNode->workType = ncclDevWorkTypeP2p;
@@ -1093,8 +1565,40 @@ static ncclResult_t addP2pToPlan(
   }
 
   nChannelsMax = std::max(nChannels[0], nChannels[1]);
+  
+  // Debug INFO
+  if (useTestChannels && (strncmp(currentBusId, targetBusIdEnv, strlen(targetBusIdEnv)) == 0)) {
+    WARN("P2P Test Mode: nChannelsMax=%d, base=%d, sendBytes=%ld, recvBytes=%ld, p2pnChannels=%d", 
+         nChannelsMax, base, sendBytes, recvBytes, comm->p2pnChannels);
+    
+    // Show the complete mapping for understanding
+    WARN("P2P Test Mode: Channel mapping with reverseBits (p2pnChannels=%d):", comm->p2pnChannels);
+    for (int p = 0; p < comm->p2pnChannels; p++) {
+      int ch = ncclP2pChannelForPart(comm->p2pnChannels, base, p);
+      //int nic = ch % 2;
+      //WARN("  Part %d -> Channel %d (NIC %d)", p, ch, nic);
+    }
+    WARN("P2P Test Mode: Using %d parts -> channels:", nChannelsMax);
+  }
+  
   for (int part=0; part < nChannelsMax; part++) {
+    // Always use original channel selection algorithm
     int channelId = ncclP2pChannelForPart(comm->p2pnChannels, base, part);
+    
+    // Debug INFO
+    if (useTestChannels && (strncmp(currentBusId, targetBusIdEnv, strlen(targetBusIdEnv)) == 0)) {
+      // Check which NIC this channel maps to
+      // With R2CC_P2P_TEST_MODE=1, channels are mapped round-robin to NICs
+      // We have p2pnChannels = 2 * localNetCount (for PRIMARY/BACKUP)
+      // So localNetCount = p2pnChannels / 2
+      // wrong local net count
+      int localNetCount = comm->p2pnChannels / 2;
+      int netDev = channelId % localNetCount;
+      if (gpuIndex != 7) netDev=gpuIndex;
+      WARN("P2P Test Mode: part=%d/%d -> channelId=%d -> NIC %d", 
+           part, nChannelsMax, channelId, netDev);
+    }
+    
     plan->channelMask |= uint64_t(1)<<channelId;
     // Add batch first.
     addWorkBatchToPlan(comm, plan, channelId, ncclDevWorkTypeP2p, ncclDevFuncId_P2p(), workOffset, p2pRound);
@@ -1114,19 +1618,67 @@ static ncclResult_t addP2pToPlan(
       } else {
         size_t chunkDataSize = u32fp8Decode(dir ? work->sendChunkSize_u32fp8 : work->recvChunkSize_u32fp8);
         size_t partBeg, partEnd;
+        
+        // Now nParts should already be correct (3 or 2) in test mode
         ncclP2pPartBounds(nParts, part, bytes, &partBeg, &partEnd);
-        if (proxyOps[dir].reg) {
-          proxyOps[dir].nsteps = 1;
-          proxyOps[dir].recvbuff = (uint8_t*)addr+partBeg;
-          proxyOps[dir].nbytes = partEnd-partBeg;
+        
+        // Debug INFO
+        if (useTestChannels && (strncmp(currentBusId, targetBusIdEnv, strlen(targetBusIdEnv)) == 0)) {
+          WARN("P2P Test Mode: Channel %d (part %d/%d) gets bytes [%ld-%ld] (%ld bytes)", 
+               channelId, part, nParts, partBeg, partEnd, partEnd-partBeg);
+        }
+        
+        // Log P2P data distribution across channels
+        if (dir == 1 && bytes > 0) { // Only log send operations
+          INFO(NCCL_INIT, "P2P Send: Channel %d (part %d/%d) bytes=%ld [%ld-%ld]", 
+               channelId, part, nParts, partEnd-partBeg, partBeg, partEnd);
+        }
+        
+        if (partEnd > partBeg) {
+          // Only set up proxy ops if there's actual data to transfer
+          if (proxyOps[dir].reg) {
+            proxyOps[dir].nsteps = 1;
+            proxyOps[dir].recvbuff = (uint8_t*)addr+partBeg;
+            proxyOps[dir].nbytes = partEnd-partBeg;
+          } else {
+            proxyOps[dir].nsteps = divUp(partEnd-partBeg, chunkDataSize);
+            proxyOps[dir].nbytes = std::min(partEnd-partBeg, chunkDataSize);
+          }
+          if (proxyOps[dir].protocol == NCCL_PROTO_LL) {
+            proxyOps[dir].nbytes *= 2;
+            proxyOps[dir].nbytes = roundUp(proxyOps[dir].nbytes, sizeof(union ncclLLFifoLine));
+          }
         } else {
-          proxyOps[dir].nsteps = divUp(partEnd-partBeg, chunkDataSize);
-          proxyOps[dir].nbytes = std::min(partEnd-partBeg, chunkDataSize);
+          // No data for this channel
+          proxyOps[dir].nsteps = 0;
+          proxyOps[dir].nbytes = 0;
         }
-        if (proxyOps[dir].protocol == NCCL_PROTO_LL) {
-          proxyOps[dir].nbytes *= 2;
-          proxyOps[dir].nbytes = roundUp(proxyOps[dir].nbytes, sizeof(union ncclLLFifoLine));
-        }
+        
+         // Only log detailed partition info when the channel count changes
+         // We reuse the static var declared above if possible, but scoping prevents it.
+         // Let's just remove the duplicate declaration and use a unique name or fix the scope.
+         // Actually, the user questioned why we need this. It's to implement "log only on change".
+         // But since we have a compilation error, let's fix it first.
+         
+         static int prevDetailNCh_detail = -1;
+         if (useTestChannels && dir == 0 && nChannels[0] != prevDetailNCh_detail) {
+            char hostname[1024];
+            gethostname(hostname, 1024);
+            char filename[1024];
+            sprintf(filename, "busid_%s_%s.log", currentBusId, hostname);
+            FILE *fp = fopen(filename, "a");
+            if (fp) {
+                int netDev = -1;
+                if (comm->topo) {
+                    int64_t netId;
+                    ncclTopoGetLocalNet(comm->topo, comm->rank, channelId, &netId, &netDev);
+                }
+                fprintf(fp, "DETAIL: Round %d Base %d Part %d -> Channel %d -> NIC %d\n", 
+                        p2pRound, base, part, channelId, netDev);
+                fclose(fp);
+            }
+            if (part == nChannelsMax - 1) prevDetailNCh_detail = nChannels[0];
+         }
       }
 
       if (proxyOps[dir].nsteps != 0) {
@@ -1139,6 +1691,7 @@ static ncclResult_t addP2pToPlan(
     }
   }
 
+  //if (testMode == 1) exit(0);
   return ncclSuccess;
 }
 
@@ -1390,6 +1943,7 @@ static ncclResult_t uploadProxyOps(struct ncclComm* comm, struct ncclKernelPlan*
   comm->sharedRes->collOpCount += plan->collOpCount;
 
   struct ncclProxyOp* op = ncclIntruQueueHead(&plan->proxyOpQueue);
+  INFO(NCCL_INIT, "uploadProxyOps: START collOpCount=%lu, plan=%p", collOpCount, plan);
   while (op != nullptr) {
     op->profilerContext = comm->profilerContext;
     op->eActivationMask = op->coll <= ncclFuncAllReduce ? op->task.coll->eActivationMask : op->task.p2p->eActivationMask;
@@ -1397,6 +1951,8 @@ static ncclResult_t uploadProxyOps(struct ncclComm* comm, struct ncclKernelPlan*
     ncclProfilerAddPidToProxyOp(op);
 
     uint64_t oldId = op->opCount;
+    INFO(NCCL_INIT, "uploadProxyOps: op=%p, channelId=%d, oldId=%lu, collOpCount=%lu", 
+         op, op->channelId, oldId, collOpCount);
     // Ignoring the bottom tag bit, opCount's are zero-based within plan so
     // translate them to the tip of the comm's history.
     if (oldId & 1) { // p2p
@@ -1409,6 +1965,8 @@ static ncclResult_t uploadProxyOps(struct ncclComm* comm, struct ncclKernelPlan*
     }
 
     NCCLCHECK(ncclProxySaveOp(comm, op, nullptr));
+    INFO(NCCL_INIT, "uploadProxyOps: RESTORE op=%p opCount from %lu to oldId=%lu", 
+         op, op->opCount, oldId);
     op->opCount = oldId; // Restore for next uploadProxyOps()
 
     struct ncclProxyOp* opNext = op->enqNext;
@@ -2319,6 +2877,13 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
   return ncclSuccess;
 }
 
+#include <thread>
+#include <chrono>
+
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+
 ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
   NCCLCHECK(ncclGroupStartInternal());
   ncclResult_t ret = ncclSuccess;
@@ -2339,6 +2904,7 @@ ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
         info->datatype, info->op, info->root, info->comm, info->comm->nRanks, info->stream);
   TRACE_CALL("nccl%s(%" PRIx64 ",%" PRIx64 ",%zu,%d,%d,%d,%p,%p)", info->opName, reinterpret_cast<int64_t>(info->sendbuff), reinterpret_cast<int64_t>(info->recvbuff), info->count, info->datatype, info->op, info->root, info->comm, info->stream);
 
+  //std::this_thread::sleep_for(std::chrono::milliseconds(2000));
   NCCLCHECKGOTO(taskAppend(info->comm, info), ret, fail);
 
 exit:

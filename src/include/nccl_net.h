@@ -92,6 +92,31 @@ typedef struct {
 
   // Notify the plugin that a recv has completed by the device
   ncclResult_t (*irecvConsumed)(void* recvComm, int n, void* request);
+
+  ncclResult_t (*setBackup)(void* sendComm);
+
+  ncclResult_t (*testBackup)(void* recvComm, int* done);
+
+  ncclResult_t (*setRequestChannel)(void** request, int channel);
+
+  int (*getRequestChannel)(void* request);
+
+  ncclResult_t (*setRequestId)(void** request, int id);
+
+  int (*getRequestId)(void* request);
+
+  ncclResult_t (*setRequestComm)(void** request, void* comm);
+
+  void* (*getRequestComm)(void* request);
+  ncclResult_t (*setRequestStep)(void** request, int step);  
+
+
+  ncclResult_t (*setRequestOperation)(void** request, int operation);
+
+  ncclResult_t (*checkSwitchToBackup)(void* sendComm, int* change);
+
+  ncclResult_t (*ncclIbTimeoutPost)(void* comm, void* request);
+
 } ncclNet_v8_t;
 
 typedef ncclNet_v8_t ncclNet_t;

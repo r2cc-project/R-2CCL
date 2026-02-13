@@ -1,76 +1,82 @@
-# NCCL
+# R<sup>2</sup>CCL: Reliable and Resilient Collective Communication
 
-Optimized primitives for inter-GPU communication.
+## Todo List
+1. Live Migration: Seamless failover via multi-NIC registration and DMA rollback. ✔️
+2. R<sup>2</sup>CCL-Balance: Load-balancing for remaining healthy interfaces. ✔️
+3. Simulated R<sup>2</sup>CCL-AllReduce: Performance-equivalent implementation via AllReduce + Broadcast ✔️
+4. Clean up legacy code and add examples / test scripts for common platforms.
+5. Native implementation of R<sup>2</sup>CCL-AllReduce with customized kernel.
+6. Optimization: Further performance tuning.
 
-## Introduction
+## Overview
+R<sup>2</sup>CCL is a fault tolerant communication library that provides lossless, low overhead failover by exploiting multi-NIC hardware. It is designed as a drop in replacement for NCCL to minimize full job terminations from network failures.
 
-NCCL (pronounced "Nickel") is a stand-alone library of standard communication routines for GPUs, implementing all-reduce, all-gather, reduce, broadcast, reduce-scatter, as well as any send/receive based communication pattern. It has been optimized to achieve high bandwidth on platforms using PCIe, NVLink, NVswitch, as well as networking using InfiniBand Verbs or TCP/IP sockets. NCCL supports an arbitrary number of GPUs installed in a single node or across multiple nodes, and can be used in either single- or multi-process (e.g., MPI) applications.
+It employs three key strategies to maintain performance under network failure: **Live Migration** for seamless failover, **R<sup>2</sup>CCL-Balance** for redistributing traffic across healthy links, and **R<sup>2</sup>CCL-AllReduce** for maximizing allreduce throughput under bandwidth heterogeneity.
 
-For more information on NCCL usage, please refer to the [NCCL documentation](https://docs.nvidia.com/deeplearning/sdk/nccl-developer-guide/index.html).
+<p align="center"><img width="100%" src="./fig/overview.png"></p><br/>
 
-## Build
+## Demo
+https://github.com/user-attachments/assets/08ce28d3-672f-4be2-a01c-100d6fb5909b
 
-Note: the official and tested builds of NCCL can be downloaded from: https://developer.nvidia.com/nccl. You can skip the following build steps if you choose to use the official builds.
 
-To build the library :
 
+
+
+## How to use R<sup>2</sup>CCL
+### Build
 ```shell
-$ cd nccl
-$ make -j src.build
+git clone https://github.com/WWeiOne/R-2CCL.git
+cd R-2CCL
+make -j
 ```
 
-If CUDA is not installed in the default /usr/local/cuda path, you can define the CUDA path with :
+### Test
+Similar to NCCL, R<sup>2</sup>CCL can be benchmarked using nccl-tests. Below we provide compilation commands for nccl-tests and an example of performance testing using allreduce.
 
+### Build nccl-tests
 ```shell
-$ make src.build CUDA_HOME=<path to cuda install>
+git clone https://github.com/NVIDIA/nccl-tests.git
+cd nccl-tests
+make
+mpirun -np 4 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1 
 ```
 
-NCCL will be compiled and installed in `build/` unless `BUILDDIR` is set.
+### Testing with Environment Variables
+To simplify testing the performance and reduce the complexity of triggering failures (e.g., using SmartNICs to disable specific routing at runtime), we provide environment variables to directly simulate specific scenarios and measure performance.
 
-By default, NCCL is compiled for all supported architectures. To accelerate the compilation and reduce the binary size, consider redefining `NVCC_GENCODE` (defined in `makefiles/common.mk`) to only include the architecture of the target platform :
+**R2CC_MODE**:
+- `0`: NCCL baseline
+- `1`: Live Migration
+- `2`: R<sup>2</sup>CCL-Balance
+- `3`: R<sup>2</sup>CCL-AllReduce
+
+### Example1: Live Migration
+Test Migration Performance.
+Requirements: 2 nodes, >=2 NICs per node.
 ```shell
-$ make -j src.build NVCC_GENCODE="-gencode=arch=compute_70,code=sm_70"
+# no failure
+mpirun -x -np 4 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1
+
+# 1 failure
+mpirun -x R2CC_MODE=1  -np 4 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1
+
+# or run the first command and disable the routing
 ```
 
-## Install
-
-To install NCCL on the system, create a package then install it as root.
-
-Debian/Ubuntu :
+### Example2: Failure Aware Scheduling Performance
+When only one NIC remains on each node, the performance of different strategies is identical. Therefore, we recommend using machines with 8 NICs and 8 GPUs for testing. Below are the performance tests for R<sup>2</sup>CCL-Balance and R<sup>2</sup>CCL-AllReduce, respectively.
 ```shell
-$ # Install tools to create debian packages
-$ sudo apt install build-essential devscripts debhelper fakeroot
-$ # Build NCCL deb package
-$ make pkg.debian.build
-$ ls build/pkg/deb/
+mpirun -x R2CC_MODE=2  -np 16 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1 
+
+mpirun -x R2CC_MODE=3  -np 16 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1 
 ```
 
-RedHat/CentOS :
-```shell
-$ # Install tools to create rpm packages
-$ sudo yum install rpm-build rpmdevtools
-$ # Build NCCL rpm package
-$ make pkg.redhat.build
-$ ls build/pkg/rpm/
+## Citation
 ```
-
-OS-agnostic tarball :
-```shell
-$ make pkg.txz.build
-$ ls build/pkg/txz/
+@article{wang2025reliable,
+  title={Reliable and Resilient Collective Communication Library for LLM Training and Serving},
+  author={Wang, Wei and Yu, Nengneng and Xiong, Sixian and Liu, Zaoxing},
+  journal={arXiv preprint arXiv:2512.25059},
+  year={2025}
+}
 ```
-
-## Tests
-
-Tests for NCCL are maintained separately at https://github.com/nvidia/nccl-tests.
-
-```shell
-$ git clone https://github.com/NVIDIA/nccl-tests.git
-$ cd nccl-tests
-$ make
-$ ./build/all_reduce_perf -b 8 -e 256M -f 2 -g <ngpus>
-```
-
-## Copyright
-
-All source code and accompanying documentation is copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.
