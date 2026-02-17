@@ -1,5 +1,20 @@
 # R<sup>2</sup>CCL: Reliable and Resilient Collective Communication
 
+## Overview
+R<sup>2</sup>CCL is a fault tolerant communication library that provides lossless, low overhead failover by exploiting multi-NIC hardware. It is designed as a drop in replacement for NCCL to minimize full job terminations from network failures.
+
+## Features
+🔥 **Zero-Downtime Hot Repair**: Automatically detects and mitigates network failures mid-collective. By utilizing multi-NIC GPU buffer registration and DMA-buffer rollback, R2CC live-migrates failed connections to backup links without losing in-flight data.
+
+⚖️ **Topology-Aware Load Balancing (R2CC-Balance)**: After a failure, R2CC dynamically redistributes traffic across the remaining healthy NICs. It is fully aware of PCIe, NUMA, and NVLink (PXN) topology to maximize remaining bandwidth.
+
+🚀 **Failure-Optimized AllReduce (R2CC-AllReduce)**: Introduces a novel schedule that prevents degraded servers from bottlenecking the cluster by intelligently combining global and partial AllReduce operations.
+
+<p align="center"><img width="100%" src="./fig/overview.png"></p><br/>
+
+## Demo
+https://github.com/user-attachments/assets/08ce28d3-672f-4be2-a01c-100d6fb5909b
+
 ## Todo List
 1. Live Migration: Seamless failover via multi-NIC registration and DMA rollback. ✔️
 2. R<sup>2</sup>CCL-Balance: Load-balancing for remaining healthy interfaces. ✔️
@@ -7,20 +22,6 @@
 4. Clean up legacy code and add examples / test scripts for common platforms.
 5. Native implementation of R<sup>2</sup>CCL-AllReduce with customized kernel.
 6. Optimization: Further performance tuning.
-
-## Overview
-R<sup>2</sup>CCL is a fault tolerant communication library that provides lossless, low overhead failover by exploiting multi-NIC hardware. It is designed as a drop in replacement for NCCL to minimize full job terminations from network failures.
-
-It employs three key strategies to maintain performance under network failure: **Live Migration** for seamless failover, **R<sup>2</sup>CCL-Balance** for redistributing traffic across healthy links, and **R<sup>2</sup>CCL-AllReduce** for maximizing allreduce throughput under bandwidth heterogeneity.
-
-<p align="center"><img width="100%" src="./fig/overview.png"></p><br/>
-
-## Demo
-https://github.com/user-attachments/assets/08ce28d3-672f-4be2-a01c-100d6fb5909b
-
-
-
-
 
 ## How to use R<sup>2</sup>CCL
 ### Build
