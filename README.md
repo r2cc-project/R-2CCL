@@ -13,7 +13,7 @@ R<sup>2</sup>CCL is a fault tolerant communication library that provides lossles
 <p align="center"><img width="100%" src="./fig/overview.png"></p><br/>
 
 ## Demo
-https://github.com/user-attachments/assets/08ce28d3-672f-4be2-a01c-100d6fb5909b
+https://github.com/user-attachments/assets/47696857-ba9d-4f0a-8c83-5316baa45703
 
 ## Todo List
 1. Live Migration: Seamless failover via multi-NIC registration and DMA rollback. ✔️
