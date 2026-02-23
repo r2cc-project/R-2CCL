@@ -35,7 +35,7 @@ We provide a pre-built CloudLab image and a public profile to quickly reproduce 
 ## How to use R<sup>2</sup>CCL
 ### Build
 ```shell
-git clone https://github.com/WWeiOne/R-2CCL.git
+git clone https://github.com/r2cc-project/R-2CCL.git
 cd R-2CCL
 make -j
 ```
