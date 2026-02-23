@@ -42,6 +42,15 @@ public:
   bool ConsumeStepSyncRequest(int channelId, int* peerRank);
   bool ConsumeStepSync(int channelId, uint64_t* absStep);
 
+  // Context-scoped failover sync (sender authoritative).
+  // dir: 0 means sender->receiver data path failover.
+  ncclResult_t SendFailoverHint(int peerRank, int channelId, int connIndex, int dir, uint64_t epochHint, uint64_t receiverObservedAbsStep);
+  ncclResult_t SendFailoverReq(int peerRank, int channelId, int connIndex, int dir, uint64_t epoch, uint64_t senderDoneAbs);
+  ncclResult_t SendFailoverAck(int peerRank, int channelId, int connIndex, int dir, uint64_t epoch, uint64_t appliedDoneAbs);
+  bool ConsumeFailoverHint(int channelId, int connIndex, int dir, uint64_t* epochHint, uint64_t* receiverObservedAbsStep, int* peerRank);
+  bool ConsumeFailoverReq(int channelId, int connIndex, int dir, uint64_t* epoch, uint64_t* senderDoneAbs, int* peerRank);
+  bool ConsumeFailoverAck(int channelId, int connIndex, int dir, uint64_t* epoch, uint64_t* appliedDoneAbs, int* peerRank);
+
   // Record and query failed channels observed locally and globally.
   void ReportFailedChannel(int channelId);
   uint64_t LocalFailedChannelMask() const { return localFailedChannelMask_.load(std::memory_order_relaxed); }
@@ -80,6 +89,18 @@ private:
   std::atomic<uint64_t> pendingSyncStep_[kMaxChannels];
   std::atomic<uint64_t> pendingSyncMask_{0};
   std::atomic<int> pendingSyncReq_[kMaxChannels];
+  static constexpr int kMaxConnIndex = 32;
+  static constexpr int kMaxFailoverDirs = 2;
+  static constexpr int kMaxFailoverContexts = kMaxChannels * kMaxConnIndex * kMaxFailoverDirs;
+  struct PendingFailoverMsg {
+    bool valid;
+    uint64_t epoch;
+    uint64_t absStep;
+    int peerRank;
+  };
+  PendingFailoverMsg pendingFailHint_[kMaxFailoverContexts];
+  PendingFailoverMsg pendingFailReq_[kMaxFailoverContexts];
+  PendingFailoverMsg pendingFailAck_[kMaxFailoverContexts];
   std::mutex recvMutex_;
 
   // Failed channel state (bitset of channelIds).
@@ -87,6 +108,9 @@ private:
   std::atomic<uint64_t> globalFailedChannelMask_{0};
 
   void UpdatePendingSyncStep(int channelId, uint64_t absStep);
+  int FailoverContextIndex(int channelId, int connIndex, int dir) const;
+  void UpdatePendingFailover(PendingFailoverMsg* table, int idx, uint64_t epoch, uint64_t absStep, int peerRank);
+  bool ConsumePendingFailover(PendingFailoverMsg* table, int idx, uint64_t* epoch, uint64_t* absStep, int* peerRank);
   
   // Verification state for unit tests
   std::string verificationState = "UNINITIALIZED";

@@ -1038,22 +1038,6 @@ static ncclResult_t proxyFree(struct ncclProxyConnection* connection, struct ncc
   return ncclSuccess;
 }
 
-// R2CC: Function to free peer connections before stopping proxy
-static ncclResult_t ncclProxyFreePeerConnections(struct ncclProxyConnectionPool* pool, struct ncclProxyState* proxyState) {
-  INFO(NCCL_R2CC, "R2CC: Freeing peer connections before proxy stop");
-  for (int b=0; b<pool->banks; b++) {
-    int max = b == pool->banks-1 ? pool->offset : NCCL_PROXY_CONN_POOL_SIZE;
-    for (int i=0; i<max; i++) {
-      ncclProxyConnection *connection = pool->pools[b]+i;
-      if (connection->state != connUninitialized) {
-        INFO(NCCL_R2CC, "R2CC: Freeing connection[%d][%d] state=%d", b, i, connection->state);
-        NCCLCHECK(proxyFree(connection, proxyState));
-      }
-    }
-  }
-  return ncclSuccess;
-}
-
 static ncclResult_t ncclProxyFreeConnections(struct ncclProxyConnectionPool* pool, struct ncclProxyState* proxyState) {
   for (int b=0; b<pool->banks; b++) {
     int max = b == pool->banks-1 ? pool->offset : NCCL_PROXY_CONN_POOL_SIZE;
@@ -1683,9 +1667,17 @@ void* ncclProxyService(void* _args) {
             stop = PROXY_STOP;
             closeConn = 1;
           } else if (type == ncclProxyMsgClose) {
-            // R2CC: Clean up peer connections before closing
+            // Initiate graceful progress shutdown; resources are freed later after progress join.
             INFO(NCCL_R2CC, "R2CC: Received ncclProxyMsgClose from localRank %d", peer->tpLocalRank);
-            ncclProxyFreePeerConnections(&connectionPool, proxyState);
+            struct ncclProxyProgressState* pstate = &proxyState->progressState;
+            if (pstate->opsPool) {
+              pthread_mutex_lock(&pstate->opsPool->mutex);
+              pstate->stop = 1;
+              pthread_cond_signal(&pstate->opsPool->cond);
+              pthread_mutex_unlock(&pstate->opsPool->mutex);
+            } else {
+              pstate->stop = 1;
+            }
             closeConn = 1;
           } else if (type == ncclProxyMsgBarrier) {
             // R2CC: Handle barrier message - wait for all operations to complete

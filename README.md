@@ -3,6 +3,8 @@
 ## Overview
 R<sup>2</sup>CCL is a fault tolerant communication library that provides lossless, low overhead failover by exploiting multi-NIC hardware. It is designed as a drop in replacement for NCCL to minimize full job terminations from network failures.
 
+📢 **Update 02/23/2025:** Added a CloudLab image and public profile for quick reproduction — see [Demo](#demo).
+
 <p align="center">
   <img width="80%" src="./fig/R2CC-Megatron.png"><br/>
   <b>Megatron Training Performance Evaluation</b>
@@ -19,6 +21,8 @@ R<sup>2</sup>CCL is a fault tolerant communication library that provides lossles
 
 ## Demo
 https://github.com/user-attachments/assets/8511cbf4-843a-4399-a742-d986eac55eb9
+
+We provide a pre-built CloudLab image and a public profile to quickly reproduce the demo experiment. See the [CloudLab setup guide](./examples/cloudlab_r7525/README.md) for details.
 
 ## Todo List
 1. Live Migration: Seamless failover via multi-NIC registration and DMA rollback. ✔️

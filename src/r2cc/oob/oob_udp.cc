@@ -23,6 +23,9 @@ OobNet& OobNet::Get() {
 static constexpr const char* kHotRepairMsgPrefix = "R2CC_HR";
 static constexpr const char* kHotRepairStepPrefix = "R2CC_HR_STEP";
 static constexpr const char* kHotRepairStepReqPrefix = "R2CC_HR_STEP_REQ";
+static constexpr const char* kHotRepairFailHintPrefix = "R2CC_HR_FO_HINT";
+static constexpr const char* kHotRepairFailReqPrefix = "R2CC_HR_FO_REQ";
+static constexpr const char* kHotRepairFailAckPrefix = "R2CC_HR_FO_ACK";
 
 // 1.1 Function: GetLocalIP
 static ncclResult_t GetLocalIP(char* ipStr, size_t maxLen) {
@@ -221,6 +224,65 @@ ncclResult_t OobNet::SendStepSyncRequest(int peerRank, int channelId) {
   return ncclSuccess;
 }
 
+ncclResult_t OobNet::SendFailoverHint(int peerRank, int channelId, int connIndex, int dir,
+                                      uint64_t epochHint, uint64_t receiverObservedAbsStep) {
+  if (peerRank < 0 || peerRank >= nRanks_) return ncclInvalidArgument;
+  if (channelId < 0 || channelId >= kMaxChannels) return ncclInvalidArgument;
+  if (connIndex < 0 || connIndex >= kMaxConnIndex) return ncclInvalidArgument;
+  if (dir < 0 || dir >= kMaxFailoverDirs) return ncclInvalidArgument;
+  if (sockfd_ < 0 || rank_ < 0 || nRanks_ <= 0) return ncclInvalidUsage;
+
+  char msg[160];
+  int n = snprintf(msg, sizeof(msg), "%s %d %d %d %d %" PRIu64 " %" PRIu64,
+                   kHotRepairFailHintPrefix, rank_, channelId, connIndex, dir, epochHint, receiverObservedAbsStep);
+  if (n <= 0) return ncclSystemError;
+
+  (void)sendto(sockfd_, msg, (size_t)n + 1, 0,
+               (struct sockaddr*)&peerStates_[peerRank].addr, sizeof(peerStates_[peerRank].addr));
+  INFO(NCCL_R2CC,
+       "OOB: Sent FAILOVER_HINT ch=%d conn=%d dir=%d epochHint=%" PRIu64 " recvAbs=%" PRIu64 " to rank %d",
+       channelId, connIndex, dir, epochHint, receiverObservedAbsStep, peerRank);
+  return ncclSuccess;
+}
+
+ncclResult_t OobNet::SendFailoverReq(int peerRank, int channelId, int connIndex, int dir, uint64_t epoch, uint64_t senderDoneAbs) {
+  if (peerRank < 0 || peerRank >= nRanks_) return ncclInvalidArgument;
+  if (channelId < 0 || channelId >= kMaxChannels) return ncclInvalidArgument;
+  if (connIndex < 0 || connIndex >= kMaxConnIndex) return ncclInvalidArgument;
+  if (dir < 0 || dir >= kMaxFailoverDirs) return ncclInvalidArgument;
+  if (sockfd_ < 0 || rank_ < 0 || nRanks_ <= 0) return ncclInvalidUsage;
+
+  char msg[160];
+  int n = snprintf(msg, sizeof(msg), "%s %d %d %d %d %" PRIu64 " %" PRIu64,
+                   kHotRepairFailReqPrefix, rank_, channelId, connIndex, dir, epoch, senderDoneAbs);
+  if (n <= 0) return ncclSystemError;
+
+  (void)sendto(sockfd_, msg, (size_t)n + 1, 0,
+               (struct sockaddr*)&peerStates_[peerRank].addr, sizeof(peerStates_[peerRank].addr));
+  INFO(NCCL_R2CC, "OOB: Sent FAILOVER_REQ ch=%d conn=%d dir=%d epoch=%" PRIu64 " done=%" PRIu64 " to rank %d",
+       channelId, connIndex, dir, epoch, senderDoneAbs, peerRank);
+  return ncclSuccess;
+}
+
+ncclResult_t OobNet::SendFailoverAck(int peerRank, int channelId, int connIndex, int dir, uint64_t epoch, uint64_t appliedDoneAbs) {
+  if (peerRank < 0 || peerRank >= nRanks_) return ncclInvalidArgument;
+  if (channelId < 0 || channelId >= kMaxChannels) return ncclInvalidArgument;
+  if (connIndex < 0 || connIndex >= kMaxConnIndex) return ncclInvalidArgument;
+  if (dir < 0 || dir >= kMaxFailoverDirs) return ncclInvalidArgument;
+  if (sockfd_ < 0 || rank_ < 0 || nRanks_ <= 0) return ncclInvalidUsage;
+
+  char msg[160];
+  int n = snprintf(msg, sizeof(msg), "%s %d %d %d %d %" PRIu64 " %" PRIu64,
+                   kHotRepairFailAckPrefix, rank_, channelId, connIndex, dir, epoch, appliedDoneAbs);
+  if (n <= 0) return ncclSystemError;
+
+  (void)sendto(sockfd_, msg, (size_t)n + 1, 0,
+               (struct sockaddr*)&peerStates_[peerRank].addr, sizeof(peerStates_[peerRank].addr));
+  INFO(NCCL_R2CC, "OOB: Sent FAILOVER_ACK ch=%d conn=%d dir=%d epoch=%" PRIu64 " done=%" PRIu64 " to rank %d",
+       channelId, connIndex, dir, epoch, appliedDoneAbs, peerRank);
+  return ncclSuccess;
+}
+
 void OobNet::UpdatePendingSyncStep(int channelId, uint64_t absStep) {
   if (channelId < 0 || channelId >= kMaxChannels) return;
   uint64_t encoded = absStep + 1; // allow absStep==0
@@ -232,6 +294,36 @@ void OobNet::UpdatePendingSyncStep(int channelId, uint64_t absStep) {
   if (encoded > cur) {
     pendingSyncMask_.fetch_or(1ull << channelId, std::memory_order_relaxed);
   }
+}
+
+int OobNet::FailoverContextIndex(int channelId, int connIndex, int dir) const {
+  if (channelId < 0 || channelId >= kMaxChannels) return -1;
+  if (connIndex < 0 || connIndex >= kMaxConnIndex) return -1;
+  if (dir < 0 || dir >= kMaxFailoverDirs) return -1;
+  return (channelId * kMaxConnIndex + connIndex) * kMaxFailoverDirs + dir;
+}
+
+void OobNet::UpdatePendingFailover(PendingFailoverMsg* table, int idx, uint64_t epoch, uint64_t absStep, int peerRank) {
+  if (idx < 0 || idx >= kMaxFailoverContexts) return;
+  PendingFailoverMsg& slot = table[idx];
+  if (!slot.valid || epoch > slot.epoch) {
+    slot.valid = true;
+    slot.epoch = epoch;
+    slot.absStep = absStep;
+    slot.peerRank = peerRank;
+  }
+}
+
+bool OobNet::ConsumePendingFailover(PendingFailoverMsg* table, int idx, uint64_t* epoch, uint64_t* absStep, int* peerRank) {
+  if (idx < 0 || idx >= kMaxFailoverContexts) return false;
+  std::lock_guard<std::mutex> lock(recvMutex_);
+  PendingFailoverMsg& slot = table[idx];
+  if (!slot.valid) return false;
+  if (epoch) *epoch = slot.epoch;
+  if (absStep) *absStep = slot.absStep;
+  if (peerRank) *peerRank = slot.peerRank;
+  slot.valid = false;
+  return true;
 }
 
 bool OobNet::ConsumeStepSync(int channelId, uint64_t* absStep) {
@@ -269,6 +361,21 @@ bool OobNet::ConsumeStepSyncRequest(int channelId, int* peerRank) {
   return false;
 }
 
+bool OobNet::ConsumeFailoverReq(int channelId, int connIndex, int dir, uint64_t* epoch, uint64_t* senderDoneAbs, int* peerRank) {
+  int idx = FailoverContextIndex(channelId, connIndex, dir);
+  return ConsumePendingFailover(pendingFailReq_, idx, epoch, senderDoneAbs, peerRank);
+}
+
+bool OobNet::ConsumeFailoverHint(int channelId, int connIndex, int dir, uint64_t* epochHint, uint64_t* receiverObservedAbsStep, int* peerRank) {
+  int idx = FailoverContextIndex(channelId, connIndex, dir);
+  return ConsumePendingFailover(pendingFailHint_, idx, epochHint, receiverObservedAbsStep, peerRank);
+}
+
+bool OobNet::ConsumeFailoverAck(int channelId, int connIndex, int dir, uint64_t* epoch, uint64_t* appliedDoneAbs, int* peerRank) {
+  int idx = FailoverContextIndex(channelId, connIndex, dir);
+  return ConsumePendingFailover(pendingFailAck_, idx, epoch, appliedDoneAbs, peerRank);
+}
+
 void OobNet::ReportFailedChannel(int channelId) {
   if (channelId < 0 || channelId >= 64) return;
   uint64_t bit = 1ull << channelId;
@@ -276,18 +383,68 @@ void OobNet::ReportFailedChannel(int channelId) {
 }
 
 bool OobNet::PollHotRepair() {
-  if (hotRepairSeen_.load(std::memory_order_relaxed)) return true;
-  if (sockfd_ < 0) return false;
+  // Keep polling even after HOT_REPAIR is latched so later STEP_SYNC messages
+  // are still drained and delivered.
+  if (sockfd_ < 0) return hotRepairSeen_.load(std::memory_order_relaxed);
 
   bool got = false;
   std::lock_guard<std::mutex> lock(recvMutex_);
   while (true) {
-    char buf[64];
+    char buf[192];
     struct sockaddr_in srcAddr;
     socklen_t addrLen = sizeof(srcAddr);
     ssize_t n = recvfrom(sockfd_, buf, sizeof(buf) - 1, 0, (struct sockaddr*)&srcAddr, &addrLen);
     if (n > 0) {
       buf[n] = '\0';
+      if (strncmp(buf, kHotRepairFailHintPrefix, strlen(kHotRepairFailHintPrefix)) == 0) {
+        int srcRank = -1;
+        int channelId = -1;
+        int connIndex = -1;
+        int dir = -1;
+        unsigned long long epochHint = 0;
+        unsigned long long recvAbs = 0;
+        if (sscanf(buf + strlen(kHotRepairFailHintPrefix), "%d %d %d %d %llu %llu",
+                   &srcRank, &channelId, &connIndex, &dir, &epochHint, &recvAbs) == 6) {
+          int idx = FailoverContextIndex(channelId, connIndex, dir);
+          UpdatePendingFailover(pendingFailHint_, idx, (uint64_t)epochHint, (uint64_t)recvAbs, srcRank);
+          INFO(NCCL_R2CC,
+               "OOB: Received FAILOVER_HINT ch=%d conn=%d dir=%d epochHint=%llu recvAbs=%llu from rank %d",
+               channelId, connIndex, dir, epochHint, recvAbs, srcRank);
+        }
+        continue;
+      }
+      if (strncmp(buf, kHotRepairFailReqPrefix, strlen(kHotRepairFailReqPrefix)) == 0) {
+        int srcRank = -1;
+        int channelId = -1;
+        int connIndex = -1;
+        int dir = -1;
+        unsigned long long epoch = 0;
+        unsigned long long absStep = 0;
+        if (sscanf(buf + strlen(kHotRepairFailReqPrefix), "%d %d %d %d %llu %llu",
+                   &srcRank, &channelId, &connIndex, &dir, &epoch, &absStep) == 6) {
+          int idx = FailoverContextIndex(channelId, connIndex, dir);
+          UpdatePendingFailover(pendingFailReq_, idx, (uint64_t)epoch, (uint64_t)absStep, srcRank);
+          INFO(NCCL_R2CC, "OOB: Received FAILOVER_REQ ch=%d conn=%d dir=%d epoch=%llu done=%llu from rank %d",
+               channelId, connIndex, dir, epoch, absStep, srcRank);
+        }
+        continue;
+      }
+      if (strncmp(buf, kHotRepairFailAckPrefix, strlen(kHotRepairFailAckPrefix)) == 0) {
+        int srcRank = -1;
+        int channelId = -1;
+        int connIndex = -1;
+        int dir = -1;
+        unsigned long long epoch = 0;
+        unsigned long long absStep = 0;
+        if (sscanf(buf + strlen(kHotRepairFailAckPrefix), "%d %d %d %d %llu %llu",
+                   &srcRank, &channelId, &connIndex, &dir, &epoch, &absStep) == 6) {
+          int idx = FailoverContextIndex(channelId, connIndex, dir);
+          UpdatePendingFailover(pendingFailAck_, idx, (uint64_t)epoch, (uint64_t)absStep, srcRank);
+          INFO(NCCL_R2CC, "OOB: Received FAILOVER_ACK ch=%d conn=%d dir=%d epoch=%llu done=%llu from rank %d",
+               channelId, connIndex, dir, epoch, absStep, srcRank);
+        }
+        continue;
+      }
       if (strncmp(buf, kHotRepairStepReqPrefix, strlen(kHotRepairStepReqPrefix)) == 0) {
         int channelId = -1;
         int peerRank = -1;
@@ -344,6 +501,20 @@ ncclResult_t OobNet::Init(int rank, int nRanks, void* bootstrapHandle) {
   lastHotRepairPeer_.store(-1, std::memory_order_relaxed);
   for (int i = 0; i < kMaxChannels; ++i) {
     pendingSyncReq_[i].store(0, std::memory_order_relaxed);
+  }
+  for (int i = 0; i < kMaxFailoverContexts; ++i) {
+    pendingFailHint_[i].valid = false;
+    pendingFailHint_[i].epoch = 0;
+    pendingFailHint_[i].absStep = 0;
+    pendingFailHint_[i].peerRank = -1;
+    pendingFailReq_[i].valid = false;
+    pendingFailReq_[i].epoch = 0;
+    pendingFailReq_[i].absStep = 0;
+    pendingFailReq_[i].peerRank = -1;
+    pendingFailAck_[i].valid = false;
+    pendingFailAck_[i].epoch = 0;
+    pendingFailAck_[i].absStep = 0;
+    pendingFailAck_[i].peerRank = -1;
   }
   localFailedChannelMask_.store(0, std::memory_order_relaxed);
   globalFailedChannelMask_.store(0, std::memory_order_relaxed);

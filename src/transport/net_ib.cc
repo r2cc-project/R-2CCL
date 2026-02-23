@@ -2592,6 +2592,11 @@ static std::atomic<uint64_t> r2ccInjectedMask{0};
 static bool r2ccShouldInjectFailure(struct ncclIbRequest* r) {
   const char* env = r2ccGetDisconnectedEnv();
   if (!env || env[0] == '\0') return false;
+  // P0 fix: injection must be sender-owned (send proxy thread) to match
+  // sender-authoritative failover.
+  // operation: 1=recvProxyProgress, 2=sendProxyProgress
+  if (r->operation != 2) return false;
+  if (r->type != NCCL_NET_IB_REQ_SEND) return false;
   int stepToFail = r2ccGetDisconnectedStep();
   if (stepToFail < 0) return false;
   if (r->step != stepToFail) return false;
@@ -2624,23 +2629,24 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
     int childDone = 0;
     ncclIbTest(r->timeoutRequest, &childDone, NULL);
     if(childDone == -1){
+      WARN("R2CC_TEST_FAIL role=%s reason=timeout_child req=%p type=%d channel=%d step=%d comm=%p",
+           operations[r->operation], r, r->type, r->channel, r->step, r->comm);
       NCCLCHECK(ncclIbFreeRequest(r));
       *done = -1;  // net disconnection.
       return ncclSuccess;
     }
     if(childDone == 0){
-      *done = 2; //child request in progress, update timer.
+      *done = 0;
       return ncclSuccess;
     }
     if(childDone == 1){
       r->timeoutRequest = NULL; 
-      *done = 2; // net has no issue, update timer
-      return ncclSuccess;
     }
   }
 
   if (r2ccShouldInjectFailure(r)) {
-    INFO(NCCL_R2CC, "R2CC inject failure: channel=%d step=%d env=%s", r->channel, r->step, r2ccGetDisconnectedEnv());
+    WARN("R2CC_TEST_FAIL role=%s reason=injected req=%p type=%d channel=%d step=%d comm=%p env=%s",
+         operations[r->operation], r, r->type, r->channel, r->step, r->comm, r2ccGetDisconnectedEnv());
     r->failed = 1;
     NCCLCHECK(ncclIbFreeRequest(r));
     *done = -1;
@@ -2649,6 +2655,8 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
 
 
   if(r->failed ==1){
+    WARN("R2CC_TEST_FAIL role=%s reason=request_marked_failed req=%p type=%d channel=%d step=%d comm=%p",
+         operations[r->operation], r, r->type, r->channel, r->step, r->comm);
     TRACE(NCCL_INIT, "%s request args_id=%d, channel=%d, step=%d, comm=%p failed", operations[r->operation], r->id, r->channel, r->step, r->comm);
     
     NCCLCHECK(ncclIbFreeRequest(r));
@@ -2660,6 +2668,8 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
     NCCLCHECK(ncclIbStatsCheckFatalCount(&r->base->stats,__func__));
     if (r->events[0] == 0 && r->events[1] == 0) {
       if(r->failed ==1){
+        WARN("R2CC_TEST_FAIL role=%s reason=request_marked_failed_post_poll req=%p type=%d channel=%d step=%d comm=%p",
+             operations[r->operation], r, r->type, r->channel, r->step, r->comm);
         TRACE(NCCL_INIT, "%s request args_id=%d, channel=%d, step=%d, comm=%p failed", operations[r->operation], r->id, r->channel, r->step, r->comm);
         NCCLCHECK(ncclIbFreeRequest(r));
         *done = -1;

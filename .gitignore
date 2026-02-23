@@ -6,4 +6,6 @@
 .vscode
 *.log
 .DS_Store
-docs/
+docs/*
+!docs/HOT_REPAIR_FAILOVER_REFACTOR_PLAN.md
+examples/cloudlab_r7525/xml/topo.xml
