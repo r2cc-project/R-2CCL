@@ -15,6 +15,12 @@
 #include <chrono>
 #include <cstdlib>
 
+// R-2CCL: when set to 1, the NCCL tuner in enqueue.cc hides Simple from
+// Broadcast's protocol choices, so it picks LL or LL128 instead. Used to
+// avoid NCCL's premature Simple pick for broadcast at ~32 MiB - 1 GiB,
+// which costs ~2x bandwidth in the MODE=3/5 split-collective path.
+int r2ccBcastNoSimple = 0;
+
 const char* ncclFuncToString(ncclFunc_t fn) {
   switch (fn) {
   case ncclFuncAllGather: return "AllGather";
@@ -221,8 +227,10 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
         struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
           bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
           BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
+        r2ccBcastNoSimple = 1;
         NCCLCHECK(ncclEnqueueCheck(&info2));
-        NCCLCHECK(ncclGroupEnd());
+        NCCLCHECK(ncclGroupEnd());    // tuner fires here; flag must still be set
+        r2ccBcastNoSimple = 0;
       }
       else if(mode == 3 and !parallel){
 	      NCCLCHECK(ncclGroupStart());
@@ -242,8 +250,10 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
         struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
           bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
           BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
+        r2ccBcastNoSimple = 1;
         NCCLCHECK(ncclEnqueueCheck(&info2));
-        NCCLCHECK(ncclGroupEnd());
+        NCCLCHECK(ncclGroupEnd());    // tuner fires here; flag must still be set
+        r2ccBcastNoSimple = 0;
 
       }
       else if(mode == 4){
@@ -265,8 +275,10 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
         struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
           bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
           BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
+        r2ccBcastNoSimple = 1;
         NCCLCHECK(ncclEnqueueCheck(&info2));
-        NCCLCHECK(ncclGroupEnd());
+        NCCLCHECK(ncclGroupEnd());    // tuner fires here; flag must still be set
+        r2ccBcastNoSimple = 0;
       }
     }
   }else{

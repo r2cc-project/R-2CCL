@@ -22,6 +22,10 @@
 
 NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
 
+// R-2CCL flag set by collectives.cc around split-collective Broadcast calls
+// to hide Simple from the broadcast tuner.
+extern int r2ccBcastNoSimple;
+
 // Returns maximum kernel stack size of all CUDA kernels
 ncclResult_t ncclInitKernelsForDevice(int cudaArch, size_t* maxStackSize) {
   ncclResult_t result = ncclSuccess;
@@ -2357,6 +2361,11 @@ static ncclResult_t updateCollCostTable(
     if (a == NCCL_ALGO_PAT && info->func == ncclFuncReduceScatter
         && (info->opDev.op == ncclDevPreMulSum || info->opDev.op == ncclDevSumPostDiv)) continue;
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
+      // R-2CCL: hide Simple from broadcast tuner inside split-collective path.
+      if (r2ccBcastNoSimple && info->func == ncclFuncBroadcast
+          && p == NCCL_PROTO_SIMPLE) {
+        continue;
+      }
       bool backup;
       float time;
       NCCLCHECK(ncclTopoGetAlgoTime(comm, info->func, a, p, nBytes, numPipeOps, &time, &backup));
