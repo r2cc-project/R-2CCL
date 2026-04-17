@@ -503,7 +503,7 @@ void OobNet::ReceiverLoop() {
   pfd.events = POLLIN;
 
   while (running_.load(std::memory_order_acquire)) {
-    int ret = poll(&pfd, 1, /*timeout_ms=*/1);
+    int ret = poll(&pfd, 1, /*timeout_ms=*/0);
     if (ret < 0) {
       if (errno == EINTR) continue; // interrupted by signal, recheck running_
       WARN("OOB: ReceiverLoop poll error: %s", strerror(errno));
