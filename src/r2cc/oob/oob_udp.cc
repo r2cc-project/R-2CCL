@@ -521,10 +521,17 @@ ncclResult_t OobNet::Init(int rank, int nRanks, void* bootstrapHandle) {
   pendingSyncMask_.store(0, std::memory_order_relaxed);
   for (int i = 0; i < kMaxChannels; i++) pendingSyncStep_[i].store(0, std::memory_order_relaxed);
   verificationState = "INIT_START";
-  
+
+  const char* disable = getenv("R2CC_OOB_DISABLE");
+  if (disable && atoi(disable) != 0) {
+    verificationState = "DISABLED";
+    INFO(NCCL_R2CC, "R2CC: OOB disabled via R2CC_OOB_DISABLE; all OOB calls become no-ops");
+    return ncclSuccess;
+  }
+
   char myIP[INET_ADDRSTRLEN];
   NCCLCHECK(GetLocalIP(myIP, INET_ADDRSTRLEN));
-  
+
   NCCLCHECK(InitSocket(myIP));
   NCCLCHECK(ExchangeInfo(bootstrapHandle, myIP));
   
