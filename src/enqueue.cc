@@ -1487,26 +1487,27 @@ static ncclResult_t addP2pToPlan(
             int64ToBusId(comm->peerInfo[myPeer].busId, peerBusId);
         }
 
-        // Check if EITHER Local OR Peer is one of the failed GPUs
-        bool localIs45 = (strncmp(currentBusId, "0000:45:00.0", 12) == 0);
-        bool peerIs45 = (strncmp(peerBusId, "0000:45:00.0", 12) == 0);
-        
+        // R2CC: failure2 is read from FAILURE2_SAME_SERVER env at function entry.
+        //   failure2=0 => 1-NIC failure (simulate only c2 down)
+        //   failure2=1 => 2-NIC failure (simulate 45 and c2 down)
+        int effectiveFailure2 = failure2;
+
         bool localIsC2 = (strncmp(currentBusId, "0000:c2:00.0", 12) == 0);
-        bool peerIsC2 = (strncmp(peerBusId, "0000:c2:00.0", 12) == 0);
+        bool peerIsC2  = (strncmp(peerBusId,    "0000:c2:00.0", 12) == 0);
+        bool localIs45 = false, peerIs45 = false;
+        if (effectiveFailure2 == 1) {
+          localIs45 = (strncmp(currentBusId, "0000:45:00.0", 12) == 0);
+          peerIs45  = (strncmp(peerBusId,    "0000:45:00.0", 12) == 0);
+        }
 
         if (localIs45 || peerIs45 || localIsC2 || peerIsC2) {
           int originalChannels = nChannels[dir];
           int targetChannels = originalChannels;
-          
-          // Force failure2=1 behavior (reduce by 4) to ensure agreement across nodes
-          // regardless of local env var.
-          int effectiveFailure2 = 1; 
-          
-          if (originalChannels > 2) targetChannels = originalChannels-2*(1+effectiveFailure2);
+          if (originalChannels > 2) targetChannels = originalChannels - 2*(1+effectiveFailure2);
           nChannels[dir] = targetChannels;
-          
-          WARN("P2P Test Mode: Failure Detected (Local=%s, Peer=%s). Reduced nChannels[%d] from %d to %d", 
-               currentBusId, peerBusId, dir, originalChannels, nChannels[dir]);
+
+          WARN("P2P Test Mode: Failure Detected (Local=%s, Peer=%s, failure2=%d). Reduced nChannels[%d] from %d to %d",
+               currentBusId, peerBusId, effectiveFailure2, dir, originalChannels, nChannels[dir]);
         }
       }
     }
