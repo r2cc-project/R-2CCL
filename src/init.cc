@@ -722,6 +722,47 @@ static int checkMNNVL(struct ncclComm* comm) {
 #define TIMER_INIT_ALLOC 7
 #define TIMERS_INIT_COUNT 8
 
+
+static bool r2ccEnvEnabled(const char* name) {
+  const char* v = getenv(name);
+  return v && atoi(v) != 0;
+}
+
+static bool r2ccFailure2SameServerEnabled() {
+  const char* v = getenv("FAILURE2_SAME_SERVER");
+  return v && atoi(v) == 1;
+}
+
+static bool r2ccBusIdAffected(const char* busId) {
+  if (busId == NULL || busId[0] == '\0') return false;
+
+  const char* target = getenv("GPUBUSID");
+  if (target && target[0] != '\0' &&
+      strncmp(busId, target, strlen(target)) == 0) {
+    return true;
+  }
+
+  if (r2ccFailure2SameServerEnabled() &&
+      strncmp(busId, "0000:45:00.0", strlen("0000:45:00.0")) == 0) {
+    return true;
+  }
+
+  return false;
+}
+
+static bool r2ccRankAffected(struct ncclComm* comm, int rank) {
+  if (comm == NULL || rank < 0) return false;
+  char busId[20];
+  if (rank == comm->rank) {
+    int64ToBusId(comm->busId, busId);
+  } else if (comm->peerInfo && rank < comm->nRanks) {
+    int64ToBusId(comm->peerInfo[rank].busId, busId);
+  } else {
+    return false;
+  }
+  return r2ccBusIdAffected(busId);
+}
+
 static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* parent, uint64_t timers[TIMERS_INIT_COUNT]) {
   // We use 2 AllGathers
   // 1. { peerInfo, comm, compCap}
@@ -1254,9 +1295,12 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
         int sendRound=0, recvRound=0;
         while (comm->p2pSchedule[sendRound].sendRank != peer) sendRound++;
         while (comm->p2pSchedule[recvRound].recvRank != peer) recvRound++;
-        uint8_t sendBase = ncclP2pChannelBaseForRound(comm, sendRound);
-        uint8_t recvBase = ncclP2pChannelBaseForRound(comm, recvRound);
-        for (int c=0; c<comm->p2pnChannelsPerPeer; c++) {
+        bool affectedPeer = r2ccEnvEnabled("R2CC_P2P_TEST_MODE") &&
+                            (r2ccRankAffected(comm, comm->rank) || r2ccRankAffected(comm, peer));
+        uint8_t sendBase = affectedPeer ? 0 : ncclP2pChannelBaseForRound(comm, sendRound);
+        uint8_t recvBase = affectedPeer ? 0 : ncclP2pChannelBaseForRound(comm, recvRound);
+        int preconnectChannels = affectedPeer ? comm->p2pnChannels : comm->p2pnChannelsPerPeer;
+        for (int c=0; c<preconnectChannels; c++) {
           int channelId;
           channelId = ncclP2pChannelForPart(comm->p2pnChannels, sendBase, c);
           if (comm->channels[channelId].peers[peer]->send[1].connected == 0) {

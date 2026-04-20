@@ -1333,6 +1333,52 @@ static ncclResult_t scheduleCollTasksToPlan(
 NCCL_PARAM(P2pLLThreshold, "P2P_LL_THRESHOLD", 16384);
 NCCL_PARAM(ChunkSize, "CHUNK_SIZE", 0);
 
+static bool r2ccEnvEnabled(const char* name) {
+  const char* v = getenv(name);
+  return v && atoi(v) != 0;
+}
+
+static bool r2ccFailure2SameServerEnabled() {
+  const char* v = getenv("FAILURE2_SAME_SERVER");
+  return v && atoi(v) == 1;
+}
+
+static bool r2ccBusIdAffected(const char* busId) {
+  if (busId == NULL || busId[0] == '\0') return false;
+
+  const char* target = getenv("GPUBUSID");
+  if (target && target[0] != '\0' &&
+      strncmp(busId, target, strlen(target)) == 0) {
+    return true;
+  }
+
+  if (r2ccFailure2SameServerEnabled() &&
+      strncmp(busId, "0000:45:00.0", strlen("0000:45:00.0")) == 0) {
+    return true;
+  }
+
+  return false;
+}
+
+static bool r2ccRankAffected(struct ncclComm* comm, int rank) {
+  if (comm == NULL || rank < 0) return false;
+  char busId[20];
+  if (rank == comm->rank) {
+    int64ToBusId(comm->busId, busId);
+  } else if (comm->peerInfo && rank < comm->nRanks) {
+    int64ToBusId(comm->peerInfo[rank].busId, busId);
+  } else {
+    return false;
+  }
+  return r2ccBusIdAffected(busId);
+}
+
+static bool r2ccP2pEdgeAffected(struct ncclComm* comm, int sendRank, int recvRank) {
+  return r2ccRankAffected(comm, comm ? comm->rank : -1) ||
+         r2ccRankAffected(comm, sendRank) ||
+         r2ccRankAffected(comm, recvRank);
+}
+
 // Put p2p op in plan assuming there is sizeof(ncclDevWorkBatch) in batch budget
 // and sizeof(ncclDevWorkP2p) in work budget. "sendRank" and "recvRank" must
 // match the corresponding values for this round of the p2p schedule (no -1's).
@@ -1358,26 +1404,27 @@ static ncclResult_t addP2pToPlan(
     ncclTopoRankToIndex(comm->topo, comm->rank, &gpuIndex);
   }
 
-  // R2CC P2P Test Mode: Check environment variables
-  const char* p2pTestMode = getenv("R2CC_P2P_TEST_MODE");
+  // R2CC P2P Test Mode: Check environment variables.
+  // For P2P we simulate the post-failure R2CC-Balance/scatter state only on
+  // affected edges. Non-affected P2P edges keep the original NCCL policy.
   const char* r2ccMode = getenv("R2CC_MODE");
-
-  const char* failure2SameServer=getenv("FAILURE2_SAME_SERVER");
-  int failure2 = failure2SameServer ? atoi(failure2SameServer) : 0;
-
-  int testMode = p2pTestMode ? atoi(p2pTestMode) : 0;
   int mode = r2ccMode ? atoi(r2ccMode) : 0;
-  bool useTestChannels = (testMode == 1);
-  
-  uint8_t base = ncclP2pChannelBaseForRound(comm, p2pRound);
-  if (useTestChannels){
-    base = 0;
+  bool useTestChannels = r2ccEnvEnabled("R2CC_P2P_TEST_MODE");
+  int failure2 = r2ccFailure2SameServerEnabled() ? 1 : 0;
+  bool affectedEdge = useTestChannels && r2ccP2pEdgeAffected(comm, sendRank, recvRank);
+
+  uint8_t base = affectedEdge ? 0 : ncclP2pChannelBaseForRound(comm, p2pRound);
+  if (affectedEdge && nChannelsMax != comm->p2pnChannels) {
+    WARN("P2P Test Mode: affected edge forcing nChannelsMax from %d to %d before scheduling",
+         nChannelsMax, comm->p2pnChannels);
+    nChannelsMax = comm->p2pnChannels;
   }
-  const char* targetBusIdEnv = getenv("GPUBUSID");
+
   char currentBusId[20];
   int64ToBusId(comm->busId, currentBusId);
-  if (useTestChannels && (strncmp(currentBusId, targetBusIdEnv, strlen(targetBusIdEnv)) == 0) ) {
-    WARN("P2P Test Mode: Enabled, R2CC_MODE=%d, will redistribute data across channels", mode);
+  if (affectedEdge) {
+    WARN("P2P Test Mode: Enabled for affected edge, R2CC_MODE=%d, base=0, p2pnChannels=%d",
+         mode, comm->p2pnChannels);
   } else {
     WARN("P2P Channel Selection: p2pRound=%d, base=%d, p2pnChannels=%d, nNodes=%d, maxLocalRanks=%d, sendRank=%d, recvRank=%d", 
          p2pRound, base, comm->p2pnChannels, comm->nNodes, comm->maxLocalRanks, sendRank, recvRank);
@@ -1497,46 +1544,36 @@ static ncclResult_t addP2pToPlan(
       // Part 14 -> 0b1110 -> 0b0111 -> Channel 7  -> NIC 7
       // Part 15 -> 0b1111 -> 0b1111 -> Channel 15 -> NIC 7
 
-      // R2CC P2P Test Mode: Force the channel count to use only NIC 0
-      // P2P mode2 ==7
+      // R2CC P2P Test Mode: affected edges first use the full logical
+      // P2P channel set, then drop the parts mapped to failed NICs.
 
       // printf("localrank=%d, failure2=%d, useTestChannels=%d, bytes=%d, reduce_channel=%d\n", localrank, failure2, useTestChannels, bytes[dir], reduce_channel);
 
-      if (useTestChannels && bytes[dir] > 0 && targetBusIdEnv) {
-      // TODO: should add another env to specific NIC failure location.
-        char currentBusId[20];
-        int64ToBusId(comm->busId, currentBusId);
-
-        // Get Peer Bus ID
-        char peerBusId[20] = "0000:00:00.0"; // Default
-        int myPeer = (dir == 1) ? recvRank : sendRank;
-        if (comm->peerInfo) {
-            int64ToBusId(comm->peerInfo[myPeer].busId, peerBusId);
+      if (affectedEdge && bytes[dir] > 0) {
+        char peerBusId[20] = "0000:00:00.0";
+        int myPeer = dir ? sendRank : recvRank;  // dir=1 send, dir=0 recv
+        if (myPeer >= 0 && myPeer < comm->nRanks && comm->peerInfo) {
+          int64ToBusId(comm->peerInfo[myPeer].busId, peerBusId);
         }
 
-        // R2CC: failure2 is read from FAILURE2_SAME_SERVER env at function entry.
-        //   failure2=0 => 1-NIC failure (simulate only c2 down)
-        //   failure2=1 => 2-NIC failure (simulate 45 and c2 down)
-        int effectiveFailure2 = failure2;
+        bool localAffected = r2ccBusIdAffected(currentBusId);
+        bool peerAffected = r2ccBusIdAffected(peerBusId);
+        if (localAffected || peerAffected) {
+          if (nChannels[dir] != nChannelsMax) {
+            WARN("P2P Test Mode: forcing nChannels[%d] from %d to %d before failure reduction",
+                 dir, nChannels[dir], nChannelsMax);
+            nChannels[dir] = nChannelsMax;
+          }
 
-        bool localIsC2 = (strncmp(currentBusId, "0000:c2:00.0", 12) == 0);
-        bool peerIsC2  = (strncmp(peerBusId,    "0000:c2:00.0", 12) == 0);
-        bool localIs45 = false, peerIs45 = false;
-        if (effectiveFailure2 == 1) {
-          localIs45 = (strncmp(currentBusId, "0000:45:00.0", 12) == 0);
-          peerIs45  = (strncmp(peerBusId,    "0000:45:00.0", 12) == 0);
-        }
-
-        if (localIs45 || peerIs45 || localIsC2 || peerIsC2) {
           int originalChannels = nChannels[dir];
-          int reduction = 2*(1+effectiveFailure2);
-          // Guard: ensure at least 1 channel remains after reduction.
-          int targetChannels = originalChannels - reduction;
+          int failedNicCount = 1 + failure2;
+          int targetChannels = nChannelsMax - 2 * failedNicCount;
           if (targetChannels < 1) targetChannels = 1;
+          if (targetChannels > originalChannels) targetChannels = originalChannels;
           nChannels[dir] = targetChannels;
 
           WARN("P2P Test Mode: Failure Detected (Local=%s, Peer=%s, failure2=%d). Reduced nChannels[%d] from %d to %d",
-               currentBusId, peerBusId, effectiveFailure2, dir, originalChannels, nChannels[dir]);
+               currentBusId, peerBusId, failure2, dir, originalChannels, nChannels[dir]);
         }
       }
     }
@@ -1601,7 +1638,7 @@ static ncclResult_t addP2pToPlan(
   nChannelsMax = std::max(nChannels[0], nChannels[1]);
   
   // Debug INFO
-  if (useTestChannels && (strncmp(currentBusId, targetBusIdEnv, strlen(targetBusIdEnv)) == 0)) {
+  if (affectedEdge) {
     WARN("P2P Test Mode: nChannelsMax=%d, base=%d, sendBytes=%ld, recvBytes=%ld, p2pnChannels=%d", 
          nChannelsMax, base, sendBytes, recvBytes, comm->p2pnChannels);
     
@@ -1620,15 +1657,12 @@ static ncclResult_t addP2pToPlan(
     int channelId = ncclP2pChannelForPart(comm->p2pnChannels, base, part);
     
     // Debug INFO
-    if (useTestChannels && (strncmp(currentBusId, targetBusIdEnv, strlen(targetBusIdEnv)) == 0)) {
+    if (affectedEdge) {
       // Check which NIC this channel maps to
-      // With R2CC_P2P_TEST_MODE=1, channels are mapped round-robin to NICs
-      // We have p2pnChannels = 2 * localNetCount (for PRIMARY/BACKUP)
-      // So localNetCount = p2pnChannels / 2
-      // wrong local net count
+      // With targeted R2CC_P2P_TEST_MODE=1, affected edges map
+      // channelId % localNetCount. p2pnChannels is 2 * localNetCount.
       int localNetCount = comm->p2pnChannels / 2;
-      int netDev = channelId % localNetCount;
-      if (gpuIndex != 7) netDev=gpuIndex;
+      int netDev = localNetCount > 0 ? channelId % localNetCount : -1;
       WARN("P2P Test Mode: part=%d/%d -> channelId=%d -> NIC %d", 
            part, nChannelsMax, channelId, netDev);
     }
@@ -1657,7 +1691,7 @@ static ncclResult_t addP2pToPlan(
         ncclP2pPartBounds(nParts, part, bytes, &partBeg, &partEnd);
         
         // Debug INFO
-        if (useTestChannels && (strncmp(currentBusId, targetBusIdEnv, strlen(targetBusIdEnv)) == 0)) {
+        if (affectedEdge) {
           WARN("P2P Test Mode: Channel %d (part %d/%d) gets bytes [%ld-%ld] (%ld bytes)", 
                channelId, part, nParts, partBeg, partEnd, partEnd-partBeg);
         }
@@ -1787,12 +1821,16 @@ static ncclResult_t scheduleP2pTasksToPlan(
         ncclIntruQueueDequeue(&peers[recvRank].recvQueue);
         comm->planner.nTasksP2p -= 2;
       } else {
+        bool affectedEdge = r2ccEnvEnabled("R2CC_P2P_TEST_MODE") && r2ccP2pEdgeAffected(comm, sendRank, recvRank);
+        int opNChannelsMax = affectedEdge ? comm->p2pnChannels : nChannelsMax;
+        int opNChannelsMin = affectedEdge ? std::min(nChannelsMin, opNChannelsMax) : nChannelsMin;
+
         // Ensure room for worst case of one new batch per channel.
-        if (!testBudget(budget, plan->nWorkBatches+nChannelsMax, plan->workBytes + sizeof(struct ncclDevWorkP2p))) {
+        if (!testBudget(budget, plan->nWorkBatches+opNChannelsMax, plan->workBytes + sizeof(struct ncclDevWorkP2p))) {
           return ncclSuccess;
         }
         struct ncclTaskP2p* p2pTasks[2] = { recv, send };
-        NCCLCHECK(addP2pToPlan(comm, plan, nChannelsMin, nChannelsMax, round, sendRank, sendBuff, sendBytes, recvRank, recvBuff, recvBytes, p2pTasks));
+        NCCLCHECK(addP2pToPlan(comm, plan, opNChannelsMin, opNChannelsMax, round, sendRank, sendBuff, sendBytes, recvRank, recvBuff, recvBytes, p2pTasks));
         if (send != nullptr) {
           ncclIntruQueueDequeue(&peers[sendRank].sendQueue);
           ncclIntruQueueEnqueue(&plan->p2pTaskQueue, send);
@@ -2833,8 +2871,11 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
                                       : comm->p2pSchedule[round].recvRank)) {
           round += 1;
         }
-        uint8_t base = ncclP2pChannelBaseForRound(comm, round);
-        for (int c=0; c < comm->p2pnChannelsPerPeer; c++) {
+        bool affectedPeer = r2ccEnvEnabled("R2CC_P2P_TEST_MODE") &&
+                            (r2ccRankAffected(comm, comm->rank) || r2ccRankAffected(comm, peer));
+        uint8_t base = affectedPeer ? 0 : ncclP2pChannelBaseForRound(comm, round);
+        int preconnectChannels = affectedPeer ? comm->p2pnChannels : comm->p2pnChannelsPerPeer;
+        for (int c=0; c < preconnectChannels; c++) {
           int channelId = ncclP2pChannelForPart(comm->p2pnChannels, base, c);
           if (isSendNotRecv) {
             if (comm->channels[channelId].peers[peer]->send[1].connected == 0) { // P2P uses only 1 connector

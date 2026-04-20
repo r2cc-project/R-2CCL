@@ -240,6 +240,16 @@ static bool r2ccTokenMatchesHca(const char* start, int len, const char* netName,
   return false;
 }
 
+
+static ncclResult_t r2ccCheckBackupConnectInfoSize() {
+  if (2 * sizeof(ncclNetHandle_t) > CONNECT_SIZE) {
+    WARN("R2CC backup connection requires %zu bytes of connectInfo but CONNECT_SIZE=%d",
+         2 * sizeof(ncclNetHandle_t), CONNECT_SIZE);
+    return ncclInternalError;
+  }
+  return ncclSuccess;
+}
+
 static bool r2ccMatchDisconnectedHca(int netDev, const char* netName) {
   const char* env = getenv("R2CC_DISCONNECTED_HCA");
   if (!env || env[0] == '\0') env = getenv("R2CC_Disconnected_HCA");
@@ -367,7 +377,8 @@ static ncclResult_t recvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
   req.tpLocalRank = comm->topParentLocalRanks[comm->localRank];
   req.tpRank = comm->topParentRanks[myInfo->rank];
   req.tpRemoteRank = comm->topParentRanks[peerInfo->rank];
-  TRACE(NCCL_INIT,"before recvSetup ncclProxyCallBlocking");
+  NCCLCHECK(r2ccCheckBackupConnectInfoSize());
+  TRACE(NCCL_INIT,"before recvSetup ncclProxyCallBlocking primary+backup respSize=%zu", 2*sizeof(ncclNetHandle_t));
   NCCLCHECK(ncclProxyCallBlocking(comm, &recv->proxyConn, ncclProxyMsgSetup, &req, sizeof(req), connectInfo, 2*sizeof(ncclNetHandle_t)));
   TRACE(NCCL_INIT,"after recvSetup ncclProxyCallBlocking");
   INFO(NCCL_INIT|NCCL_NET,"Channel %02d/%d : %d[%d] -> %d[%d] [receive] via NET/%s/%d%s%s", channelId, connIndex, peerInfo->rank, peerInfo->nvmlDev, myInfo->rank, myInfo->nvmlDev, comm->ncclNet->name, req.netDev,
@@ -433,6 +444,7 @@ static ncclResult_t sendConnect(struct ncclComm* comm, struct ncclConnect* conne
     send->transportResources = map;
     opId = send;
     INFO(NCCL_PROXY, "sendConnect ncclProxyCallAsync opId=%p", opId);
+    NCCLCHECK(r2ccCheckBackupConnectInfoSize());
     netSendConnectArgs args[2] = {0};
     memcpy(&args, connectInfo, 2*sizeof(ncclNetHandle_t));
     TRACE(NCCL_INIT, "netSendConnectArgs size is %lu", sizeof(netSendConnectArgs));
@@ -912,8 +924,9 @@ static ncclResult_t recvProxySetup(struct ncclProxyConnection* connection, struc
   resources->waitFailoverHintSendCount = 0;
 
   TRACE(NCCL_INIT, "listen 1");
-  // if (respSize != sizeof(ncclNetHandle_t)) return ncclInternalError;
-  
+  NCCLCHECK(r2ccCheckBackupConnectInfoSize());
+  if (respSize != 2*(int)sizeof(ncclNetHandle_t)) return ncclInternalError;
+
   // R2CC: Log detailed listen setup
   static int setupCount = 0;
   setupCount++;
@@ -1030,7 +1043,8 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
            resources->channelId, resources->netDev);
     }
   }
-  // if (reqSize != sizeof(netSendConnectArgs)) return ncclInternalError;
+  NCCLCHECK(r2ccCheckBackupConnectInfoSize());
+  if (reqSize != 2*(int)sizeof(netSendConnectArgs)) return ncclInternalError;
   ncclResult_t ret = ncclSuccess;
   ncclResult_t ret2 = ncclSuccess;
   netSendConnectArgs* req = (netSendConnectArgs*) reqBuff;

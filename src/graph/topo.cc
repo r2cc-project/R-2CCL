@@ -863,6 +863,40 @@ fail:
 
 NCCL_PARAM(P2pCrossNuma, "P2P_CROSS_NUMA", 0);
 
+static bool r2ccEnvEnabled(const char* name) {
+  const char* v = getenv(name);
+  return v && atoi(v) != 0;
+}
+
+static bool r2ccFailure2SameServerEnabled() {
+  const char* v = getenv("FAILURE2_SAME_SERVER");
+  return v && atoi(v) == 1;
+}
+
+static bool r2ccGpuBusIdAffected(const char* busId) {
+  if (busId == NULL || busId[0] == '\0') return false;
+
+  const char* target = getenv("GPUBUSID");
+  if (target && target[0] != '\0' &&
+      strncmp(busId, target, strlen(target)) == 0) {
+    return true;
+  }
+
+  if (r2ccFailure2SameServerEnabled() &&
+      strncmp(busId, "0000:45:00.0", strlen("0000:45:00.0")) == 0) {
+    return true;
+  }
+
+  return false;
+}
+
+static bool r2ccGpuIndexAffected(struct ncclTopoSystem* system, int gpuIndex) {
+  if (system == NULL || gpuIndex < 0 || gpuIndex >= system->nodes[GPU].count) return false;
+  char busId[20];
+  int64ToBusId(system->nodes[GPU].nodes[gpuIndex].id, busId);
+  return r2ccGpuBusIdAffected(busId);
+}
+
 ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, int index, int resultType, int** locals, int* localCount, int* pathType) {
   int minType = PATH_DIS;
   float maxBw = 0;
@@ -871,51 +905,22 @@ ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, int index
   struct ncclTopoLinkList* paths = system->nodes[type].nodes[index].paths[resultType];
   if (paths == NULL) { *localCount = 0; return ncclSuccess; }
   
-  // If P2P_CROSS_NUMA is enabled, return all available NICs
-  // if (ncclParamP2pCrossNuma() && type == GPU && resultType == NET) {
+  // R2CC all-NIC policy is deliberately targeted.
+  // - R2CC_USE_ALL_NIC=1 remains the explicit global all-NIC override.
+  // - R2CC_P2P_TEST_MODE=1 exposes all local NICs only for affected GPUs
+  //   (GPUBUSID and, in mode3, the second same-server failure GPU).
+  bool useAllNic = r2ccEnvEnabled("R2CC_USE_ALL_NIC");
+  bool p2pTestMode = r2ccEnvEnabled("R2CC_P2P_TEST_MODE");
+  bool affectedGpu = (type == GPU) ? r2ccGpuIndexAffected(system, index) : false;
 
-  const char* useAllNicEnv = getenv("R2CC_USE_ALL_NIC");
-  const char* p2pTestMode = getenv("R2CC_P2P_TEST_MODE");
-  int testMode = p2pTestMode ? atoi(p2pTestMode) : 0;
-  
-  // P2P mode2 ==7
-  const char* targetBusIdEnv = getenv("GPUBUSID");
-  const char* failure2SameServer=getenv("FAILURE2_SAME_SERVER");
-  
-  bool matchBusId = false;
-  
-  if (targetBusIdEnv && type == GPU) {
-    char currentBusId[20];
-    int64ToBusId(system->nodes[GPU].nodes[index].id, currentBusId);  // Get current GPU node's busId
-    matchBusId = (strncmp(currentBusId, targetBusIdEnv, strlen(targetBusIdEnv)) == 0);
-    if(failure2SameServer) matchBusId |= (strncmp(currentBusId, "0000:45:00.0", strlen("0000:45:00.0")) == 0);
-    //if(matchBusId)printf("P2P mode2 matchBusId=%d\n currentBusId=%s\n targetBusIdEnv=%s\n", matchBusId, currentBusId, targetBusIdEnv);
-  }
-  
-  if (useAllNicEnv && atoi(useAllNicEnv) != 0 && type == GPU && resultType == NET) {
+  if (type == GPU && resultType == NET && (useAllNic || (p2pTestMode && affectedGpu))) {
     for (int i=0; i<system->nodes[resultType].count; i++) {
-      if (paths[i].bw > 0) {
-        (*locals)[count++] = i;
-      }
+      if (paths[i].bw > 0) (*locals)[count++] = i;
     }
     *localCount = count;
     return ncclSuccess;
   }
 
-  if (testMode == 1 && matchBusId && type == GPU && resultType == NET) {
-    for (int i=0; i<system->nodes[resultType].count; i++) {
-      if (paths[i].bw > 0) {
-        (*locals)[count++] = i;
-        // INFO(NCCL_INIT, "P2P_CROSS_NUMA: GPU %d -> NET[%d] (id=%lx, dev=%d)", 
-        //      index, i, system->nodes[NET].nodes[i].id, system->nodes[NET].nodes[i].net.dev);
-      }
-    }
-    *localCount = count;
-    //INFO(NCCL_INIT, "R2CC: GPU with busId %s accessing all %d NICs", currentBusId, count);
-    // INFO(NCCL_INIT, "P2P_CROSS_NUMA enabled: returning %d NICs for GPU %d", count, index);
-    return ncclSuccess;
-  }
-  
   // Original logic: only return NICs with highest bandwidth
   for (int i=0; i<system->nodes[resultType].count; i++) {
     if (paths[i].bw > maxBw || (paths[i].bw == maxBw && paths[i].type < minType)) {
@@ -964,60 +969,25 @@ ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int ch
   int* localGpus = NULL;
   int localGpuCount;
   int net;
-  const char* p2pTestMode;  // Declare before NCCLCHECKGOTO
-  int testMode;  // Declare before NCCLCHECKGOTO
-  const char* useAllNicEnv;  // Declare before NCCLCHECKGOTO
-  // P2P mode2 ==7 - declare variables before any goto
-  const char* targetBusIdEnv;
-  bool matchBusId = false;
-  
+  bool useAllNic = r2ccEnvEnabled("R2CC_USE_ALL_NIC");
+  bool p2pTestMode = r2ccEnvEnabled("R2CC_P2P_TEST_MODE");
+  bool affectedGpu = r2ccGpuIndexAffected(system, gpu);
+
+  if (localNetCount <= 0) { ret = ncclInternalError; goto fail; }
   NCCLCHECKGOTO(ncclTopoGetLocal(system, NET, localNets[0], GPU, &localGpus, &localGpuCount, NULL), ret, fail);
-  net = system->nodes[GPU].nodes[gpu].gpu.dev;
-  
-  // WARN("ncclTopoGetLocalNet: rank=%d channelId=%d gpu=%d gpu.dev=%d localNetCount=%d localGpuCount=%d", 
-  //      rank, channelId, gpu, net, localNetCount, localGpuCount);
-  
-  p2pTestMode = getenv("R2CC_P2P_TEST_MODE");
-  testMode = p2pTestMode ? atoi(p2pTestMode) : 0;
-  
-  // P2P mode2 ==7 - get environment variable
-  targetBusIdEnv = getenv("GPUBUSID");
-  
-  if (isPow2(localNetCount)) net = mirrorBits(net, localNetCount);
-  net += channelId%(DIVUP(localNetCount,localGpuCount));
+  if (localGpuCount <= 0) { ret = ncclInternalError; goto fail; }
 
-  net = system->nodes[GPU].nodes[gpu].gpu.dev;
-
-  // P2P mode2 ==7 - check busId match
-  if (targetBusIdEnv) {
-    char currentBusId[20];
-    int64ToBusId(system->nodes[GPU].nodes[gpu].id, currentBusId);  // Get current GPU's busId
-    matchBusId = (strncmp(currentBusId, targetBusIdEnv, strlen(targetBusIdEnv)) == 0);
-    
-    const char* failure2SameServer=getenv("FAILURE2_SAME_SERVER");
-    if(failure2SameServer && atoi(failure2SameServer)) {
-        matchBusId |= (strncmp(currentBusId, "0000:45:00.0", strlen("0000:45:00.0")) == 0);
-    }
-  }
-  
-  useAllNicEnv = getenv("R2CC_USE_ALL_NIC");
-  if (useAllNicEnv && atoi(useAllNicEnv) != 0) {
+  if (useAllNic || (p2pTestMode && affectedGpu)) {
+    // In targeted P2P scatter mode, only affected GPUs use the stable
+    // channelId -> NIC mapping. Non-affected GPUs keep NCCL's default
+    // nearest/default-NIC mapping.
     net = channelId % localNetCount;
-  } else if (testMode != 0 && matchBusId) {
-    net = channelId % localNetCount;
-
-    // R2CC_P2P_TEST_MODE=1: NUMA-aware NIC selection
-    // GPU 0-3 (NUMA 0) use NICs 0-3, GPU 4-7 (NUMA 1) use NICs 4-7
-    // gpuDev = system->nodes[GPU].nodes[gpu].gpu.dev;
-    // if (gpuDev < 4) {
-    //   // NUMA 0: use NICs 0-3
-    //   net = channelId % 4;
-    // } else {
-    //   // NUMA 1: use NICs 4-7
-    //   net = 4 + (channelId % 4);
-    // }
+  } else {
+    net = system->nodes[GPU].nodes[gpu].gpu.dev;
+    if (isPow2(localNetCount)) net = mirrorBits(net, localNetCount);
+    net += channelId%(DIVUP(localNetCount,localGpuCount));
   }
-  
+
   {
     int selectedNetIndex = localNets[net%localNetCount];
     // INFO(NCCL_INIT, "ncclTopoGetLocalNet: after calc net=%d, net%%localNetCount=%d, selectedNetIndex=%d, id=%lx, dev=%d", 

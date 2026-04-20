@@ -706,15 +706,24 @@ static ncclResult_t ncclTopoGetNchannels(struct ncclComm* comm, int g /*local gp
       *nChannels = 2;
     }
   } else {
-    // Remote rank, use network
+    // Remote rank, use network.
+    // R2CC_USE_ALL_NIC keeps its original meaning: one channel per local NIC.
+    // R2CC_P2P_TEST_MODE uses two logical P2P parts per NIC so mode2/mode3
+    // can drop 2/4 parts while keeping a channelBase+nChannels device ABI.
     const char* useAllNicEnv = getenv("R2CC_USE_ALL_NIC");
-    if (useAllNicEnv && atoi(useAllNicEnv) != 0) {
+    const char* p2pTestModeEnv = getenv("R2CC_P2P_TEST_MODE");
+    if ((useAllNicEnv && atoi(useAllNicEnv) != 0) ||
+        (p2pTestModeEnv && atoi(p2pTestModeEnv) == 1)) {
       int localNetCount = 0;
       struct ncclTopoLinkList* paths = system->nodes[GPU].nodes[g].paths[NET];
       for (int i = 0; i < system->nodes[NET].count; i++) {
         if (paths[i].bw > 0) localNetCount++;
       }
-      *nChannels = localNetCount > 0 ? localNetCount : 1;
+      if (p2pTestModeEnv && atoi(p2pTestModeEnv) == 1) {
+        *nChannels = localNetCount > 0 ? 2 * localNetCount : 1;
+      } else {
+        *nChannels = localNetCount > 0 ? localNetCount : 1;
+      }
       return ncclSuccess;
     }
     int nNetChannels = ncclParamNChannelsPerNetPeer();
@@ -800,7 +809,7 @@ ncclResult_t ncclTopoComputeP2pChannels(struct ncclComm* comm) {
     }
     
     if (maxLocalNetCount > 0) {
-      int targetChannels = 2 * maxLocalNetCount;  // 2x for PRIMARY/BACKUP
+      int targetChannels = 2 * maxLocalNetCount;  // 2 P2P parts per NIC
       INFO(NCCL_INIT, "R2CC P2P_TEST_MODE=1: Target channels = %d (2 x %d NICs)", targetChannels, maxLocalNetCount);
       INFO(NCCL_INIT, "R2CC P2P_TEST_MODE=1: Before adjustment - minChannels=%d, p2pnChannels=%d", 
            minChannels, comm->p2pnChannels);
