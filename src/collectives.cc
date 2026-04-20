@@ -12,8 +12,10 @@
 #include "r2cc/oob/oob_udp.h"
 #include "nccl.h"
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 
 // R-2CCL: when set to 1, the NCCL tuner in enqueue.cc hides Simple from
 // Broadcast's protocol choices, so it picks LL or LL128 instead. Used to
@@ -40,6 +42,47 @@ static size_t r2ccBcastSimpleMinBytes() {
   static size_t cached = [] {
     const char* e = getenv("R2CC_BCAST_SIMPLE_MIN_BYTES");
     return e ? (size_t)strtoull(e, nullptr, 10) : (size_t)0;
+  }();
+  return cached;
+}
+
+static size_t r2ccParseSizeBytes(const char* e, size_t fallback) {
+  if (e == nullptr || *e == '\0') return fallback;
+
+  char* end = nullptr;
+  unsigned long long value = strtoull(e, &end, 10);
+  if (end == e) return fallback;
+
+  while (*end != '\0' && std::isspace((unsigned char)*end)) end++;
+
+  unsigned long long mult = 1;
+  if (*end != '\0') {
+    char suffix = (char)std::tolower((unsigned char)*end++);
+    switch (suffix) {
+      case 'k': mult = 1ull << 10; break;
+      case 'm': mult = 1ull << 20; break;
+      case 'g': mult = 1ull << 30; break;
+      case 't': mult = 1ull << 40; break;
+      default: return fallback;
+    }
+
+    if (*end == 'i' || *end == 'I') end++;
+    if (*end == 'b' || *end == 'B') end++;
+    while (*end != '\0' && std::isspace((unsigned char)*end)) end++;
+    if (*end != '\0') return fallback;
+  }
+
+  if (value > (unsigned long long)std::numeric_limits<size_t>::max() / mult) return fallback;
+  return (size_t)(value * mult);
+}
+
+// ARBC_ARRS=32M means:
+// <=32 MiB : AllReduce + Broadcast
+// > 32 MiB : AllReduce + ReduceScatter
+// Unset keeps the current AllReduce + Broadcast behavior.
+static size_t r2ccArbcArrsThresholdBytes() {
+  static size_t cached = [] {
+    return r2ccParseSizeBytes(getenv("ARBC_ARRS"), std::numeric_limits<size_t>::max());
   }();
   return cached;
 }
@@ -232,31 +275,59 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
 
       size_t mainCount = originalCount * (nNetDevs - failure_num) / nNetDevs;
       size_t subCount = originalCount - mainCount;
-      
+      bool useReduceScatterPhase2 = totalUserBytes > r2ccArbcArrsThresholdBytes();
+      size_t rsRecvCount = 0;
+      if (useReduceScatterPhase2) {
+        // ReduceScatter consumes nRanks * recvcount input elements, so keep the
+        // phase-2 slice aligned and absorb any remainder into phase 1.
+        rsRecvCount = subCount / comm->nRanks;
+        subCount = rsRecvCount * comm->nRanks;
+        mainCount = originalCount - subCount;
+      }
+
+      auto enqueuePhase2Broadcast = [&](size_t phase2Count) -> ncclResult_t {
+        size_t offset = mainCount * elementSize;
+        const void* bcastSendbuff = (const char*)sendbuff + offset;
+        void* bcastRecvbuff = (char*)recvbuff + offset;
+
+        struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
+          bcastSendbuff, bcastRecvbuff, phase2Count, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
+          BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
+        {
+          size_t bcastBytes = phase2Count * elementSize;
+          size_t simpleMin = r2ccBcastSimpleMinBytes();
+          bool hideSimple = r2ccBcastNoSimpleEnabled() && (simpleMin == 0 || bcastBytes < simpleMin);
+          r2ccBcastNoSimple = hideSimple ? 1 : 0;
+        }
+        NCCLCHECK(ncclEnqueueCheck(&info2));
+        return ncclSuccess;
+      };
+
+      auto enqueuePhase2ReduceScatter = [&](size_t phase2RecvCount) -> ncclResult_t {
+        if (phase2RecvCount == 0) return ncclSuccess;
+
+        size_t offset = mainCount * elementSize;
+        const void* rsSendbuff = (const char*)sendbuff + offset;
+        void* rsRecvbuff = (char*)recvbuff + offset + comm->rank * phase2RecvCount * elementSize;
+
+        struct ncclInfo info2 = { ncclFuncReduceScatter, "ReduceScatter",
+          rsSendbuff, rsRecvbuff, phase2RecvCount, datatype, op, 0, comm, stream, /* Args */
+          REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS };
+        NCCLCHECK(ncclEnqueueCheck(&info2));
+        return ncclSuccess;
+      };
+
       // MODE=3: Both phases
       // MODE=4: Only Phase 1 (AllReduce)
-      // MODE=5: Only Phase 2 (Broadcast)
+      // MODE=5: Only Phase 2 (Broadcast or ReduceScatter)
       if(mode == 3 and parallel){
         NCCLCHECK(ncclGroupStart());
         struct ncclInfo info1 = { ncclFuncAllReduce, "AllReduce",
           sendbuff, recvbuff, mainCount, datatype, op, 0, comm, stream, /* Args */
           ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
         NCCLCHECK(ncclEnqueueCheck(&info1));
-        // Calculate offset for remaining data
-        size_t offset = mainCount * elementSize;
-        const void* bcastSendbuff = (const char*)sendbuff + offset;
-        void* bcastRecvbuff = (char*)recvbuff + offset;
-        
-        struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
-          bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
-          BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
-        {
-          size_t bcastBytes = (size_t)subCount * elementSize;
-          size_t simpleMin = r2ccBcastSimpleMinBytes();
-          bool hideSimple = r2ccBcastNoSimpleEnabled() && (simpleMin == 0 || bcastBytes < simpleMin);
-          r2ccBcastNoSimple = hideSimple ? 1 : 0;
-        }
-        NCCLCHECK(ncclEnqueueCheck(&info2));
+        if (useReduceScatterPhase2) NCCLCHECK(enqueuePhase2ReduceScatter(rsRecvCount));
+        else NCCLCHECK(enqueuePhase2Broadcast(subCount));
         NCCLCHECK(ncclGroupEnd());    // tuner fires here; flag must still be set
         r2ccBcastNoSimple = 0;
       }
@@ -270,21 +341,8 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
 
 
 	      NCCLCHECK(ncclGroupStart());
-        // Calculate offset for remaining data
-        size_t offset = mainCount * elementSize;
-        const void* bcastSendbuff = (const char*)sendbuff + offset;
-        void* bcastRecvbuff = (char*)recvbuff + offset;
-
-        struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
-          bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
-          BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
-        {
-          size_t bcastBytes = (size_t)subCount * elementSize;
-          size_t simpleMin = r2ccBcastSimpleMinBytes();
-          bool hideSimple = r2ccBcastNoSimpleEnabled() && (simpleMin == 0 || bcastBytes < simpleMin);
-          r2ccBcastNoSimple = hideSimple ? 1 : 0;
-        }
-        NCCLCHECK(ncclEnqueueCheck(&info2));
+        if (useReduceScatterPhase2) NCCLCHECK(enqueuePhase2ReduceScatter(rsRecvCount));
+        else NCCLCHECK(enqueuePhase2Broadcast(subCount));
         NCCLCHECK(ncclGroupEnd());    // tuner fires here; flag must still be set
         r2ccBcastNoSimple = 0;
 
@@ -298,23 +356,10 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
         NCCLCHECK(ncclEnqueueCheck(&info1));
         NCCLCHECK(ncclGroupEnd());
       }else if(mode == 5){
-        // Phase 2: Broadcast remaining data from "failed" node
+        // Phase 2: Broadcast or ReduceScatter on the remaining data
         NCCLCHECK(ncclGroupStart());
-        // Calculate offset for remaining data
-        size_t offset = mainCount * elementSize;
-        const void* bcastSendbuff = (const char*)sendbuff + offset;
-        void* bcastRecvbuff = (char*)recvbuff + offset;
-        
-        struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
-          bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
-          BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
-        {
-          size_t bcastBytes = (size_t)subCount * elementSize;
-          size_t simpleMin = r2ccBcastSimpleMinBytes();
-          bool hideSimple = r2ccBcastNoSimpleEnabled() && (simpleMin == 0 || bcastBytes < simpleMin);
-          r2ccBcastNoSimple = hideSimple ? 1 : 0;
-        }
-        NCCLCHECK(ncclEnqueueCheck(&info2));
+        if (useReduceScatterPhase2) NCCLCHECK(enqueuePhase2ReduceScatter(rsRecvCount));
+        else NCCLCHECK(enqueuePhase2Broadcast(subCount));
         NCCLCHECK(ncclGroupEnd());    // tuner fires here; flag must still be set
         r2ccBcastNoSimple = 0;
       }

@@ -824,6 +824,7 @@ static ncclResult_t scheduleCollTasksToPlan(
   size_t totalUserBytes = 0;
   bool hasAllReduce = false;
   bool hasBroadcast = false;
+  bool hasReduceScatter = false;
 
   int const nMaxChannels[2*2] = {mxchannels, comm->nvlsChannels, // [collnet][nvls]
                                  mxchannels, comm->nvlsChannels};
@@ -845,8 +846,10 @@ static ncclResult_t scheduleCollTasksToPlan(
 
       if (task->func == ncclFuncAllReduce) hasAllReduce = true;
       if (task->func == ncclFuncBroadcast) hasBroadcast = true;
+      if (task->func == ncclFuncReduceScatter) hasReduceScatter = true;
       // Accumulate total user bytes to check against threshold
-      totalUserBytes += task->count * ncclTypeSize(task->datatype);
+      totalUserBytes += task->count * ncclTypeSize(task->datatype) *
+                        ncclFuncMaxSendRecvCount(task->func, comm->nRanks, 1);
 
       task = task->next;
       workNode = workNode->next;
@@ -856,18 +859,18 @@ static ncclResult_t scheduleCollTasksToPlan(
   } while (0);
 
 
-  // ---------------- R2CC: fixed channel partition for fused AllReduce + Broadcast ----------------
+  // ---------------- R2CC: fixed channel partition for fused AllReduce + phase-2 op ----------------
   static int envFixedSplit = -1;
   if (envFixedSplit == -1) {
     const char* env = getenv("R2CC_FIXED_CHANNEL_SPLIT");
     envFixedSplit = env ? atoi(env) : 0;
   }
-  int r2ccFixedSplit = (totalUserBytes <= 134217728 && hasAllReduce && hasBroadcast) ? envFixedSplit : 0;
+  int r2ccFixedSplit = (totalUserBytes <= 134217728 && hasAllReduce && (hasBroadcast || hasReduceScatter)) ? envFixedSplit : 0;
   // Fixed split assumes contiguous channel ranges; disable it when MODE=2 introduces sparse channel sets.
   if (mode > 1 && failedMask != 0) r2ccFixedSplit = 0;
 
    // if (comm->rank == 0 && hasAllReduce ) {
-   //  printf("\nDEBUG: [Rank 0] Total User Bytes: %zu, r2ccFixedSplit: %d\n hasAllReduce: %d, hasBroadcast: %d\n", totalUserBytes, r2ccFixedSplit, hasAllReduce, hasBroadcast);
+   //  printf("\nDEBUG: [Rank 0] Total User Bytes: %zu, r2ccFixedSplit: %d\n hasAllReduce: %d, hasBroadcast: %d, hasReduceScatter: %d\n", totalUserBytes, r2ccFixedSplit, hasAllReduce, hasBroadcast, hasReduceScatter);
    //  fflush(stdout);
    // }
 
@@ -877,11 +880,14 @@ static ncclResult_t scheduleCollTasksToPlan(
     struct ncclWorkList* w0 = ncclIntruQueueHead(&planner->collWorkQueue);
     struct ncclWorkList* w1 = w0 ? w0->next : nullptr;
 
+    auto isPhase2Func = [&](ncclFunc_t func) {
+      return func == ncclFuncBroadcast || func == ncclFuncReduceScatter;
+    };
     auto isPair = [&](struct ncclTaskColl* a, struct ncclTaskColl* b) {
       if (a == nullptr || b == nullptr) return false;
       if (b->next != nullptr) return false;
-      bool ab = (a->func == ncclFuncAllReduce && b->func == ncclFuncBroadcast);
-      bool ba = (a->func == ncclFuncBroadcast && b->func == ncclFuncAllReduce);
+      bool ab = (a->func == ncclFuncAllReduce && isPhase2Func(b->func));
+      bool ba = (isPhase2Func(a->func) && b->func == ncclFuncAllReduce);
       return ab || ba;
     };
 
@@ -893,43 +899,44 @@ static ncclResult_t scheduleCollTasksToPlan(
         int totalCh = nMaxChannels[kind0];
         if (totalCh >= 2) {
           // traffic weights (already includes AllReduce x2 via trafficBytes)
-          size_t wAR = 0, wBC = 0;
+          size_t wAR = 0, wP2 = 0;
           if (t0->func == ncclFuncAllReduce) wAR = t0->trafficBytes;
-          if (t0->func == ncclFuncBroadcast) wBC = t0->trafficBytes;
+          if (isPhase2Func(t0->func)) wP2 = t0->trafficBytes;
           if (t1->func == ncclFuncAllReduce) wAR = t1->trafficBytes;
-          if (t1->func == ncclFuncBroadcast) wBC = t1->trafficBytes;
+          if (isPhase2Func(t1->func)) wP2 = t1->trafficBytes;
 
-          size_t denom = wAR + wBC;
+          size_t denom = wAR + wP2;
           if (denom == 0) denom = 1;
 
-          // bcCh = round(totalCh * wBC / (wAR+wBC)), clamp to [1, totalCh-1]
-          uint64_t numer = (uint64_t)totalCh * (uint64_t)wBC + (uint64_t)(denom/2);
-          int bcCh = (int)(numer / (uint64_t)denom);
-          if (bcCh < 1) bcCh = 1;
-          if (bcCh > totalCh-1) bcCh = totalCh-1;
+          // p2Ch = round(totalCh * wP2 / (wAR+wP2)), clamp to [1, totalCh-1]
+          uint64_t numer = (uint64_t)totalCh * (uint64_t)wP2 + (uint64_t)(denom/2);
+          int p2Ch = (int)(numer / (uint64_t)denom);
+          if (p2Ch < 1) p2Ch = 1;
+          if (p2Ch > totalCh-1) p2Ch = totalCh-1;
 
-          // ---------------- R2CC: override bcCh by failure-induced channel reduction ----------------
+          // ---------------- R2CC: override stage-2 channels by failure-induced channel reduction ----------------
           // Your machine: 16->14 (remove 2 ch) means 1 NIC failed; 16->12 (remove 4 ch) means 2 NIC failed.
-          // Force bcast to use the last (removed-1) channels: removed=2 => 1 ch; removed=4 => 3 ch.
+          // Force phase 2 to use the last (removed-1) channels: removed=2 => 1 ch; removed=4 => 3 ch.
           const int origCh = comm->nChannels;          // typically 16
           const int removedCh = origCh - totalCh;      // 2 or 4 in your setup
-          int bcChForced = 0;
-          if (removedCh == 2) bcChForced = 1;          // failure=1 => bcast uses last 1 channel
-          else if (removedCh == 4) bcChForced = 3;     // failure=2 => bcast uses last 3 channels (10/11/12th)
+          int p2ChForced = 0;
+          if (removedCh == 2) p2ChForced = 1;          // failure=1 => stage2 uses last 1 channel
+          else if (removedCh == 4) p2ChForced = 3;     // failure=2 => stage2 uses last 3 channels (10/11/12th)
 
           // Apply override if matched
-          if (bcChForced) {
-            bcCh = bcChForced;
-            if (bcCh < 1) bcCh = 1;
-            if (bcCh > totalCh-1) bcCh = totalCh-1;
+          if (p2ChForced) {
+            p2Ch = p2ChForced;
+            if (p2Ch < 1) p2Ch = 1;
+            if (p2Ch > totalCh-1) p2Ch = totalCh-1;
           }
 
-          int arCh = totalCh - bcCh;
+          int arCh = totalCh - p2Ch;
+          ncclFunc_t phase2Func = t0->func == ncclFuncAllReduce ? t1->func : t0->func;
 
           if (comm->rank == 0) {
             INFO(NCCL_INIT,
-                "R2CC_FIXED_CHANNEL_SPLIT: origCh=%d totalCh=%d removedCh=%d arCh=%d bcCh=%d (forced=%d) wAR=%zu wBC=%zu",
-                origCh, totalCh, removedCh, arCh, bcCh, bcChForced, wAR, wBC);
+                "R2CC_FIXED_CHANNEL_SPLIT: stage2=%s origCh=%d totalCh=%d removedCh=%d arCh=%d p2Ch=%d (forced=%d) wAR=%zu wP2=%zu",
+                ncclFuncToString(phase2Func), origCh, totalCh, removedCh, arCh, p2Ch, p2ChForced, wAR, wP2);
           }
 
 
@@ -1057,8 +1064,8 @@ static ncclResult_t scheduleCollTasksToPlan(
           for (int i = 0; i < 2; i++) {
             struct ncclTaskColl* task = ncclIntruQueueHead(&planner->collTaskQueue);
             struct ncclWorkList* workNode = ncclIntruQueueHead(&planner->collWorkQueue);
-            int base = (task->func == ncclFuncBroadcast) ? arCh : 0;
-            int nav  = (task->func == ncclFuncBroadcast) ? bcCh : arCh;
+            int base = (task->func == ncclFuncAllReduce) ? 0 : arCh;
+            int nav  = (task->func == ncclFuncAllReduce) ? arCh : p2Ch;
             NCCLCHECK(scheduleOneFixed(task, workNode, base, nav));
           }
 
