@@ -22,9 +22,9 @@
 
 NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
 
-// R-2CCL flag set by collectives.cc around split-collective Broadcast calls
-// to hide Simple from the broadcast tuner.
-extern int r2ccBcastNoSimple;
+// R-2CCL flag set by collectives.cc around split-collective phase-2
+// ReduceScatter calls to hide SIMPLE from the tuner.
+extern int r2ccRsNoSimple;
 
 // Returns maximum kernel stack size of all CUDA kernels
 ncclResult_t ncclInitKernelsForDevice(int cudaArch, size_t* maxStackSize) {
@@ -811,7 +811,7 @@ static ncclResult_t scheduleCollTasksToPlan(
 
   size_t totalUserBytes = 0;
   bool hasAllReduce = false;
-  bool hasBroadcast = false;
+  bool hasReduceScatter = false;
 
   int const nMaxChannels[2*2] = {mxchannels, comm->nvlsChannels, // [collnet][nvls]
                                  mxchannels, comm->nvlsChannels};
@@ -832,9 +832,10 @@ static ncclResult_t scheduleCollTasksToPlan(
       nChannels[kind] = std::min(nChannels[kind], nMaxChannels[kind]);
 
       if (task->func == ncclFuncAllReduce) hasAllReduce = true;
-      if (task->func == ncclFuncBroadcast) hasBroadcast = true;
+      if (task->func == ncclFuncReduceScatter) hasReduceScatter = true;
       // Accumulate total user bytes to check against threshold
-      totalUserBytes += task->count * ncclTypeSize(task->datatype);
+      totalUserBytes += task->count * ncclTypeSize(task->datatype) *
+                        ncclFuncMaxSendRecvCount(task->func, comm->nRanks, 1);
 
       task = task->next;
       workNode = workNode->next;
@@ -844,18 +845,18 @@ static ncclResult_t scheduleCollTasksToPlan(
   } while (0);
 
 
-  // ---------------- R2CC: fixed channel partition for fused AllReduce + Broadcast ----------------
+  // ---------------- R2CC: fixed channel partition for fused AllReduce + ReduceScatter ----------------
   static int envFixedSplit = -1;
   if (envFixedSplit == -1) {
     const char* env = getenv("R2CC_FIXED_CHANNEL_SPLIT");
     envFixedSplit = env ? atoi(env) : 0;
   }
-  int r2ccFixedSplit = (totalUserBytes <= 134217728 && hasAllReduce && hasBroadcast) ? envFixedSplit : 0;
+  int r2ccFixedSplit = (totalUserBytes <= 134217728 && hasAllReduce && hasReduceScatter) ? envFixedSplit : 0;
   // Fixed split assumes contiguous channel ranges; disable it when MODE=2 introduces sparse channel sets.
   if (mode > 1 && failedMask != 0) r2ccFixedSplit = 0;
 
    // if (comm->rank == 0 && hasAllReduce ) {
-   //  printf("\nDEBUG: [Rank 0] Total User Bytes: %zu, r2ccFixedSplit: %d\n hasAllReduce: %d, hasBroadcast: %d\n", totalUserBytes, r2ccFixedSplit, hasAllReduce, hasBroadcast);
+   //  printf("\nDEBUG: [Rank 0] Total User Bytes: %zu, r2ccFixedSplit: %d\n hasAllReduce: %d, hasReduceScatter: %d\n", totalUserBytes, r2ccFixedSplit, hasAllReduce, hasReduceScatter);
    //  fflush(stdout);
    // }
 
@@ -868,8 +869,8 @@ static ncclResult_t scheduleCollTasksToPlan(
     auto isPair = [&](struct ncclTaskColl* a, struct ncclTaskColl* b) {
       if (a == nullptr || b == nullptr) return false;
       if (b->next != nullptr) return false;
-      bool ab = (a->func == ncclFuncAllReduce && b->func == ncclFuncBroadcast);
-      bool ba = (a->func == ncclFuncBroadcast && b->func == ncclFuncAllReduce);
+      bool ab = (a->func == ncclFuncAllReduce && b->func == ncclFuncReduceScatter);
+      bool ba = (a->func == ncclFuncReduceScatter && b->func == ncclFuncAllReduce);
       return ab || ba;
     };
 
@@ -881,43 +882,43 @@ static ncclResult_t scheduleCollTasksToPlan(
         int totalCh = nMaxChannels[kind0];
         if (totalCh >= 2) {
           // traffic weights (already includes AllReduce x2 via trafficBytes)
-          size_t wAR = 0, wBC = 0;
+          size_t wAR = 0, wRS = 0;
           if (t0->func == ncclFuncAllReduce) wAR = t0->trafficBytes;
-          if (t0->func == ncclFuncBroadcast) wBC = t0->trafficBytes;
+          if (t0->func == ncclFuncReduceScatter) wRS = t0->trafficBytes;
           if (t1->func == ncclFuncAllReduce) wAR = t1->trafficBytes;
-          if (t1->func == ncclFuncBroadcast) wBC = t1->trafficBytes;
+          if (t1->func == ncclFuncReduceScatter) wRS = t1->trafficBytes;
 
-          size_t denom = wAR + wBC;
+          size_t denom = wAR + wRS;
           if (denom == 0) denom = 1;
 
-          // bcCh = round(totalCh * wBC / (wAR+wBC)), clamp to [1, totalCh-1]
-          uint64_t numer = (uint64_t)totalCh * (uint64_t)wBC + (uint64_t)(denom/2);
-          int bcCh = (int)(numer / (uint64_t)denom);
-          if (bcCh < 1) bcCh = 1;
-          if (bcCh > totalCh-1) bcCh = totalCh-1;
+          // rsCh = round(totalCh * wRS / (wAR+wRS)), clamp to [1, totalCh-1]
+          uint64_t numer = (uint64_t)totalCh * (uint64_t)wRS + (uint64_t)(denom/2);
+          int rsCh = (int)(numer / (uint64_t)denom);
+          if (rsCh < 1) rsCh = 1;
+          if (rsCh > totalCh-1) rsCh = totalCh-1;
 
-          // ---------------- R2CC: override bcCh by failure-induced channel reduction ----------------
+          // ---------------- R2CC: override stage-2 channels by failure-induced channel reduction ----------------
           // Your machine: 16->14 (remove 2 ch) means 1 NIC failed; 16->12 (remove 4 ch) means 2 NIC failed.
-          // Force bcast to use the last (removed-1) channels: removed=2 => 1 ch; removed=4 => 3 ch.
+          // Force phase 2 to use the last (removed-1) channels: removed=2 => 1 ch; removed=4 => 3 ch.
           const int origCh = comm->nChannels;          // typically 16
           const int removedCh = origCh - totalCh;      // 2 or 4 in your setup
-          int bcChForced = 0;
-          if (removedCh == 2) bcChForced = 1;          // failure=1 => bcast uses last 1 channel
-          else if (removedCh == 4) bcChForced = 3;     // failure=2 => bcast uses last 3 channels (10/11/12th)
+          int rsChForced = 0;
+          if (removedCh == 2) rsChForced = 1;          // failure=1 => stage2 uses last 1 channel
+          else if (removedCh == 4) rsChForced = 3;     // failure=2 => stage2 uses last 3 channels
 
           // Apply override if matched
-          if (bcChForced) {
-            bcCh = bcChForced;
-            if (bcCh < 1) bcCh = 1;
-            if (bcCh > totalCh-1) bcCh = totalCh-1;
+          if (rsChForced) {
+            rsCh = rsChForced;
+            if (rsCh < 1) rsCh = 1;
+            if (rsCh > totalCh-1) rsCh = totalCh-1;
           }
 
-          int arCh = totalCh - bcCh;
+          int arCh = totalCh - rsCh;
 
           if (comm->rank == 0) {
             INFO(NCCL_INIT,
-                "R2CC_FIXED_CHANNEL_SPLIT: origCh=%d totalCh=%d removedCh=%d arCh=%d bcCh=%d (forced=%d) wAR=%zu wBC=%zu",
-                origCh, totalCh, removedCh, arCh, bcCh, bcChForced, wAR, wBC);
+                "R2CC_FIXED_CHANNEL_SPLIT: origCh=%d totalCh=%d removedCh=%d arCh=%d rsCh=%d (forced=%d) wAR=%zu wRS=%zu",
+                origCh, totalCh, removedCh, arCh, rsCh, rsChForced, wAR, wRS);
           }
 
 
@@ -1045,8 +1046,8 @@ static ncclResult_t scheduleCollTasksToPlan(
           for (int i = 0; i < 2; i++) {
             struct ncclTaskColl* task = ncclIntruQueueHead(&planner->collTaskQueue);
             struct ncclWorkList* workNode = ncclIntruQueueHead(&planner->collWorkQueue);
-            int base = (task->func == ncclFuncBroadcast) ? arCh : 0;
-            int nav  = (task->func == ncclFuncBroadcast) ? bcCh : arCh;
+            int base = (task->func == ncclFuncReduceScatter) ? arCh : 0;
+            int nav  = (task->func == ncclFuncReduceScatter) ? rsCh : arCh;
             NCCLCHECK(scheduleOneFixed(task, workNode, base, nav));
           }
 
@@ -2362,11 +2363,8 @@ static ncclResult_t updateCollCostTable(
     if (a == NCCL_ALGO_PAT && info->func == ncclFuncReduceScatter
         && (info->opDev.op == ncclDevPreMulSum || info->opDev.op == ncclDevSumPostDiv)) continue;
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
-      // R-2CCL: hide Simple from broadcast tuner inside split-collective path.
-      if (r2ccBcastNoSimple && info->func == ncclFuncBroadcast
-          && p == NCCL_PROTO_SIMPLE) {
-        continue;
-      }
+      if (r2ccRsNoSimple && info->func == ncclFuncReduceScatter
+          && p == NCCL_PROTO_SIMPLE) continue;
       bool backup;
       float time;
       NCCLCHECK(ncclTopoGetAlgoTime(comm, info->func, a, p, nBytes, numPipeOps, &time, &backup));

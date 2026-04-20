@@ -15,11 +15,9 @@
 #include <chrono>
 #include <cstdlib>
 
-// R-2CCL: when set to 1, the NCCL tuner in enqueue.cc hides Simple from
-// Broadcast's protocol choices, so it picks LL or LL128 instead. Used to
-// avoid NCCL's premature Simple pick for broadcast at ~32 MiB - 1 GiB,
-// which costs ~2x bandwidth in the MODE=3/5 split-collective path.
-int r2ccBcastNoSimple = 0;
+// R-2CCL: when set to 1 around the split-collective phase-2 ReduceScatter,
+// the NCCL tuner in enqueue.cc hides SIMPLE from its protocol choices.
+int r2ccRsNoSimple = 0;
 
 const char* ncclFuncToString(ncclFunc_t fn) {
   switch (fn) {
@@ -209,28 +207,36 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
 
       size_t mainCount = originalCount * (nNetDevs - failure_num) / nNetDevs;
       size_t subCount = originalCount - mainCount;
+      // ReduceScatter consumes nRanks * recvcount input elements, so keep the
+      // phase-2 slice aligned and absorb any remainder into phase 1.
+      size_t rsRecvCount = subCount / comm->nRanks;
+      subCount = rsRecvCount * comm->nRanks;
+      mainCount = originalCount - subCount;
+      const char* rsNoSimpleEnv = getenv("R2CC_RS_NO_SIMPLE");
+      int rsNoSimpleEnabled = (rsNoSimpleEnv && atoi(rsNoSimpleEnv) != 0) ? 1 : 0;
       
       // MODE=3: Both phases
       // MODE=4: Only Phase 1 (AllReduce)
-      // MODE=5: Only Phase 2 (Broadcast)
+      // MODE=5: Only Phase 2 (ReduceScatter)
       if(mode == 3 and parallel){
         NCCLCHECK(ncclGroupStart());
         struct ncclInfo info1 = { ncclFuncAllReduce, "AllReduce",
           sendbuff, recvbuff, mainCount, datatype, op, 0, comm, stream, /* Args */
           ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
         NCCLCHECK(ncclEnqueueCheck(&info1));
-        // Calculate offset for remaining data
-        size_t offset = mainCount * elementSize;
-        const void* bcastSendbuff = (const char*)sendbuff + offset;
-        void* bcastRecvbuff = (char*)recvbuff + offset;
-        
-        struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
-          bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
-          BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
-        r2ccBcastNoSimple = 1;
-        NCCLCHECK(ncclEnqueueCheck(&info2));
-        NCCLCHECK(ncclGroupEnd());    // tuner fires here; flag must still be set
-        r2ccBcastNoSimple = 0;
+        if (rsRecvCount != 0) {
+          size_t offset = mainCount * elementSize;
+          const void* rsSendbuff = (const char*)sendbuff + offset;
+          void* rsRecvbuff = (char*)recvbuff + offset + comm->rank * rsRecvCount * elementSize;
+
+          struct ncclInfo info2 = { ncclFuncReduceScatter, "ReduceScatter",
+            rsSendbuff, rsRecvbuff, rsRecvCount, datatype, op, 0, comm, stream, /* Args */
+            REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS };
+          if (rsNoSimpleEnabled) r2ccRsNoSimple = 1;
+          NCCLCHECK(ncclEnqueueCheck(&info2));
+        }
+        NCCLCHECK(ncclGroupEnd());
+        r2ccRsNoSimple = 0;
       }
       else if(mode == 3 and !parallel){
 	      NCCLCHECK(ncclGroupStart());
@@ -242,18 +248,19 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
 
 
 	      NCCLCHECK(ncclGroupStart());
-        // Calculate offset for remaining data
-        size_t offset = mainCount * elementSize;
-        const void* bcastSendbuff = (const char*)sendbuff + offset;
-        void* bcastRecvbuff = (char*)recvbuff + offset;
+        if (rsRecvCount != 0) {
+          size_t offset = mainCount * elementSize;
+          const void* rsSendbuff = (const char*)sendbuff + offset;
+          void* rsRecvbuff = (char*)recvbuff + offset + comm->rank * rsRecvCount * elementSize;
 
-        struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
-          bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
-          BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
-        r2ccBcastNoSimple = 1;
-        NCCLCHECK(ncclEnqueueCheck(&info2));
-        NCCLCHECK(ncclGroupEnd());    // tuner fires here; flag must still be set
-        r2ccBcastNoSimple = 0;
+          struct ncclInfo info2 = { ncclFuncReduceScatter, "ReduceScatter",
+            rsSendbuff, rsRecvbuff, rsRecvCount, datatype, op, 0, comm, stream, /* Args */
+            REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS };
+          if (rsNoSimpleEnabled) r2ccRsNoSimple = 1;
+          NCCLCHECK(ncclEnqueueCheck(&info2));
+        }
+        NCCLCHECK(ncclGroupEnd());
+        r2ccRsNoSimple = 0;
 
       }
       else if(mode == 4){
@@ -265,20 +272,21 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
         NCCLCHECK(ncclEnqueueCheck(&info1));
         NCCLCHECK(ncclGroupEnd());
       }else if(mode == 5){
-        // Phase 2: Broadcast remaining data from "failed" node
+        // Phase 2: ReduceScatter on the remaining data
         NCCLCHECK(ncclGroupStart());
-        // Calculate offset for remaining data
-        size_t offset = mainCount * elementSize;
-        const void* bcastSendbuff = (const char*)sendbuff + offset;
-        void* bcastRecvbuff = (char*)recvbuff + offset;
-        
-        struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
-          bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
-          BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
-        r2ccBcastNoSimple = 1;
-        NCCLCHECK(ncclEnqueueCheck(&info2));
-        NCCLCHECK(ncclGroupEnd());    // tuner fires here; flag must still be set
-        r2ccBcastNoSimple = 0;
+        if (rsRecvCount != 0) {
+          size_t offset = mainCount * elementSize;
+          const void* rsSendbuff = (const char*)sendbuff + offset;
+          void* rsRecvbuff = (char*)recvbuff + offset + comm->rank * rsRecvCount * elementSize;
+
+          struct ncclInfo info2 = { ncclFuncReduceScatter, "ReduceScatter",
+            rsSendbuff, rsRecvbuff, rsRecvCount, datatype, op, 0, comm, stream, /* Args */
+            REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS };
+          if (rsNoSimpleEnabled) r2ccRsNoSimple = 1;
+          NCCLCHECK(ncclEnqueueCheck(&info2));
+        }
+        NCCLCHECK(ncclGroupEnd());
+        r2ccRsNoSimple = 0;
       }
     }
   }else{
