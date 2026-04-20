@@ -26,6 +26,18 @@ NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
 // to hide Simple from the broadcast tuner.
 extern int r2ccBcastNoSimple;
 
+// R-2CCL: runtime per-call floor for P2P nChannels[dir]. Honors the original
+// P2P_MIN_CHANNELS_PER_PEER env name (paths.cc applies it as a pool-size
+// floor at init; this enforces it on each P2P call too). Cached once.
+// <= 0 means "no runtime floor" (vanilla behavior).
+static int r2ccP2pMinChannelsPerPeer() {
+  static int cached = [] {
+    const char* e = getenv("NCCL_P2P_MIN_CHANNELS_PER_PEER");
+    return e ? atoi(e) : -1;
+  }();
+  return cached;
+}
+
 // Returns maximum kernel stack size of all CUDA kernels
 ncclResult_t ncclInitKernelsForDevice(int cudaArch, size_t* maxStackSize) {
   ncclResult_t result = ncclSuccess;
@@ -1444,6 +1456,14 @@ static ncclResult_t addP2pToPlan(
       ssize_t minPartSize = comm->nNodes > 1 ? stepSize[dir]/2 : stepSize[dir]/8;
       ssize_t maxPartSize = comm->nNodes > 1 ? stepSize[dir]   : stepSize[dir]*32;
       nChannels[dir] = std::min<int>(nChannelsMin, divUp(bytes[dir], minPartSize));
+      // R-2CCL: enforce NCCL_P2P_MIN_CHANNELS_PER_PEER as a true runtime floor
+      // on each P2P call (not just a pool-size floor at init). Clamp to the
+      // allocated per-peer pool so we never exceed what the communicator has.
+      int p2pMinCh = r2ccP2pMinChannelsPerPeer();
+      if (p2pMinCh > 0) {
+        nChannels[dir] = std::max(nChannels[dir], p2pMinCh);
+        nChannels[dir] = std::min(nChannels[dir], (int)comm->p2pnChannelsPerPeer);
+      }
       size_t partSize = std::max(minPartSize, divUp(bytes[dir], nChannels[dir]));
       while (partSize > maxPartSize && nChannels[dir] <= nChannelsMax/2) {
         nChannels[dir] *= 2;
@@ -1502,8 +1522,10 @@ static ncclResult_t addP2pToPlan(
 
         if (localIs45 || peerIs45 || localIsC2 || peerIsC2) {
           int originalChannels = nChannels[dir];
-          int targetChannels = originalChannels;
-          if (originalChannels > 2) targetChannels = originalChannels - 2*(1+effectiveFailure2);
+          int reduction = 2*(1+effectiveFailure2);
+          // Guard: ensure at least 1 channel remains after reduction.
+          int targetChannels = originalChannels - reduction;
+          if (targetChannels < 1) targetChannels = 1;
           nChannels[dir] = targetChannels;
 
           WARN("P2P Test Mode: Failure Detected (Local=%s, Peer=%s, failure2=%d). Reduced nChannels[%d] from %d to %d",

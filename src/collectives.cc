@@ -21,6 +21,29 @@
 // which costs ~2x bandwidth in the MODE=3/5 split-collective path.
 int r2ccBcastNoSimple = 0;
 
+// Env-cached toggle. R2CC_BCAST_NO_SIMPLE=0 lets Simple back into the
+// bcast tuner; unset or =1 keeps the default (hide Simple).
+static bool r2ccBcastNoSimpleEnabled() {
+  static bool cached = [] {
+    const char* e = getenv("R2CC_BCAST_NO_SIMPLE");
+    return e ? atoi(e) != 0 : true;
+  }();
+  return cached;
+}
+
+// Minimum bcast size (bytes) at which Simple is allowed into the bcast
+// tuner. Below this size, Simple is hidden (LL128 chosen). 0 means
+// "never allowed" - matches current post-patch behavior.
+// Recommended: 2 GiB (2147483648). LL128 wins up to 1 GiB; Simple wins
+// at >= 2 GiB in our measurements.
+static size_t r2ccBcastSimpleMinBytes() {
+  static size_t cached = [] {
+    const char* e = getenv("R2CC_BCAST_SIMPLE_MIN_BYTES");
+    return e ? (size_t)strtoull(e, nullptr, 10) : (size_t)0;
+  }();
+  return cached;
+}
+
 const char* ncclFuncToString(ncclFunc_t fn) {
   switch (fn) {
   case ncclFuncAllGather: return "AllGather";
@@ -227,7 +250,12 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
         struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
           bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
           BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
-        r2ccBcastNoSimple = 1;
+        {
+          size_t bcastBytes = (size_t)subCount * elementSize;
+          size_t simpleMin = r2ccBcastSimpleMinBytes();
+          bool hideSimple = r2ccBcastNoSimpleEnabled() && (simpleMin == 0 || bcastBytes < simpleMin);
+          r2ccBcastNoSimple = hideSimple ? 1 : 0;
+        }
         NCCLCHECK(ncclEnqueueCheck(&info2));
         NCCLCHECK(ncclGroupEnd());    // tuner fires here; flag must still be set
         r2ccBcastNoSimple = 0;
@@ -250,7 +278,12 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
         struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
           bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
           BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
-        r2ccBcastNoSimple = 1;
+        {
+          size_t bcastBytes = (size_t)subCount * elementSize;
+          size_t simpleMin = r2ccBcastSimpleMinBytes();
+          bool hideSimple = r2ccBcastNoSimpleEnabled() && (simpleMin == 0 || bcastBytes < simpleMin);
+          r2ccBcastNoSimple = hideSimple ? 1 : 0;
+        }
         NCCLCHECK(ncclEnqueueCheck(&info2));
         NCCLCHECK(ncclGroupEnd());    // tuner fires here; flag must still be set
         r2ccBcastNoSimple = 0;
@@ -275,7 +308,12 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
         struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
           bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
           BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
-        r2ccBcastNoSimple = 1;
+        {
+          size_t bcastBytes = (size_t)subCount * elementSize;
+          size_t simpleMin = r2ccBcastSimpleMinBytes();
+          bool hideSimple = r2ccBcastNoSimpleEnabled() && (simpleMin == 0 || bcastBytes < simpleMin);
+          r2ccBcastNoSimple = hideSimple ? 1 : 0;
+        }
         NCCLCHECK(ncclEnqueueCheck(&info2));
         NCCLCHECK(ncclGroupEnd());    // tuner fires here; flag must still be set
         r2ccBcastNoSimple = 0;
