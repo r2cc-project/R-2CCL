@@ -203,6 +203,7 @@ struct ncclNetSocketComm {
   int nSocks;
   int nThreads;
   int nextSock;
+  int failed;
   struct ncclNetSocketRequest requests[MAX_REQUESTS];
   pthread_t helperThread[MAX_THREADS];
   struct ncclNetSocketThreadResources threadResources[MAX_THREADS];
@@ -225,6 +226,7 @@ void* persistentSocketThread(void *args_) {
           if (r != NULL && r->used == 1 && r->offset < r->size) {
             r->result = ncclSocketProgress(r->op, r->sock, r->data, r->size, &r->offset);
             if (r->result != ncclSuccess) {
+              __atomic_store_n(&comm->failed, 1, __ATOMIC_RELAXED);
               WARN("NET/Socket : socket progress error");
               return NULL;
             }
@@ -492,10 +494,22 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     WARN("NET/Socket : test called with NULL request");
     return ncclInternalError;
   }
+  // Check socket failure flag
+  if (r->comm && __atomic_load_n(&r->comm->failed, __ATOMIC_RELAXED)) {
+    *done = -1;
+    return ncclSuccess;
+  }
   if (r->used == 1) { /* try to send/recv size */
     int data = r->size;
     int offset = 0;
-    NCCLCHECK(ncclSocketProgress(r->op, r->ctrlSock, &data, sizeof(int), &offset));
+    ncclResult_t ret = ncclSocketProgress(r->op, r->ctrlSock, &data, sizeof(int), &offset);
+
+    if (ret != ncclSuccess) {
+      if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
+      WARN("NET/Socket : ctrl socket failure");
+      *done = -1;
+      return ncclSuccess;
+    }
 
     if (offset == 0) return ncclSuccess; /* Not ready -- retry later */
 
@@ -533,7 +547,12 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
       int nCompleted = 0;
       for (int i=0; i<r->nSubs; i++) {
         struct ncclNetSocketTask* sub = r->tasks[i];
-        if (sub->result != ncclSuccess) return sub->result;
+        if (sub->result != ncclSuccess) {
+          if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
+          WARN("NET/Socket: subtask failure");
+          *done = -1;
+          return ncclSuccess;
+        }
         if (sub->offset == sub->size) nCompleted++;
       }
       if (nCompleted == r->nSubs) {
@@ -547,7 +566,13 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
       }
     } else { // progress request using main thread
       if (r->offset < r->size) {
-        NCCLCHECK(ncclSocketProgress(r->op, r->ctrlSock, r->data, r->size, &r->offset));
+        ncclResult_t ret = ncclSocketProgress(r->op, r->ctrlSock, r->data, r->size, &r->offset);
+        if (ret != ncclSuccess) {
+          if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
+          WARN("NET/Socket: ctrl socket failure");
+          *done = -1;
+          return ncclSuccess;
+        }
       }
       if (r->offset == r->size) {
         if (size) *size = r->size;
