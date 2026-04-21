@@ -863,38 +863,116 @@ fail:
 
 NCCL_PARAM(P2pCrossNuma, "P2P_CROSS_NUMA", 0);
 
-static bool r2ccEnvEnabled(const char* name) {
+
+static bool r2ccFailedNetDevsExplicitTopo() {
+  const char* list = getenv("R2CC_P2P_FAILED_NETDEVS");
+  const char* dev1 = getenv("R2CC_P2P_FAILED_NETDEV");
+  return (list && list[0] != '\0') || (dev1 && dev1[0] != '\0');
+}
+
+static bool r2ccEnvEnabledTopo(const char* name) {
   const char* v = getenv(name);
   return v && atoi(v) != 0;
 }
 
-static bool r2ccFailure2SameServerEnabled() {
+static bool r2ccFailure2SameServerEnabledTopo() {
   const char* v = getenv("FAILURE2_SAME_SERVER");
   return v && atoi(v) == 1;
 }
 
-static bool r2ccGpuBusIdAffected(const char* busId) {
-  if (busId == NULL || busId[0] == '\0') return false;
+static int r2ccAddFailedNetDevTopo(int* failed, int count, int maxCount, int dev) {
+  if (dev < 0 || count >= maxCount) return count;
+  for (int i = 0; i < count; i++) if (failed[i] == dev) return count;
+  failed[count++] = dev;
+  return count;
+}
 
-  const char* target = getenv("GPUBUSID");
-  if (target && target[0] != '\0' &&
-      strncmp(busId, target, strlen(target)) == 0) {
-    return true;
+static int r2ccGetFailedNetDevsTopo(int* failed, int maxCount) {
+  int count = 0;
+  const char* list = getenv("R2CC_P2P_FAILED_NETDEVS");
+  if (list && list[0] != '\0') {
+    const char* p = list;
+    while (*p != '\0') {
+      while (*p == ',' || *p == ';' || *p == ':' || *p == ' ') p++;
+      if (*p == '\0') break;
+      char* end = NULL;
+      long dev = strtol(p, &end, 0);
+      if (end == p) break;
+      count = r2ccAddFailedNetDevTopo(failed, count, maxCount, (int)dev);
+      p = end;
+    }
+    return count;
   }
 
-  if (r2ccFailure2SameServerEnabled() &&
-      strncmp(busId, "0000:45:00.0", strlen("0000:45:00.0")) == 0) {
-    return true;
+  const char* dev1 = getenv("R2CC_P2P_FAILED_NETDEV");
+  if (dev1 && dev1[0] != '\0') {
+    count = r2ccAddFailedNetDevTopo(failed, count, maxCount, atoi(dev1));
+    const char* dev2 = getenv("R2CC_P2P_FAILED_NETDEV2");
+    if (dev2 && dev2[0] != '\0') count = r2ccAddFailedNetDevTopo(failed, count, maxCount, atoi(dev2));
+    return count;
   }
 
+  // Backward-compatible defaults for the existing wrapper.
+  count = r2ccAddFailedNetDevTopo(failed, count, maxCount, 7);
+  if (r2ccFailure2SameServerEnabledTopo()) count = r2ccAddFailedNetDevTopo(failed, count, maxCount, 3);
+  return count;
+}
+
+static bool r2ccNetDevFailedTopo(int netDev, const int* failed, int failedCount) {
+  for (int i = 0; i < failedCount; i++) if (failed[i] == netDev) return true;
   return false;
 }
 
-static bool r2ccGpuIndexAffected(struct ncclTopoSystem* system, int gpuIndex) {
-  if (system == NULL || gpuIndex < 0 || gpuIndex >= system->nodes[GPU].count) return false;
-  char busId[20];
-  int64ToBusId(system->nodes[GPU].nodes[gpuIndex].id, busId);
-  return r2ccGpuBusIdAffected(busId);
+static bool r2ccBusIdAffectedTopo(const char* busId) {
+  if (busId == NULL || busId[0] == '\0') return false;
+
+  const char* target = getenv("GPUBUSID");
+  if (target && target[0] != '\0' && strncmp(busId, target, strlen(target)) == 0) return true;
+
+  if (r2ccFailure2SameServerEnabledTopo() &&
+      strncmp(busId, "0000:45:00.0", strlen("0000:45:00.0")) == 0) {
+    return true;
+  }
+  return false;
+}
+
+static bool r2ccGpuOriginalLocalNetDevAffectedTopo(struct ncclTopoSystem* system, int gpu) {
+  int failed[8];
+  int failedCount = r2ccGetFailedNetDevsTopo(failed, 8);
+  if (failedCount <= 0 || system == NULL || gpu < 0) return false;
+
+  struct ncclTopoLinkList* paths = system->nodes[GPU].nodes[gpu].paths[NET];
+  if (paths == NULL) return false;
+
+  int minType = PATH_DIS;
+  float maxBw = 0.0f;
+  for (int i = 0; i < system->nodes[NET].count; i++) {
+    if (paths[i].bw > maxBw || (paths[i].bw == maxBw && paths[i].type < minType)) {
+      maxBw = paths[i].bw;
+      minType = paths[i].type;
+    }
+  }
+  if (maxBw <= 0) return false;
+
+  for (int i = 0; i < system->nodes[NET].count; i++) {
+    if (paths[i].bw == maxBw && paths[i].type == minType) {
+      int dev = system->nodes[NET].nodes[i].net.dev;
+      if (r2ccNetDevFailedTopo(dev, failed, failedCount)) return true;
+    }
+  }
+  return false;
+}
+
+static bool r2ccGpuIndexAffectedTopo(struct ncclTopoSystem* system, int gpu) {
+  if (r2ccGpuOriginalLocalNetDevAffectedTopo(system, gpu)) return true;
+
+  // Backward-compatible fallback for the old GPUBUSID-based wrapper.
+  // If failed netDevs were explicitly specified, do not also mark GPUBUSID GPUs.
+  if (r2ccFailedNetDevsExplicitTopo()) return false;
+
+  char currentBusId[20];
+  int64ToBusId(system->nodes[GPU].nodes[gpu].id, currentBusId);
+  return r2ccBusIdAffectedTopo(currentBusId);
 }
 
 ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, int index, int resultType, int** locals, int* localCount, int* pathType) {
@@ -904,25 +982,21 @@ ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, int index
   NCCLCHECK(ncclCalloc(locals, system->nodes[resultType].count));
   struct ncclTopoLinkList* paths = system->nodes[type].nodes[index].paths[resultType];
   if (paths == NULL) { *localCount = 0; return ncclSuccess; }
-  
-  // R2CC all-NIC policy is deliberately targeted.
-  // - R2CC_USE_ALL_NIC=1 remains the explicit global all-NIC override.
-  // - R2CC_P2P_TEST_MODE=1 exposes all local NICs only for affected GPUs
-  //   (GPUBUSID and, in mode3, the second same-server failure GPU).
-  bool useAllNic = r2ccEnvEnabled("R2CC_USE_ALL_NIC");
-  bool p2pTestMode = r2ccEnvEnabled("R2CC_P2P_TEST_MODE");
-  bool affectedGpu = (type == GPU) ? r2ccGpuIndexAffected(system, index) : false;
+
+  bool useAllNic = r2ccEnvEnabledTopo("R2CC_USE_ALL_NIC");
+  bool p2pTestMode = r2ccEnvEnabledTopo("R2CC_P2P_TEST_MODE");
+  bool affectedGpu = (type == GPU) ? r2ccGpuIndexAffectedTopo(system, index) : false;
 
   if (type == GPU && resultType == NET && (useAllNic || (p2pTestMode && affectedGpu))) {
-    for (int i=0; i<system->nodes[resultType].count; i++) {
+    for (int i = 0; i < system->nodes[resultType].count; i++) {
       if (paths[i].bw > 0) (*locals)[count++] = i;
     }
     *localCount = count;
     return ncclSuccess;
   }
 
-  // Original logic: only return NICs with highest bandwidth
-  for (int i=0; i<system->nodes[resultType].count; i++) {
+  // Original logic: only return NICs with highest bandwidth / closest path type.
+  for (int i = 0; i < system->nodes[resultType].count; i++) {
     if (paths[i].bw > maxBw || (paths[i].bw == maxBw && paths[i].type < minType)) {
       maxBw = paths[i].bw;
       minType = paths[i].type;
@@ -963,43 +1037,39 @@ ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int ch
   ncclResult_t ret = ncclSuccess;
   int gpu;
   NCCLCHECK(ncclTopoRankToIndex(system, rank, &gpu));
-  int* localNets;
-  int localNetCount;
+  int* localNets = NULL;
+  int localNetCount = 0;
   NCCLCHECK(ncclTopoGetLocal(system, GPU, gpu, NET, &localNets, &localNetCount, NULL));
   int* localGpus = NULL;
-  int localGpuCount;
+  int localGpuCount = 0;
   int net;
-  bool useAllNic = r2ccEnvEnabled("R2CC_USE_ALL_NIC");
-  bool p2pTestMode = r2ccEnvEnabled("R2CC_P2P_TEST_MODE");
-  bool affectedGpu = r2ccGpuIndexAffected(system, gpu);
+
+  bool useAllNic = r2ccEnvEnabledTopo("R2CC_USE_ALL_NIC");
+  bool p2pTestMode = r2ccEnvEnabledTopo("R2CC_P2P_TEST_MODE");
+  bool affectedGpu = r2ccGpuIndexAffectedTopo(system, gpu);
 
   if (localNetCount <= 0) { ret = ncclInternalError; goto fail; }
   NCCLCHECKGOTO(ncclTopoGetLocal(system, NET, localNets[0], GPU, &localGpus, &localGpuCount, NULL), ret, fail);
   if (localGpuCount <= 0) { ret = ncclInternalError; goto fail; }
 
   if (useAllNic || (p2pTestMode && affectedGpu)) {
-    // In targeted P2P scatter mode, only affected GPUs use the stable
-    // channelId -> NIC mapping. Non-affected GPUs keep NCCL's default
-    // nearest/default-NIC mapping.
+    // In failed-netDev P2P scatter mode, only GPUs whose original local/default
+    // NIC set intersects a failed physical NIC use the stable channelId -> NIC
+    // mapping. Other GPUs keep NCCL's default nearest/default NIC mapping.
     net = channelId % localNetCount;
   } else {
     net = system->nodes[GPU].nodes[gpu].gpu.dev;
     if (isPow2(localNetCount)) net = mirrorBits(net, localNetCount);
-    net += channelId%(DIVUP(localNetCount,localGpuCount));
+    net += channelId % (DIVUP(localNetCount, localGpuCount));
   }
 
   {
-    int selectedNetIndex = localNets[net%localNetCount];
-    // INFO(NCCL_INIT, "ncclTopoGetLocalNet: after calc net=%d, net%%localNetCount=%d, selectedNetIndex=%d, id=%lx, dev=%d", 
-    //      net, net%localNetCount, selectedNetIndex,
-    //      system->nodes[NET].nodes[selectedNetIndex].id, 
-    //      system->nodes[NET].nodes[selectedNetIndex].net.dev);
-    
+    int selectedNetIndex = localNets[net % localNetCount];
     if (id) *id = system->nodes[NET].nodes[selectedNetIndex].id;
     if (dev) *dev = system->nodes[NET].nodes[selectedNetIndex].net.dev;
   }
 exit:
-  free(localNets);
+  if (localNets) free(localNets);
   if (localGpus) free(localGpus);
   return ret;
 fail:

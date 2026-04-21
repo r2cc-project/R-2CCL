@@ -1343,6 +1343,146 @@ static bool r2ccFailure2SameServerEnabled() {
   return v && atoi(v) == 1;
 }
 
+
+static bool r2ccFailedNetDevsExplicit() {
+  const char* list = getenv("R2CC_P2P_FAILED_NETDEVS");
+  const char* dev1 = getenv("R2CC_P2P_FAILED_NETDEV");
+  return (list && list[0] != '\0') || (dev1 && dev1[0] != '\0');
+}
+
+static int r2ccAddFailedNetDev(int* failed, int count, int maxCount, int dev) {
+  if (dev < 0 || count >= maxCount) return count;
+  for (int i = 0; i < count; i++) if (failed[i] == dev) return count;
+  failed[count++] = dev;
+  return count;
+}
+
+static int r2ccGetFailedNetDevs(int* failed, int maxCount) {
+  int count = 0;
+
+  // Preferred explicit NIC-failure interface. Examples:
+  //   R2CC_P2P_FAILED_NETDEVS=3,7
+  //   R2CC_P2P_FAILED_NETDEV=7 R2CC_P2P_FAILED_NETDEV2=3
+  const char* list = getenv("R2CC_P2P_FAILED_NETDEVS");
+  if (list && list[0] != '\0') {
+    const char* p = list;
+    while (*p != '\0') {
+      while (*p == ',' || *p == ';' || *p == ':' || *p == ' ') p++;
+      if (*p == '\0') break;
+      char* end = NULL;
+      long dev = strtol(p, &end, 0);
+      if (end == p) break;
+      count = r2ccAddFailedNetDev(failed, count, maxCount, (int)dev);
+      p = end;
+    }
+    return count;
+  }
+
+  const char* dev1 = getenv("R2CC_P2P_FAILED_NETDEV");
+  if (dev1 && dev1[0] != '\0') {
+    count = r2ccAddFailedNetDev(failed, count, maxCount, atoi(dev1));
+    const char* dev2 = getenv("R2CC_P2P_FAILED_NETDEV2");
+    if (dev2 && dev2[0] != '\0') count = r2ccAddFailedNetDev(failed, count, maxCount, atoi(dev2));
+    return count;
+  }
+
+  // Backward-compatible defaults for the existing wrapper:
+  // FAIL_MODE=2: GPUBUSID=c2 -> failed netDev 7.
+  // FAIL_MODE=3: plus FAILURE2_SAME_SERVER=1 -> failed netDev 3 and 7.
+  count = r2ccAddFailedNetDev(failed, count, maxCount, 7);
+  if (r2ccFailure2SameServerEnabled()) count = r2ccAddFailedNetDev(failed, count, maxCount, 3);
+  return count;
+}
+
+static bool r2ccNetDevFailed(int netDev, const int* failed, int failedCount) {
+  for (int i = 0; i < failedCount; i++) if (failed[i] == netDev) return true;
+  return false;
+}
+
+static bool r2ccRankLocalNetDevAffected(struct ncclComm* comm, int rank) {
+  if (comm == NULL || comm->topo == NULL || rank < 0 || rank >= comm->nRanks) return false;
+
+  int failed[8];
+  int failedCount = r2ccGetFailedNetDevs(failed, 8);
+  if (failedCount <= 0) return false;
+
+  int gpu = -1;
+  if (ncclTopoRankToIndex(comm->topo, rank, &gpu) != ncclSuccess || gpu < 0) return false;
+
+  struct ncclTopoLinkList* paths = comm->topo->nodes[GPU].nodes[gpu].paths[NET];
+  if (paths == NULL) return false;
+
+  // Recompute the original ncclTopoGetLocal(GPU, NET) choice without applying
+  // R2CC_P2P_TEST_MODE. This identifies GPUs whose nearest/default NIC set
+  // intersects the failed physical NIC set.
+  int minType = PATH_DIS;
+  float maxBw = 0.0f;
+  int netCount = comm->topo->nodes[NET].count;
+  for (int i = 0; i < netCount; i++) {
+    if (paths[i].bw > maxBw || (paths[i].bw == maxBw && paths[i].type < minType)) {
+      maxBw = paths[i].bw;
+      minType = paths[i].type;
+    }
+  }
+  if (maxBw <= 0) return false;
+
+  for (int i = 0; i < netCount; i++) {
+    if (paths[i].bw == maxBw && paths[i].type == minType) {
+      int dev = comm->topo->nodes[NET].nodes[i].net.dev;
+      if (r2ccNetDevFailed(dev, failed, failedCount)) return true;
+    }
+  }
+  return false;
+}
+
+static bool r2ccPartSuffixDropsFailedNetDevs(int p2pnChannels, int localNetCount, uint8_t base,
+                                             const int* failed, int failedCount) {
+  if (failedCount <= 0 || localNetCount <= 0 || p2pnChannels <= 0) return false;
+  int targetChannels = p2pnChannels - 2 * failedCount;
+  if (targetChannels < 0) return false;
+
+  int hits[8] = {0};
+  for (int part = targetChannels; part < p2pnChannels; part++) {
+    int channelId = ncclP2pChannelForPart(p2pnChannels, base, part);
+    int netDev = channelId % localNetCount;
+    bool found = false;
+    for (int i = 0; i < failedCount; i++) {
+      if (failed[i] == netDev) {
+        hits[i]++;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return false;
+  }
+
+  // With 2*localNetCount logical channels, each netDev owns two parts.
+  for (int i = 0; i < failedCount; i++) if (hits[i] != 2) return false;
+  return true;
+}
+
+static bool r2ccFindBaseForFailedNetDevs(int p2pnChannels, int localNetCount,
+                                         const int* failed, int failedCount, uint8_t* baseOut) {
+  if (baseOut) *baseOut = 0;
+  if (failedCount <= 0) return false;
+  if (p2pnChannels != 2 * localNetCount) return false;
+  for (int b = 0; b < localNetCount; b++) {
+    if (r2ccPartSuffixDropsFailedNetDevs(p2pnChannels, localNetCount, (uint8_t)b, failed, failedCount)) {
+      if (baseOut) *baseOut = (uint8_t)b;
+      return true;
+    }
+  }
+  return false;
+}
+
+static size_t r2ccP2pReduceMinBytes() {
+  static size_t cached = [] {
+    const char* e = getenv("R2CC_P2P_REDUCE_MIN_BYTES");
+    return (e && e[0] != '\0') ? (size_t)strtoull(e, NULL, 0) : (size_t)(1 << 20);
+  }();
+  return cached;
+}
+
 static bool r2ccBusIdAffected(const char* busId) {
   if (busId == NULL || busId[0] == '\0') return false;
 
@@ -1362,6 +1502,16 @@ static bool r2ccBusIdAffected(const char* busId) {
 
 static bool r2ccRankAffected(struct ncclComm* comm, int rank) {
   if (comm == NULL || rank < 0) return false;
+
+  // New model: specify failed physical NICs/netDevs, then mark any GPU whose
+  // original local/default NIC set contains one of those failed netDevs.
+  if (r2ccRankLocalNetDevAffected(comm, rank)) return true;
+
+  // Backward-compatible busId fallback for the old wrapper semantics.
+  // If the user explicitly specified failed netDevs, do not also mark the old
+  // GPUBUSID GPUs as affected.
+  if (r2ccFailedNetDevsExplicit()) return false;
+
   char busId[20];
   if (rank == comm->rank) {
     int64ToBusId(comm->busId, busId);
@@ -1411,9 +1561,21 @@ static ncclResult_t addP2pToPlan(
   int mode = r2ccMode ? atoi(r2ccMode) : 0;
   bool useTestChannels = r2ccEnvEnabled("R2CC_P2P_TEST_MODE");
   int failure2 = r2ccFailure2SameServerEnabled() ? 1 : 0;
-  bool affectedEdge = useTestChannels && r2ccP2pEdgeAffected(comm, sendRank, recvRank);
+  int failedNetDevs[8];
+  int failedNetDevCount = r2ccGetFailedNetDevs(failedNetDevs, 8);
+  int localNetCountForR2cc = comm->p2pnChannels > 0 ? comm->p2pnChannels / 2 : 0;
+  uint8_t r2ccBase = 0;
+  bool failedSetRepresentable = r2ccFindBaseForFailedNetDevs(
+      comm->p2pnChannels, localNetCountForR2cc, failedNetDevs, failedNetDevCount, &r2ccBase);
+  bool affectedEdge = useTestChannels && failedNetDevCount > 0 && r2ccP2pEdgeAffected(comm, sendRank, recvRank);
 
-  uint8_t base = affectedEdge ? 0 : ncclP2pChannelBaseForRound(comm, p2pRound);
+  uint8_t base = affectedEdge ? r2ccBase : ncclP2pChannelBaseForRound(comm, p2pRound);
+  if (affectedEdge && !failedSetRepresentable) {
+    WARN("P2P Test Mode: failed netDev set cannot be represented by prefix channelBase+nChannels "
+         "with p2pnChannels=%d localNetCount=%d failedCount=%d; need sparse channel mask for this failure set",
+         comm->p2pnChannels, localNetCountForR2cc, failedNetDevCount);
+    return ncclInternalError;
+  }
   if (affectedEdge && nChannelsMax != comm->p2pnChannels) {
     WARN("P2P Test Mode: affected edge forcing nChannelsMax from %d to %d before scheduling",
          nChannelsMax, comm->p2pnChannels);
@@ -1423,8 +1585,9 @@ static ncclResult_t addP2pToPlan(
   char currentBusId[20];
   int64ToBusId(comm->busId, currentBusId);
   if (affectedEdge) {
-    WARN("P2P Test Mode: Enabled for affected edge, R2CC_MODE=%d, base=0, p2pnChannels=%d",
-         mode, comm->p2pnChannels);
+    WARN("P2P Test Mode: Enabled for failed-netDev affected edge, R2CC_MODE=%d, base=%d, p2pnChannels=%d, failedNetDevs=%d%s%d",
+         mode, base, comm->p2pnChannels, failedNetDevs[0],
+         failedNetDevCount > 1 ? "," : "", failedNetDevCount > 1 ? failedNetDevs[1] : -1);
   } else {
     WARN("P2P Channel Selection: p2pRound=%d, base=%d, p2pnChannels=%d, nNodes=%d, maxLocalRanks=%d, sendRank=%d, recvRank=%d", 
          p2pRound, base, comm->p2pnChannels, comm->nNodes, comm->maxLocalRanks, sendRank, recvRank);
@@ -1556,24 +1719,27 @@ static ncclResult_t addP2pToPlan(
           int64ToBusId(comm->peerInfo[myPeer].busId, peerBusId);
         }
 
-        bool localAffected = r2ccBusIdAffected(currentBusId);
-        bool peerAffected = r2ccBusIdAffected(peerBusId);
-        if (localAffected || peerAffected) {
+        size_t reduceThreshold = r2ccP2pReduceMinBytes();
+        if ((size_t)bytes[dir] < reduceThreshold) {
+          WARN("P2P Test Mode: small message %ld bytes on failed-netDev affected edge "
+               "(threshold=%zu). Keeping natural nChannels[%d]=%d; skip full-channel reduction",
+               bytes[dir], reduceThreshold, dir, nChannels[dir]);
+        } else {
           if (nChannels[dir] != nChannelsMax) {
-            WARN("P2P Test Mode: forcing nChannels[%d] from %d to %d before failure reduction",
+            WARN("P2P Test Mode: forcing nChannels[%d] from %d to %d before failed-netDev reduction",
                  dir, nChannels[dir], nChannelsMax);
             nChannels[dir] = nChannelsMax;
           }
 
           int originalChannels = nChannels[dir];
-          int failedNicCount = 1 + failure2;
-          int targetChannels = nChannelsMax - 2 * failedNicCount;
+          int targetChannels = nChannelsMax - 2 * failedNetDevCount;
           if (targetChannels < 1) targetChannels = 1;
           if (targetChannels > originalChannels) targetChannels = originalChannels;
           nChannels[dir] = targetChannels;
 
-          WARN("P2P Test Mode: Failure Detected (Local=%s, Peer=%s, failure2=%d). Reduced nChannels[%d] from %d to %d",
-               currentBusId, peerBusId, failure2, dir, originalChannels, nChannels[dir]);
+          WARN("P2P Test Mode: Failed netDev reduction (Local=%s, Peer=%s, failure2=%d, "
+               "failedCount=%d, base=%d). Reduced nChannels[%d] from %d to %d",
+               currentBusId, peerBusId, failure2, failedNetDevCount, base, dir, originalChannels, nChannels[dir]);
         }
       }
     }
@@ -2873,7 +3039,20 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
         }
         bool affectedPeer = r2ccEnvEnabled("R2CC_P2P_TEST_MODE") &&
                             (r2ccRankAffected(comm, comm->rank) || r2ccRankAffected(comm, peer));
-        uint8_t base = affectedPeer ? 0 : ncclP2pChannelBaseForRound(comm, round);
+        uint8_t r2ccPreBase = 0;
+        if (affectedPeer) {
+          int failedNetDevs[8];
+          int failedNetDevCount = r2ccGetFailedNetDevs(failedNetDevs, 8);
+          int localNetCountForR2cc = comm->p2pnChannels > 0 ? comm->p2pnChannels / 2 : 0;
+          if (!r2ccFindBaseForFailedNetDevs(comm->p2pnChannels, localNetCountForR2cc,
+                                            failedNetDevs, failedNetDevCount, &r2ccPreBase)) {
+            WARN("P2P Test Mode: preconnect failed netDev set is not representable; "
+                 "p2pnChannels=%d localNetCount=%d failedCount=%d",
+                 comm->p2pnChannels, localNetCountForR2cc, failedNetDevCount);
+            return ncclInternalError;
+          }
+        }
+        uint8_t base = affectedPeer ? r2ccPreBase : ncclP2pChannelBaseForRound(comm, round);
         int preconnectChannels = affectedPeer ? comm->p2pnChannels : comm->p2pnChannelsPerPeer;
         for (int c=0; c < preconnectChannels; c++) {
           int channelId = ncclP2pChannelForPart(comm->p2pnChannels, base, c);

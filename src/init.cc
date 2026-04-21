@@ -642,6 +642,128 @@ static ncclResult_t computeBuffSizes(struct ncclComm* comm) {
 NCCL_PARAM(GraphDumpFileRank, "GRAPH_DUMP_FILE_RANK", 0);
 NCCL_PARAM(CollNetNodeThreshold, "COLLNET_NODE_THRESHOLD", 2);
 NCCL_PARAM(NvbPreconnect, "NVB_PRECONNECT", 1);
+
+
+static bool r2ccInitEnvEnabled(const char* name) {
+  const char* v = getenv(name);
+  return v && atoi(v) != 0;
+}
+
+static bool r2ccInitFailure2SameServerEnabled() {
+  const char* v = getenv("FAILURE2_SAME_SERVER");
+  return v && atoi(v) == 1;
+}
+
+static int r2ccInitAddFailedNetDev(int* failed, int count, int maxCount, int dev) {
+  if (dev < 0 || count >= maxCount) return count;
+  for (int i = 0; i < count; i++) if (failed[i] == dev) return count;
+  failed[count++] = dev;
+  return count;
+}
+
+static int r2ccInitGetFailedNetDevs(int* failed, int maxCount) {
+  int count = 0;
+  const char* list = getenv("R2CC_P2P_FAILED_NETDEVS");
+  if (list && list[0] != '\0') {
+    const char* p = list;
+    while (*p != '\0') {
+      while (*p == ',' || *p == ';' || *p == ':' || *p == ' ') p++;
+      if (*p == '\0') break;
+      char* end = NULL;
+      long dev = strtol(p, &end, 0);
+      if (end == p) break;
+      count = r2ccInitAddFailedNetDev(failed, count, maxCount, (int)dev);
+      p = end;
+    }
+    return count;
+  }
+
+  const char* dev1 = getenv("R2CC_P2P_FAILED_NETDEV");
+  if (dev1 && dev1[0] != '\0') {
+    count = r2ccInitAddFailedNetDev(failed, count, maxCount, atoi(dev1));
+    const char* dev2 = getenv("R2CC_P2P_FAILED_NETDEV2");
+    if (dev2 && dev2[0] != '\0') count = r2ccInitAddFailedNetDev(failed, count, maxCount, atoi(dev2));
+    return count;
+  }
+
+  count = r2ccInitAddFailedNetDev(failed, count, maxCount, 7);
+  if (r2ccInitFailure2SameServerEnabled()) count = r2ccInitAddFailedNetDev(failed, count, maxCount, 3);
+  return count;
+}
+
+static bool r2ccInitNetDevFailed(int netDev, const int* failed, int failedCount) {
+  for (int i = 0; i < failedCount; i++) if (failed[i] == netDev) return true;
+  return false;
+}
+
+static bool r2ccInitRankLocalNetDevAffected(struct ncclComm* comm, int rank) {
+  if (comm == NULL || comm->topo == NULL || rank < 0 || rank >= comm->nRanks) return false;
+
+  int failed[8];
+  int failedCount = r2ccInitGetFailedNetDevs(failed, 8);
+  if (failedCount <= 0) return false;
+
+  int gpu = -1;
+  if (ncclTopoRankToIndex(comm->topo, rank, &gpu) != ncclSuccess || gpu < 0) return false;
+  struct ncclTopoLinkList* paths = comm->topo->nodes[GPU].nodes[gpu].paths[NET];
+  if (paths == NULL) return false;
+
+  int minType = PATH_DIS;
+  float maxBw = 0.0f;
+  int netCount = comm->topo->nodes[NET].count;
+  for (int i = 0; i < netCount; i++) {
+    if (paths[i].bw > maxBw || (paths[i].bw == maxBw && paths[i].type < minType)) {
+      maxBw = paths[i].bw;
+      minType = paths[i].type;
+    }
+  }
+  if (maxBw <= 0) return false;
+  for (int i = 0; i < netCount; i++) {
+    if (paths[i].bw == maxBw && paths[i].type == minType) {
+      int dev = comm->topo->nodes[NET].nodes[i].net.dev;
+      if (r2ccInitNetDevFailed(dev, failed, failedCount)) return true;
+    }
+  }
+  return false;
+}
+
+static bool r2ccInitPartSuffixDropsFailedNetDevs(int p2pnChannels, int localNetCount, uint8_t base,
+                                                 const int* failed, int failedCount) {
+  if (failedCount <= 0 || localNetCount <= 0 || p2pnChannels <= 0) return false;
+  int targetChannels = p2pnChannels - 2 * failedCount;
+  if (targetChannels < 0) return false;
+
+  int hits[8] = {0};
+  for (int part = targetChannels; part < p2pnChannels; part++) {
+    int channelId = ncclP2pChannelForPart(p2pnChannels, base, part);
+    int netDev = channelId % localNetCount;
+    bool found = false;
+    for (int i = 0; i < failedCount; i++) {
+      if (failed[i] == netDev) {
+        hits[i]++;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return false;
+  }
+  for (int i = 0; i < failedCount; i++) if (hits[i] != 2) return false;
+  return true;
+}
+
+static bool r2ccInitFindBaseForFailedNetDevs(int p2pnChannels, int localNetCount,
+                                             const int* failed, int failedCount, uint8_t* baseOut) {
+  if (baseOut) *baseOut = 0;
+  if (failedCount <= 0) return false;
+  if (p2pnChannels != 2 * localNetCount) return false;
+  for (int b = 0; b < localNetCount; b++) {
+    if (r2ccInitPartSuffixDropsFailedNetDevs(p2pnChannels, localNetCount, (uint8_t)b, failed, failedCount)) {
+      if (baseOut) *baseOut = (uint8_t)b;
+      return true;
+    }
+  }
+  return false;
+}
 NCCL_PARAM(AllocP2pNetLLBuffers, "ALLOC_P2P_NET_LL_BUFFERS", 0);
 
 // MNNVL: Flag to indicate whether to enable Multi-Node NVLink
@@ -721,47 +843,6 @@ static int checkMNNVL(struct ncclComm* comm) {
 #define TIMER_INIT_CONNECT 6
 #define TIMER_INIT_ALLOC 7
 #define TIMERS_INIT_COUNT 8
-
-
-static bool r2ccEnvEnabled(const char* name) {
-  const char* v = getenv(name);
-  return v && atoi(v) != 0;
-}
-
-static bool r2ccFailure2SameServerEnabled() {
-  const char* v = getenv("FAILURE2_SAME_SERVER");
-  return v && atoi(v) == 1;
-}
-
-static bool r2ccBusIdAffected(const char* busId) {
-  if (busId == NULL || busId[0] == '\0') return false;
-
-  const char* target = getenv("GPUBUSID");
-  if (target && target[0] != '\0' &&
-      strncmp(busId, target, strlen(target)) == 0) {
-    return true;
-  }
-
-  if (r2ccFailure2SameServerEnabled() &&
-      strncmp(busId, "0000:45:00.0", strlen("0000:45:00.0")) == 0) {
-    return true;
-  }
-
-  return false;
-}
-
-static bool r2ccRankAffected(struct ncclComm* comm, int rank) {
-  if (comm == NULL || rank < 0) return false;
-  char busId[20];
-  if (rank == comm->rank) {
-    int64ToBusId(comm->busId, busId);
-  } else if (comm->peerInfo && rank < comm->nRanks) {
-    int64ToBusId(comm->peerInfo[rank].busId, busId);
-  } else {
-    return false;
-  }
-  return r2ccBusIdAffected(busId);
-}
 
 static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* parent, uint64_t timers[TIMERS_INIT_COUNT]) {
   // We use 2 AllGathers
@@ -1295,10 +1376,25 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
         int sendRound=0, recvRound=0;
         while (comm->p2pSchedule[sendRound].sendRank != peer) sendRound++;
         while (comm->p2pSchedule[recvRound].recvRank != peer) recvRound++;
-        bool affectedPeer = r2ccEnvEnabled("R2CC_P2P_TEST_MODE") &&
-                            (r2ccRankAffected(comm, comm->rank) || r2ccRankAffected(comm, peer));
-        uint8_t sendBase = affectedPeer ? 0 : ncclP2pChannelBaseForRound(comm, sendRound);
-        uint8_t recvBase = affectedPeer ? 0 : ncclP2pChannelBaseForRound(comm, recvRound);
+        bool affectedPeer = r2ccInitEnvEnabled("R2CC_P2P_TEST_MODE") &&
+                            (r2ccInitRankLocalNetDevAffected(comm, comm->rank) ||
+                             r2ccInitRankLocalNetDevAffected(comm, peer));
+        uint8_t r2ccBase = 0;
+        if (affectedPeer) {
+          int failedNetDevs[8];
+          int failedNetDevCount = r2ccInitGetFailedNetDevs(failedNetDevs, 8);
+          int localNetCountForR2cc = comm->p2pnChannels > 0 ? comm->p2pnChannels / 2 : 0;
+          if (!r2ccInitFindBaseForFailedNetDevs(comm->p2pnChannels, localNetCountForR2cc,
+                                                failedNetDevs, failedNetDevCount, &r2ccBase)) {
+            WARN("P2P Test Mode: init preconnect failed netDev set is not representable; "
+                 "p2pnChannels=%d localNetCount=%d failedCount=%d",
+                 comm->p2pnChannels, localNetCountForR2cc, failedNetDevCount);
+            ret = ncclInternalError;
+            goto fail;
+          }
+        }
+        uint8_t sendBase = affectedPeer ? r2ccBase : ncclP2pChannelBaseForRound(comm, sendRound);
+        uint8_t recvBase = affectedPeer ? r2ccBase : ncclP2pChannelBaseForRound(comm, recvRound);
         int preconnectChannels = affectedPeer ? comm->p2pnChannels : comm->p2pnChannelsPerPeer;
         for (int c=0; c<preconnectChannels; c++) {
           int channelId;
