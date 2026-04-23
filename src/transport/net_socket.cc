@@ -15,6 +15,7 @@
 #include <poll.h>
 #include <limits.h>
 #include <fcntl.h>
+#include <time.h>
 
 /* Init functions */
 static int ncclNetIfs = -1;
@@ -121,6 +122,13 @@ ncclResult_t ncclNetSocketGetProperties(int dev, ncclNetProperties_t* props) {
 
 NCCL_PARAM(SocketNsocksPerThread, "NSOCKS_PERTHREAD", -2);
 NCCL_PARAM(SocketNthreads, "SOCKET_NTHREADS", -2);
+NCCL_PARAM(SocketStallTimeout, "SOCKET_STALL_TIMEOUT", 30);
+
+static inline uint64_t ncclNetSocketNowNs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return uint64_t(ts.tv_sec) * 1000 * 1000 * 1000 + uint64_t(ts.tv_nsec);
+}
 
 enum ncclNetSocketCommState {
   ncclNetSocketCommStateStart = 0,
@@ -153,18 +161,22 @@ struct ncclNetSocketTask {
   int offset;
   int used;
   ncclResult_t result;
+  uint64_t lastProgressNs;
 };
 
 struct ncclNetSocketRequest {
   int op;
   void* data;
   int size;
+  int ctrlData;
+  int ctrlOffset;
   struct ncclSocket* ctrlSock;
   int offset;
   int used;
   struct ncclNetSocketComm* comm;
   struct ncclNetSocketTask* tasks[MAX_SOCKETS];
   int nSubs;
+  uint64_t lastProgressNs;
   // R2CC fields for backup support
   int channel;
   int id;
@@ -209,6 +221,12 @@ struct ncclNetSocketComm {
   struct ncclNetSocketThreadResources threadResources[MAX_THREADS];
 };
 
+static inline bool ncclNetSocketProgressTimedOut(uint64_t lastProgressNs, uint64_t nowNs) {
+  int64_t timeoutSec = ncclParamSocketStallTimeout();
+  uint64_t timeoutNs = uint64_t(timeoutSec) * 1000 * 1000 * 1000;
+  return timeoutNs != 0 && lastProgressNs != 0 && nowNs > lastProgressNs && (nowNs - lastProgressNs) >= timeoutNs;
+}
+
 void* persistentSocketThread(void *args_) {
   struct ncclNetSocketThreadResources* resource = (struct ncclNetSocketThreadResources*)args_;
   struct ncclNetSocketComm* comm = resource->comm;
@@ -224,11 +242,15 @@ void* persistentSocketThread(void *args_) {
         for (int j=0; j<nSocksPerThread; j++) {
           struct ncclNetSocketTask* r = myQueue->tasks+i+j;
           if (r != NULL && r->used == 1 && r->offset < r->size) {
+            int prevOffset = r->offset;
             r->result = ncclSocketProgress(r->op, r->sock, r->data, r->size, &r->offset);
             if (r->result != ncclSuccess) {
               __atomic_store_n(&comm->failed, 1, __ATOMIC_RELAXED);
               WARN("NET/Socket : socket progress error");
               return NULL;
+            }
+            if (r->offset > prevOffset) {
+              __atomic_store_n(&r->lastProgressNs, ncclNetSocketNowNs(), __ATOMIC_RELAXED);
             }
             idle = 0;
             if (r->offset < r->size) repeat = 1;
@@ -433,13 +455,23 @@ ncclResult_t ncclNetSocketGetRequest(struct ncclNetSocketComm* comm, int op, voi
   for (int i=0; i<MAX_REQUESTS; i++) {
     struct ncclNetSocketRequest* r = comm->requests+i;
     if (r->used == 0) {
+      uint64_t nowNs = ncclNetSocketNowNs();
       r->op = op;
       r->data = data;
       r->size = size;
+      r->ctrlData = size;
+      r->ctrlOffset = 0;
       r->ctrlSock = &comm->ctrlSock;
+      r->offset = 0;
       r->used = 1;
       r->comm = comm;
       r->nSubs = 0;
+      r->lastProgressNs = nowNs;
+      r->channel = -1;
+      r->id = -1;
+      r->netComm = NULL;
+      r->step = -1;
+      r->operation = 0;
       *req = r;
       return ncclSuccess;
     }
@@ -474,6 +506,7 @@ ncclResult_t ncclNetSocketGetTask(struct ncclNetSocketComm* comm, int op, void* 
     r->sock = comm->socks + comm->nextSock;
     r->offset = 0;
     r->result = ncclSuccess;
+    r->lastProgressNs = ncclNetSocketNowNs();
     comm->nextSock = (comm->nextSock + 1) % comm->nSocks;
     r->used = 1;
     *req = r;
@@ -500,9 +533,8 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     return ncclSuccess;
   }
   if (r->used == 1) { /* try to send/recv size */
-    int data = r->size;
-    int offset = 0;
-    ncclResult_t ret = ncclSocketProgress(r->op, r->ctrlSock, &data, sizeof(int), &offset);
+    int prevOffset = r->ctrlOffset;
+    ncclResult_t ret = ncclSocketProgress(r->op, r->ctrlSock, &r->ctrlData, sizeof(int), &r->ctrlOffset);
 
     if (ret != ncclSuccess) {
       if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
@@ -511,22 +543,28 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
       return ncclSuccess;
     }
 
-    if (offset == 0) return ncclSuccess; /* Not ready -- retry later */
+    if (r->ctrlOffset > prevOffset) {
+      r->lastProgressNs = ncclNetSocketNowNs();
+    } else if (r->ctrlOffset < (int)sizeof(int) && ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
+      if (r->comm) __atomic_store_n(&req->comm->failed, 1, __ATOMIC_RELAXED);
+      WARN("NET/Socket: request stalled");
+      *done = -1;
+      return ncclSuccess;
+    }
 
-    // Not sure we could ever receive less than 4 bytes, but just in case ...
-    if (offset < sizeof(int)) NCCLCHECK(ncclSocketWait(r->op, r->ctrlSock, &data, sizeof(int), &offset));
+    if (r->ctrlOffset < (int)sizeof(int)) return ncclSuccess; /* Not ready -- retry later */
 
     // Check size is less or equal to the size provided by the user
-    if (r->op == NCCL_SOCKET_RECV && data > r->size) {
+    if (r->op == NCCL_SOCKET_RECV && r->ctrlData > r->size) {
       char line[SOCKET_NAME_MAXLEN+1];
       union ncclSocketAddress addr;
       NCCLCHECK(ncclSocketGetAddr(r->ctrlSock, &addr));
       WARN("NET/Socket : peer %s message truncated : receiving %d bytes instead of %d. If you believe your socket network is in healthy state, \
           there may be a mismatch in collective sizes or environment settings (e.g. NCCL_PROTO, NCCL_ALGO) between ranks",
-          ncclSocketToString(&addr, line), data, r->size);
+          ncclSocketToString(&addr, line), r->ctrlData, r->size);
       return ncclInvalidUsage;
     }
-    r->size = data;
+    r->size = r->ctrlData;
     r->offset = 0;
     r->used = 2; // done exchanging size
     // divide into subtasks
@@ -545,15 +583,23 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
   if (r->used == 2) { // already exchanged size
     if (r->nSubs > 0) {
       int nCompleted = 0;
+      uint64_t nowNs = ncclNetSocketNowNs();
       for (int i=0; i<r->nSubs; i++) {
         struct ncclNetSocketTask* sub = r->tasks[i];
         if (sub->result != ncclSuccess) {
           if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
-          WARN("NET/Socket: subtask failure");
+          WARN("NET/Socket : subtask failure");
           *done = -1;
           return ncclSuccess;
         }
-        if (sub->offset == sub->size) nCompleted++;
+        if (sub->offset == sub->size) {
+          nCompleted++;
+        } else if (ncclNetSocketProgressTimedOut(__atomic_load_n(&sub->lastProgressNs, __ATOMIC_RELAXED), nowNs)) {
+          if (r->comm) __atomic_store_n(&req->comm->failed, 1, __ATOMIC_RELAXED);
+          WARN("NET/Socket: request stalled");
+          *done = -1;
+          return ncclSuccess;
+        }
       }
       if (nCompleted == r->nSubs) {
         if (size) *size = r->size;
@@ -566,10 +612,19 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
       }
     } else { // progress request using main thread
       if (r->offset < r->size) {
+        int prevOffset = r->offset;
         ncclResult_t ret = ncclSocketProgress(r->op, r->ctrlSock, r->data, r->size, &r->offset);
         if (ret != ncclSuccess) {
           if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
           WARN("NET/Socket: ctrl socket failure");
+          *done = -1;
+          return ncclSuccess;
+        }
+        if (r->offset > prevOffset) {
+          r->lastProgressNs = ncclNetSocketNowNs();
+        } else if (r->offset < r->size && ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
+          if (r->comm) __atomic_store_n(&req->comm->failed, 1, __ATOMIC_RELAXED);
+          WARN("NET/Socket: request stalled");
           *done = -1;
           return ncclSuccess;
         }
