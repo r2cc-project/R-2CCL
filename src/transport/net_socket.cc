@@ -546,7 +546,7 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     if (r->ctrlOffset > prevOffset) {
       r->lastProgressNs = ncclNetSocketNowNs();
     } else if (r->ctrlOffset < (int)sizeof(int) && ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
-      if (r->comm) __atomic_store_n(&req->comm->failed, 1, __ATOMIC_RELAXED);
+      if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
       WARN("NET/Socket: request stalled");
       *done = -1;
       return ncclSuccess;
@@ -595,7 +595,7 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
         if (sub->offset == sub->size) {
           nCompleted++;
         } else if (ncclNetSocketProgressTimedOut(__atomic_load_n(&sub->lastProgressNs, __ATOMIC_RELAXED), nowNs)) {
-          if (r->comm) __atomic_store_n(&req->comm->failed, 1, __ATOMIC_RELAXED);
+          if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
           WARN("NET/Socket: request stalled");
           *done = -1;
           return ncclSuccess;
@@ -623,7 +623,7 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
         if (r->offset > prevOffset) {
           r->lastProgressNs = ncclNetSocketNowNs();
         } else if (r->offset < r->size && ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
-          if (r->comm) __atomic_store_n(&req->comm->failed, 1, __ATOMIC_RELAXED);
+          if (r->comm) __atomic_store_n(r->comm->failed, 1, __ATOMIC_RELAXED);
           WARN("NET/Socket: request stalled");
           *done = -1;
           return ncclSuccess;
