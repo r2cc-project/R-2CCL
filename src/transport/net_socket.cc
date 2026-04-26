@@ -227,6 +227,16 @@ static inline bool ncclNetSocketProgressTimedOut(uint64_t lastProgressNs, uint64
   return timeoutNs != 0 && lastProgressNs != 0 && nowNs > lastProgressNs && (nowNs - lastProgressNs) >= timeoutNs;
 }
 
+static inline void ncclNetSocketMarkFailed(struct ncclNetSocketComm* comm) {
+  if (comm) __atomic_store_n(&comm->failed, 1, __ATOMIC_RELAXED);
+}
+
+static inline bool ncclNetSocketUpdateProgress(uint64_t* lastProgressNs, int prevOffset, int offset) {
+  if (offset <= prevOffset) return false;
+  *lastProgressNs = ncclNetSocketNowNs();
+  return true;
+}
+
 void* persistentSocketThread(void *args_) {
   struct ncclNetSocketThreadResources* resource = (struct ncclNetSocketThreadResources*)args_;
   struct ncclNetSocketComm* comm = resource->comm;
@@ -245,7 +255,7 @@ void* persistentSocketThread(void *args_) {
             int prevOffset = r->offset;
             r->result = ncclSocketProgress(r->op, r->sock, r->data, r->size, &r->offset);
             if (r->result != ncclSuccess) {
-              __atomic_store_n(&comm->failed, 1, __ATOMIC_RELAXED);
+              ncclNetSocketMarkFailed(comm);
               WARN("NET/Socket : socket progress error");
               return NULL;
             }
@@ -537,17 +547,18 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     ncclResult_t ret = ncclSocketProgress(r->op, r->ctrlSock, &r->ctrlData, sizeof(int), &r->ctrlOffset);
 
     if (ret != ncclSuccess) {
-      if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
+      ncclNetSocketMarkFailed(r->comm);
       WARN("NET/Socket : ctrl socket failure");
       *done = -1;
       return ncclSuccess;
     }
 
-    if (r->ctrlOffset > prevOffset) {
-      r->lastProgressNs = ncclNetSocketNowNs();
-    } else if (r->ctrlOffset < (int)sizeof(int) && ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
-      if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
-      WARN("NET/Socket: request stalled");
+    // Check socket progress timeout
+    if (!ncclNetSocketUpdateProgress(&r->lastProgressNs, prevOffset, r->ctrlOffset) &&
+        r->ctrlOffset < (int)sizeof(int) &&
+        ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
+      ncclNetSocketMarkFailed(r->comm);
+      WARN("NET/Socket : request stalled");
       *done = -1;
       return ncclSuccess;
     }
@@ -587,16 +598,17 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
       for (int i=0; i<r->nSubs; i++) {
         struct ncclNetSocketTask* sub = r->tasks[i];
         if (sub->result != ncclSuccess) {
-          if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
+          ncclNetSocketMarkFailed(r->comm);
           WARN("NET/Socket : subtask failure");
           *done = -1;
           return ncclSuccess;
         }
         if (sub->offset == sub->size) {
           nCompleted++;
+        // Check socket progress timeout
         } else if (ncclNetSocketProgressTimedOut(__atomic_load_n(&sub->lastProgressNs, __ATOMIC_RELAXED), nowNs)) {
-          if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
-          WARN("NET/Socket: request stalled");
+          ncclNetSocketMarkFailed(r->comm);
+          WARN("NET/Socket : request stalled");
           *done = -1;
           return ncclSuccess;
         }
@@ -615,16 +627,17 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
         int prevOffset = r->offset;
         ncclResult_t ret = ncclSocketProgress(r->op, r->ctrlSock, r->data, r->size, &r->offset);
         if (ret != ncclSuccess) {
-          if (r->comm) __atomic_store_n(&r->comm->failed, 1, __ATOMIC_RELAXED);
-          WARN("NET/Socket: ctrl socket failure");
+          ncclNetSocketMarkFailed(r->comm);
+          WARN("NET/Socket : ctrl socket failure");
           *done = -1;
           return ncclSuccess;
         }
-        if (r->offset > prevOffset) {
-          r->lastProgressNs = ncclNetSocketNowNs();
-        } else if (r->offset < r->size && ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
-          if (r->comm) __atomic_store_n(r->comm->failed, 1, __ATOMIC_RELAXED);
-          WARN("NET/Socket: request stalled");
+        // Check socket progress timeout
+        if (!ncclNetSocketUpdateProgress(&r->lastProgressNs, prevOffset, r->offset) &&
+            r->offset < r->size &&
+            ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
+          ncclNetSocketMarkFailed(r->comm);
+          WARN("NET/Socket : request stalled");
           *done = -1;
           return ncclSuccess;
         }
