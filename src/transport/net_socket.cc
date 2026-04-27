@@ -123,6 +123,7 @@ ncclResult_t ncclNetSocketGetProperties(int dev, ncclNetProperties_t* props) {
 NCCL_PARAM(SocketNsocksPerThread, "NSOCKS_PERTHREAD", -2);
 NCCL_PARAM(SocketNthreads, "SOCKET_NTHREADS", -2);
 NCCL_PARAM(SocketStallTimeout, "SOCKET_STALL_TIMEOUT", 30);
+NCCL_PARAM(SocketPeerAck, "SOCKET_PEER_ACK", 1);
 
 static inline uint64_t ncclNetSocketNowNs() {
   struct timespec ts;
@@ -171,6 +172,8 @@ struct ncclNetSocketRequest {
   int ctrlData;
   int ctrlOffset;
   struct ncclSocket* ctrlSock;
+  int ackData;
+  int ackOffset;
   int offset;
   int used;
   struct ncclNetSocketComm* comm;
@@ -235,6 +238,16 @@ static inline bool ncclNetSocketUpdateProgress(uint64_t* lastProgressNs, int pre
   if (offset <= prevOffset) return false;
   *lastProgressNs = ncclNetSocketNowNs();
   return true;
+}
+
+static inline void ncclNetSocketCompleteRequest(struct ncclNetSocketRequest* r, int* done, int* size) {
+  if (size) *size = r->size;
+  *done = 1;
+  r->used = 0;
+  for (int i=0; i<r->nSubs; i++) {
+    struct ncclNetSocketTask* sub = r->tasks[i];
+    sub->used = 0;
+  }
 }
 
 void* persistentSocketThread(void *args_) {
@@ -472,6 +485,8 @@ ncclResult_t ncclNetSocketGetRequest(struct ncclNetSocketComm* comm, int op, voi
       r->ctrlData = size;
       r->ctrlOffset = 0;
       r->ctrlSock = &comm->ctrlSock;
+      r->ackData = 0;
+      r->ackOffset = 0;
       r->offset = 0;
       r->used = 1;
       r->comm = comm;
@@ -592,6 +607,7 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     r->nSubs = i;
   }
   if (r->used == 2) { // already exchanged size
+    int payloadDone = 0;
     if (r->nSubs > 0) {
       int nCompleted = 0;
       uint64_t nowNs = ncclNetSocketNowNs();
@@ -613,15 +629,7 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
           return ncclSuccess;
         }
       }
-      if (nCompleted == r->nSubs) {
-        if (size) *size = r->size;
-        *done = 1;
-        r->used = 0;
-        for (int i=0; i<r->nSubs; i++) {
-          struct ncclNetSocketTask* sub = r->tasks[i];
-          sub->used = 0;
-        }
-      }
+      if (nCompleted == r->nSubs) payloadDone = 1;
     } else { // progress request using main thread
       if (r->offset < r->size) {
         int prevOffset = r->offset;
@@ -642,12 +650,47 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
           return ncclSuccess;
         }
       }
-      if (r->offset == r->size) {
-        if (size) *size = r->size;
-        *done = 1;
-        r->used = 0;
+      if (r->offset == r->size) payloadDone = 1;
+    }
+    if (payloadDone) {
+      if (ncclParamSocketPeerAck()) {
+        // For TCP, local send completion only means the kernel accepted bytes.
+        // Wait for a peer ACK so blackholed traffic is visible to the stall timer.
+        r->ackData = r->op == NCCL_SOCKET_RECV ? r->size : 0;
+        r->ackOffset = 0;
+        r->lastProgressNs = ncclNetSocketNowNs();
+        r->used = 3;
+      } else {
+        ncclNetSocketCompleteRequest(r, done, size);
       }
     }
+  }
+  if (r->used == 3) { // payload done; exchange peer ACK
+    int ackOp = r->op == NCCL_SOCKET_SEND ? NCCL_SOCKET_RECV : NCCL_SOCKET_SEND;
+    int prevOffset = r->ackOffset;
+    ncclResult_t ret = ncclSocketProgress(ackOp, r->ctrlSock, &r->ackData, sizeof(int), &r->ackOffset);
+    if (ret != ncclSuccess) {
+      ncclNetSocketMarkFailed(r->comm);
+      WARN("NET/Socket : peer ACK socket failure");
+      *done = -1;
+      return ncclSuccess;
+    }
+    if (!ncclNetSocketUpdateProgress(&r->lastProgressNs, prevOffset, r->ackOffset) &&
+        r->ackOffset < (int)sizeof(int) &&
+        ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
+      ncclNetSocketMarkFailed(r->comm);
+      WARN("NET/Socket : peer ACK stalled");
+      *done = -1;
+      return ncclSuccess;
+    }
+    if (r->ackOffset < (int)sizeof(int)) return ncclSuccess;
+    if (r->op == NCCL_SOCKET_SEND && r->ackData != r->size) {
+      ncclNetSocketMarkFailed(r->comm);
+      WARN("NET/Socket : peer ACK size mismatch : received %d expected %d", r->ackData, r->size);
+      *done = -1;
+      return ncclSuccess;
+    }
+    ncclNetSocketCompleteRequest(r, done, size);
   }
   return ncclSuccess;
 }
