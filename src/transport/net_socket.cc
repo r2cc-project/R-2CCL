@@ -122,7 +122,7 @@ ncclResult_t ncclNetSocketGetProperties(int dev, ncclNetProperties_t* props) {
 
 NCCL_PARAM(SocketNsocksPerThread, "NSOCKS_PERTHREAD", -2);
 NCCL_PARAM(SocketNthreads, "SOCKET_NTHREADS", -2);
-NCCL_PARAM(SocketStallTimeout, "SOCKET_STALL_TIMEOUT", 30);
+NCCL_PARAM(SocketStallTimeout, "SOCKET_STALL_TIMEOUT", 5);
 NCCL_PARAM(SocketPeerAck, "SOCKET_PEER_ACK", 1);
 
 static inline uint64_t ncclNetSocketNowNs() {
