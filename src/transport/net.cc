@@ -2416,8 +2416,6 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           //if(!resources->useBackup)
           //  NCCLCHECK(proxyState->ncclNet->setBackup(resources->netSendCommBackup));
 
-          printf("SEND: Test result done=%d for request %p, channel=%d\n", done, sub->requests[buffSlot], sub->channelId);
-
           // return ncclInternalError;
           INFO(NCCL_R2CC, "SEND ERROR PATH: test returned -1, channel=%d, useBackup=%d - THIS SHOULD NOT HAPPEN WITH MODE=1", sub->channelId, resources->useBackup);
           TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d: test done=-1", args->id, sub->channelId, sub->base+sub->done, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
