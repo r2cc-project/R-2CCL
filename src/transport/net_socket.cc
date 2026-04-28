@@ -203,6 +203,7 @@ struct ncclNetSocketComm {
   int nSocks;
   int nThreads;
   int nextSock;
+  int failed;
   struct ncclNetSocketRequest requests[MAX_REQUESTS];
   pthread_t helperThread[MAX_THREADS];
   struct ncclNetSocketThreadResources threadResources[MAX_THREADS];
@@ -214,6 +215,7 @@ void* persistentSocketThread(void *args_) {
   struct ncclNetSocketTaskQueue* myQueue = &resource->threadTaskQueue;
   int nSocksPerThread = comm->nSocks / comm->nThreads;
   while (1) {
+    if (comm->failed) return NULL;
     int idle = 1;
     int mark = myQueue->next; // mark newest task seen
     for (int i=0; i<myQueue->len; i+=nSocksPerThread) {
@@ -226,6 +228,8 @@ void* persistentSocketThread(void *args_) {
             r->result = ncclSocketProgress(r->op, r->sock, r->data, r->size, &r->offset);
             if (r->result != ncclSuccess) {
               WARN("NET/Socket : socket progress error");
+              comm->failed = 1;
+              resource->stop = 1;
               return NULL;
             }
             idle = 0;
@@ -428,6 +432,7 @@ socket_recv:
 }
 
 ncclResult_t ncclNetSocketGetRequest(struct ncclNetSocketComm* comm, int op, void* data, int size, struct ncclNetSocketRequest** req) {
+  if (comm->failed) return ncclRemoteError;
   for (int i=0; i<MAX_REQUESTS; i++) {
     struct ncclNetSocketRequest* r = comm->requests+i;
     if (r->used == 0) {
@@ -447,6 +452,7 @@ ncclResult_t ncclNetSocketGetRequest(struct ncclNetSocketComm* comm, int op, voi
 }
 
 ncclResult_t ncclNetSocketGetTask(struct ncclNetSocketComm* comm, int op, void* data, int size, struct ncclNetSocketTask** req) {
+  if (comm->failed) return ncclRemoteError;
   int tid = comm->nextSock % comm->nThreads;
   struct ncclNetSocketThreadResources* res = comm->threadResources+tid;
   struct ncclNetSocketTaskQueue* queue = &res->threadTaskQueue;
@@ -492,15 +498,31 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     WARN("NET/Socket : test called with NULL request");
     return ncclInternalError;
   }
+  if (r->comm && r->comm->failed) {
+    *done = -1;
+    return ncclSuccess;
+  }
   if (r->used == 1) { /* try to send/recv size */
     int data = r->size;
     int offset = 0;
-    NCCLCHECK(ncclSocketProgress(r->op, r->ctrlSock, &data, sizeof(int), &offset));
+    ncclResult_t progress = ncclSocketProgress(r->op, r->ctrlSock, &data, sizeof(int), &offset);
+    if (progress != ncclSuccess) {
+      if (r->comm) r->comm->failed = 1;
+      *done = -1;
+      return ncclSuccess;
+    }
 
     if (offset == 0) return ncclSuccess; /* Not ready -- retry later */
 
     // Not sure we could ever receive less than 4 bytes, but just in case ...
-    if (offset < sizeof(int)) NCCLCHECK(ncclSocketWait(r->op, r->ctrlSock, &data, sizeof(int), &offset));
+    if (offset < sizeof(int)) {
+      progress = ncclSocketWait(r->op, r->ctrlSock, &data, sizeof(int), &offset);
+      if (progress != ncclSuccess) {
+        if (r->comm) r->comm->failed = 1;
+        *done = -1;
+        return ncclSuccess;
+      }
+    }
 
     // Check size is less or equal to the size provided by the user
     if (r->op == NCCL_SOCKET_RECV && data > r->size) {
@@ -533,7 +555,18 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
       int nCompleted = 0;
       for (int i=0; i<r->nSubs; i++) {
         struct ncclNetSocketTask* sub = r->tasks[i];
-        if (sub->result != ncclSuccess) return sub->result;
+        if (sub->result != ncclSuccess) {
+          if (sub->result == ncclRemoteError || sub->result == ncclSystemError || (r->comm && r->comm->failed)) {
+            *done = -1;
+            r->used = 0;
+            for (int j=0; j<r->nSubs; j++) {
+              struct ncclNetSocketTask* other = r->tasks[j];
+              if (other) other->used = 0;
+            }
+            return ncclSuccess;
+          }
+          return sub->result;
+        }
         if (sub->offset == sub->size) nCompleted++;
       }
       if (nCompleted == r->nSubs) {
@@ -547,7 +580,13 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
       }
     } else { // progress request using main thread
       if (r->offset < r->size) {
-        NCCLCHECK(ncclSocketProgress(r->op, r->ctrlSock, r->data, r->size, &r->offset));
+        ncclResult_t progress = ncclSocketProgress(r->op, r->ctrlSock, r->data, r->size, &r->offset);
+        if (progress != ncclSuccess) {
+          if (r->comm) r->comm->failed = 1;
+          *done = -1;
+          r->used = 0;
+          return ncclSuccess;
+        }
       }
       if (r->offset == r->size) {
         if (size) *size = r->size;
@@ -621,13 +660,29 @@ ncclResult_t ncclNetSocketClose(void* opaqueComm) {
 
 // R2CC backup support functions for Socket transport
 ncclResult_t ncclNetSocketSetBackup(void* sendComm) {
-  // Socket doesn't need special backup setup
+  if (sendComm) {
+    struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)sendComm;
+    comm->failed = 0;
+  }
   return ncclSuccess;
 }
 
 ncclResult_t ncclNetSocketTestBackup(void* recvComm, int* done) {
-  // For socket, we don't have a separate backup test mechanism
   *done = 0;
+  if (recvComm == NULL) return ncclSuccess;
+
+  struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)recvComm;
+  if (comm->failed) {
+    *done = -1;
+    return ncclSuccess;
+  }
+
+  int ready = 0;
+  ncclResult_t ret = ncclSocketReady(&comm->ctrlSock, &ready);
+  if (ret != ncclSuccess || !ready) {
+    comm->failed = 1;
+    *done = -1;
+  }
   return ncclSuccess;
 }
 
@@ -688,19 +743,15 @@ ncclResult_t ncclNetSocketSetRequestOperation(void** request, int op) {
 }
 
 ncclResult_t ncclNetSocketCheckSwitchToBackup(void* sendComm, int* change) {
-  // For Socket transport, we don't have automatic failure detection
-  // The application layer should handle connection failures
   *change = 0;
   if (sendComm == NULL) {
     return ncclSuccess;
   }
   
   struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)sendComm;
-  // Check if the control socket is still connected
   int ready;
-  NCCLCHECK(ncclSocketReady(&comm->ctrlSock, &ready));
-  if (!ready) {
-    // Socket is closed, should switch to backup
+  ncclResult_t ret = ncclSocketReady(&comm->ctrlSock, &ready);
+  if (ret != ncclSuccess || comm->failed || !ready) {
     *change = 1;
   }
   return ncclSuccess;
