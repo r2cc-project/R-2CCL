@@ -209,13 +209,35 @@ struct ncclNetSocketComm {
   struct ncclNetSocketThreadResources threadResources[MAX_THREADS];
 };
 
+static inline int ncclNetSocketCommIsFailed(struct ncclNetSocketComm* comm) {
+  return __atomic_load_n(&comm->failed, __ATOMIC_ACQUIRE);
+}
+
+static inline void ncclNetSocketCommSetFailed(struct ncclNetSocketComm* comm) {
+  if (comm) __atomic_store_n(&comm->failed, 1, __ATOMIC_RELEASE);
+}
+
+static inline void ncclNetSocketCommClearFailed(struct ncclNetSocketComm* comm) {
+  if (comm) __atomic_store_n(&comm->failed, 0, __ATOMIC_RELEASE);
+}
+
+static inline void ncclNetSocketAbortRequest(struct ncclNetSocketRequest* r) {
+  if (r == NULL) return;
+  for (int i=0; i<r->nSubs; i++) {
+    struct ncclNetSocketTask* sub = r->tasks[i];
+    if (sub) sub->used = 0;
+  }
+  r->nSubs = 0;
+  r->used = 0;
+}
+
 void* persistentSocketThread(void *args_) {
   struct ncclNetSocketThreadResources* resource = (struct ncclNetSocketThreadResources*)args_;
   struct ncclNetSocketComm* comm = resource->comm;
   struct ncclNetSocketTaskQueue* myQueue = &resource->threadTaskQueue;
   int nSocksPerThread = comm->nSocks / comm->nThreads;
   while (1) {
-    if (comm->failed) return NULL;
+    if (ncclNetSocketCommIsFailed(comm)) return NULL;
     int idle = 1;
     int mark = myQueue->next; // mark newest task seen
     for (int i=0; i<myQueue->len; i+=nSocksPerThread) {
@@ -228,7 +250,7 @@ void* persistentSocketThread(void *args_) {
             r->result = ncclSocketProgress(r->op, r->sock, r->data, r->size, &r->offset);
             if (r->result != ncclSuccess) {
               WARN("NET/Socket : socket progress error");
-              comm->failed = 1;
+              ncclNetSocketCommSetFailed(comm);
               resource->stop = 1;
               return NULL;
             }
@@ -432,7 +454,7 @@ socket_recv:
 }
 
 ncclResult_t ncclNetSocketGetRequest(struct ncclNetSocketComm* comm, int op, void* data, int size, struct ncclNetSocketRequest** req) {
-  if (comm->failed) return ncclRemoteError;
+  if (ncclNetSocketCommIsFailed(comm)) return ncclRemoteError;
   for (int i=0; i<MAX_REQUESTS; i++) {
     struct ncclNetSocketRequest* r = comm->requests+i;
     if (r->used == 0) {
@@ -452,7 +474,7 @@ ncclResult_t ncclNetSocketGetRequest(struct ncclNetSocketComm* comm, int op, voi
 }
 
 ncclResult_t ncclNetSocketGetTask(struct ncclNetSocketComm* comm, int op, void* data, int size, struct ncclNetSocketTask** req) {
-  if (comm->failed) return ncclRemoteError;
+  if (ncclNetSocketCommIsFailed(comm)) return ncclRemoteError;
   int tid = comm->nextSock % comm->nThreads;
   struct ncclNetSocketThreadResources* res = comm->threadResources+tid;
   struct ncclNetSocketTaskQueue* queue = &res->threadTaskQueue;
@@ -498,8 +520,9 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     WARN("NET/Socket : test called with NULL request");
     return ncclInternalError;
   }
-  if (r->comm && r->comm->failed) {
+  if (r->comm && ncclNetSocketCommIsFailed(r->comm)) {
     *done = -1;
+    ncclNetSocketAbortRequest(r);
     return ncclSuccess;
   }
   if (r->used == 1) { /* try to send/recv size */
@@ -507,8 +530,9 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     int offset = 0;
     ncclResult_t progress = ncclSocketProgress(r->op, r->ctrlSock, &data, sizeof(int), &offset);
     if (progress != ncclSuccess) {
-      if (r->comm) r->comm->failed = 1;
+      ncclNetSocketCommSetFailed(r->comm);
       *done = -1;
+      ncclNetSocketAbortRequest(r);
       return ncclSuccess;
     }
 
@@ -518,8 +542,9 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     if (offset < sizeof(int)) {
       progress = ncclSocketWait(r->op, r->ctrlSock, &data, sizeof(int), &offset);
       if (progress != ncclSuccess) {
-        if (r->comm) r->comm->failed = 1;
+        ncclNetSocketCommSetFailed(r->comm);
         *done = -1;
+        ncclNetSocketAbortRequest(r);
         return ncclSuccess;
       }
     }
@@ -556,13 +581,9 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
       for (int i=0; i<r->nSubs; i++) {
         struct ncclNetSocketTask* sub = r->tasks[i];
         if (sub->result != ncclSuccess) {
-          if (sub->result == ncclRemoteError || sub->result == ncclSystemError || (r->comm && r->comm->failed)) {
+          if (sub->result == ncclRemoteError || sub->result == ncclSystemError || (r->comm && ncclNetSocketCommIsFailed(r->comm))) {
             *done = -1;
-            r->used = 0;
-            for (int j=0; j<r->nSubs; j++) {
-              struct ncclNetSocketTask* other = r->tasks[j];
-              if (other) other->used = 0;
-            }
+            ncclNetSocketAbortRequest(r);
             return ncclSuccess;
           }
           return sub->result;
@@ -582,9 +603,9 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
       if (r->offset < r->size) {
         ncclResult_t progress = ncclSocketProgress(r->op, r->ctrlSock, r->data, r->size, &r->offset);
         if (progress != ncclSuccess) {
-          if (r->comm) r->comm->failed = 1;
+          ncclNetSocketCommSetFailed(r->comm);
           *done = -1;
-          r->used = 0;
+          ncclNetSocketAbortRequest(r);
           return ncclSuccess;
         }
       }
@@ -662,7 +683,7 @@ ncclResult_t ncclNetSocketClose(void* opaqueComm) {
 ncclResult_t ncclNetSocketSetBackup(void* sendComm) {
   if (sendComm) {
     struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)sendComm;
-    comm->failed = 0;
+    ncclNetSocketCommClearFailed(comm);
   }
   return ncclSuccess;
 }
@@ -672,7 +693,7 @@ ncclResult_t ncclNetSocketTestBackup(void* recvComm, int* done) {
   if (recvComm == NULL) return ncclSuccess;
 
   struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)recvComm;
-  if (comm->failed) {
+  if (ncclNetSocketCommIsFailed(comm)) {
     *done = -1;
     return ncclSuccess;
   }
@@ -680,7 +701,7 @@ ncclResult_t ncclNetSocketTestBackup(void* recvComm, int* done) {
   int ready = 0;
   ncclResult_t ret = ncclSocketReady(&comm->ctrlSock, &ready);
   if (ret != ncclSuccess || !ready) {
-    comm->failed = 1;
+    ncclNetSocketCommSetFailed(comm);
     *done = -1;
   }
   return ncclSuccess;
@@ -751,7 +772,7 @@ ncclResult_t ncclNetSocketCheckSwitchToBackup(void* sendComm, int* change) {
   struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)sendComm;
   int ready;
   ncclResult_t ret = ncclSocketReady(&comm->ctrlSock, &ready);
-  if (ret != ncclSuccess || comm->failed || !ready) {
+  if (ret != ncclSuccess || ncclNetSocketCommIsFailed(comm) || !ready) {
     *change = 1;
   }
   return ncclSuccess;
