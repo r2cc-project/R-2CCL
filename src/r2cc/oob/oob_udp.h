@@ -4,6 +4,7 @@
 #include "nccl.h"
 #include <netinet/in.h>
 #include <atomic>
+#include <thread>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -16,7 +17,8 @@ extern "C" __attribute__((visibility("default"))) void r2cc_oob_get_test_result(
 class OobNet {
 public:
   static OobNet& Get();
-  
+  ~OobNet();
+
   // Initialize with rank info and exchange UDP ports
   // bootstrapHandle is void* to avoid circular dependency
   ncclResult_t Init(int rank, int nRanks, void* bootstrapHandle);
@@ -102,6 +104,8 @@ private:
   PendingFailoverMsg pendingFailReq_[kMaxFailoverContexts];
   PendingFailoverMsg pendingFailAck_[kMaxFailoverContexts];
   std::mutex recvMutex_;
+  std::thread receiverThread_;
+  std::atomic<bool> running_{false};
 
   // Failed channel state (bitset of channelIds).
   std::atomic<uint64_t> localFailedChannelMask_{0};
@@ -111,6 +115,10 @@ private:
   int FailoverContextIndex(int channelId, int connIndex, int dir) const;
   void UpdatePendingFailover(PendingFailoverMsg* table, int idx, uint64_t epoch, uint64_t absStep, int peerRank);
   bool ConsumePendingFailover(PendingFailoverMsg* table, int idx, uint64_t* epoch, uint64_t* absStep, int* peerRank);
+  // Background receiver thread: blocks on poll(), drains socket when data arrives.
+  void ReceiverLoop();
+  // Drain all pending UDP messages from sockfd_. REQUIRES: recvMutex_ held by caller.
+  bool DrainSocket();
   
   // Verification state for unit tests
   std::string verificationState = "UNINITIALIZED";

@@ -14,6 +14,7 @@
 #include <inttypes.h>
 #include <ifaddrs.h>
 #include <netdb.h>
+#include <poll.h>
 
 OobNet& OobNet::Get() {
   static OobNet instance;
@@ -382,13 +383,17 @@ void OobNet::ReportFailedChannel(int channelId) {
   localFailedChannelMask_.fetch_or(bit, std::memory_order_relaxed);
 }
 
-bool OobNet::PollHotRepair() {
-  // Keep polling even after HOT_REPAIR is latched so later STEP_SYNC messages
-  // are still drained and delivered.
-  if (sockfd_ < 0) return hotRepairSeen_.load(std::memory_order_relaxed);
+OobNet::~OobNet() {
+  running_.store(false, std::memory_order_release);
+  if (receiverThread_.joinable()) {
+    receiverThread_.join();
+  }
+}
 
+// Drain all pending UDP messages from sockfd_ and update shared atomic state.
+// REQUIRES: recvMutex_ held by caller.
+bool OobNet::DrainSocket() {
   bool got = false;
-  std::lock_guard<std::mutex> lock(recvMutex_);
   while (true) {
     char buf[192];
     struct sockaddr_in srcAddr;
@@ -457,7 +462,6 @@ bool OobNet::PollHotRepair() {
         continue;
       }
       if (strncmp(buf, kHotRepairStepPrefix, strlen(kHotRepairStepPrefix)) == 0) {
-        // Best-effort parse: "R2CC_HR_STEP <channel> <step>"
         int channelId = -1;
         unsigned long long step = 0;
         if (sscanf(buf + strlen(kHotRepairStepPrefix), "%d %llu", &channelId, &step) == 2) {
@@ -475,7 +479,6 @@ bool OobNet::PollHotRepair() {
         int peerRank = -1;
         char* endptr = nullptr;
         long v = strtol(buf + strlen(kHotRepairMsgPrefix), &endptr, 10);
-        // If there is a space before the number, strtol will skip it.
         if (endptr != buf + strlen(kHotRepairMsgPrefix)) peerRank = (int)v;
         if (peerRank >= 0) lastHotRepairPeer_.store(peerRank, std::memory_order_relaxed);
 
@@ -486,14 +489,54 @@ bool OobNet::PollHotRepair() {
     }
 
     if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-    if (n == -1) WARN("OOB: PollHotRepair recvfrom error: %s", strerror(errno));
+    if (n == -1) WARN("OOB: DrainSocket recvfrom error: %s", strerror(errno));
     break;
   }
+  return got;
+}
 
-  return got || hotRepairSeen_.load(std::memory_order_relaxed);
+// Background thread: blocks on poll() and drains the OOB socket when data
+// arrives. This moves all recvfrom() syscalls off the proxy progress hot path.
+void OobNet::ReceiverLoop() {
+  struct pollfd pfd;
+  pfd.fd     = sockfd_;
+  pfd.events = POLLIN;
+
+  while (running_.load(std::memory_order_acquire)) {
+    int ret = poll(&pfd, 1, /*timeout_ms=*/100);
+    if (ret < 0) {
+      if (errno == EINTR) continue; // interrupted by signal, recheck running_
+      WARN("OOB: ReceiverLoop poll error: %s", strerror(errno));
+      break;
+    }
+    if (ret == 0) continue; // timeout, loop back and recheck running_
+
+    if (pfd.revents & POLLIN) {
+      std::lock_guard<std::mutex> lock(recvMutex_);
+      DrainSocket();
+    }
+    if (pfd.revents & (POLLERR | POLLHUP)) {
+      WARN("OOB: ReceiverLoop socket error (revents=0x%x), exiting", pfd.revents);
+      break;
+    }
+  }
+}
+
+// PollHotRepair is now a zero-cost atomic read. All socket I/O happens in
+// ReceiverLoop() (background thread), which updates hotRepairSeen_ and the
+// other shared state. Callers on the proxy progress hot path pay no syscall.
+bool OobNet::PollHotRepair() {
+  return hotRepairSeen_.load(std::memory_order_relaxed);
 }
 
 ncclResult_t OobNet::Init(int rank, int nRanks, void* bootstrapHandle) {
+  // Stop any previously running background thread before re-initializing
+  // (e.g., repeated calls in unit tests).
+  if (receiverThread_.joinable()) {
+    running_.store(false, std::memory_order_release);
+    receiverThread_.join();
+  }
+
   rank_ = rank;
   nRanks_ = nRanks;
   hotRepairSeen_.store(false, std::memory_order_relaxed);
@@ -545,7 +588,12 @@ ncclResult_t OobNet::Init(int rank, int nRanks, void* bootstrapHandle) {
 
   // Final Barrier to ensure verification is done before moving on
   NCCLCHECK(bootstrapBarrier(bootstrapHandle, rank, nRanks, 0x43));
-  
+
+  // Start the background OOB receiver thread. Must start after TestRecv()
+  // completes so the verification phase has exclusive use of the socket.
+  running_.store(true, std::memory_order_release);
+  receiverThread_ = std::thread(&OobNet::ReceiverLoop, this);
+
   return ncclSuccess;
 }
 
