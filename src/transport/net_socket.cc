@@ -701,10 +701,10 @@ static ncclResult_t ncclNetSocketProgressPayload(struct ncclNetSocketRequest* r,
   }
 
   if (payloadDone) {
-    ncclNetSocketReleaseTasks(r);
     if (ncclParamSocketPeerAck()) {
       // For TCP, local send completion only means the kernel accepted bytes.
       // Wait for a peer ACK so blackholed traffic is visible to the stall timer.
+      ncclNetSocketReleaseTasks(r);
       ncclNetSocketStartAck(r);
     } else {
       ncclNetSocketRequestDone(r);
@@ -716,7 +716,7 @@ static ncclResult_t ncclNetSocketProgressPayload(struct ncclNetSocketRequest* r,
 static ncclResult_t ncclNetSocketProgressAck(struct ncclNetSocketRequest* r, int* ackBlocked) {
   int ackOp = r->op == NCCL_SOCKET_SEND ? NCCL_SOCKET_RECV : NCCL_SOCKET_SEND;
   int prevOffset = r->ackOffset;
-  ncclResult_t ret = ncclSocketProgress(ackOp, r->ackSock, &r->ackData, sizeof(r->ackData), &r->ackOffset);
+  ncclResult_t ret = ncclSocketProgress(ackOp, r->ackSock, &r->ackData, (int)sizeof(r->ackData), &r->ackOffset);
   if (ret != ncclSuccess) {
     r->used = ncclNetSocketRequestStateFailed;
     ncclNetSocketMarkFailed(r->comm);
@@ -959,6 +959,11 @@ ncclResult_t ncclNetSocketCheckSwitchToBackup(void* sendComm, int* change) {
   NCCLCHECK(ncclSocketReady(&comm->ctrlSock, &ready));
   if (!ready) {
     // Socket is closed, should switch to backup
+    *change = 1;
+    return ncclSuccess;
+  }
+  NCCLCHECK(ncclSocketReady(&comm->ackSock, &ready));
+  if (!ready) {
     *change = 1;
   }
   return ncclSuccess;
