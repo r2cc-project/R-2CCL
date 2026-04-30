@@ -171,6 +171,7 @@ struct ncclNetSocketTask {
   int offset;
   int used;
   ncclResult_t result;
+  uint64_t seq;
   uint64_t lastProgressNs;
 };
 
@@ -236,6 +237,7 @@ struct ncclNetSocketComm {
   int nThreads;
   int nextSock;
   uint64_t nextRequestSeq;
+  uint64_t nextTaskSeq;
   int failed;
   struct ncclNetSocketRequest requests[MAX_REQUESTS];
   pthread_t helperThread[MAX_THREADS];
@@ -266,7 +268,7 @@ static inline void ncclNetSocketReleaseTasks(struct ncclNetSocketRequest* r) {
   for (int i=0; i<r->nSubs; i++) {
     struct ncclNetSocketTask* sub = r->tasks[i];
     if (sub) {
-      sub->used = 0;
+      __atomic_store_n(&sub->used, 0, __ATOMIC_RELEASE);
       r->tasks[i] = NULL;
     }
   }
@@ -297,36 +299,40 @@ static inline void ncclNetSocketStartAck(struct ncclNetSocketRequest* r) {
   r->used = ncclNetSocketRequestStateAck;
 }
 
+static inline bool ncclNetSocketTaskActive(struct ncclNetSocketTask* r) {
+  return r && __atomic_load_n(&r->used, __ATOMIC_ACQUIRE) == 1 && r->offset < r->size;
+}
+
 void* persistentSocketThread(void *args_) {
   struct ncclNetSocketThreadResources* resource = (struct ncclNetSocketThreadResources*)args_;
   struct ncclNetSocketComm* comm = resource->comm;
   struct ncclNetSocketTaskQueue* myQueue = &resource->threadTaskQueue;
-  int nSocksPerThread = comm->nSocks / comm->nThreads;
   while (1) {
     int idle = 1;
     int mark = myQueue->next; // mark newest task seen
-    for (int i=0; i<myQueue->len; i+=nSocksPerThread) {
-      int repeat;
-      do {
-        repeat = 0;
-        for (int j=0; j<nSocksPerThread; j++) {
-          struct ncclNetSocketTask* r = myQueue->tasks+i+j;
-          if (r != NULL && r->used == 1 && r->offset < r->size) {
-            int prevOffset = r->offset;
-            r->result = ncclSocketProgress(r->op, r->sock, r->data, r->size, &r->offset);
-            if (r->result != ncclSuccess) {
-              ncclNetSocketMarkFailed(comm);
-              WARN("NET/Socket : socket progress error");
-              return NULL;
-            }
-            if (r->offset > prevOffset) {
-              __atomic_store_n(&r->lastProgressNs, ncclNetSocketNowNs(), __ATOMIC_RELAXED);
-            }
-            idle = 0;
-            if (r->offset < r->size) repeat = 1;
-          }
-        }
-      } while (repeat);
+    struct ncclNetSocketTask* oldestPerSocket[MAX_SOCKETS] = { NULL };
+    // Only progress the oldest active task for each TCP stream.
+    for (int i=0; i<myQueue->len; i++) {
+      struct ncclNetSocketTask* r = myQueue->tasks+i;
+      if (!ncclNetSocketTaskActive(r)) continue;
+      int sockIndex = (int)(r->sock - comm->socks);
+      if (sockIndex < 0 || sockIndex >= comm->nSocks) continue;
+      if (oldestPerSocket[sockIndex] == NULL || r->seq < oldestPerSocket[sockIndex]->seq) oldestPerSocket[sockIndex] = r;
+    }
+    for (int i=0; i<comm->nSocks; i++) {
+      struct ncclNetSocketTask* r = oldestPerSocket[i];
+      if (r == NULL) continue;
+      int prevOffset = r->offset;
+      r->result = ncclSocketProgress(r->op, r->sock, r->data, r->size, &r->offset);
+      if (r->result != ncclSuccess) {
+        ncclNetSocketMarkFailed(comm);
+        WARN("NET/Socket : socket progress error");
+        return NULL;
+      }
+      if (r->offset > prevOffset) {
+        __atomic_store_n(&r->lastProgressNs, ncclNetSocketNowNs(), __ATOMIC_RELAXED);
+      }
+      idle = 0;
     }
     if (idle) {
       pthread_mutex_lock(&resource->threadLock);
@@ -576,16 +582,17 @@ ncclResult_t ncclNetSocketGetTask(struct ncclNetSocketComm* comm, int op, void* 
     ncclSetThreadName(comm->helperThread[tid], "NCCL Sock%c%1u%2u%2u", op == NCCL_SOCKET_SEND ? 'S' : 'R', comm->dev, tid, comm->cudaDev);
   }
   struct ncclNetSocketTask* r = queue->tasks+queue->next;
-  if (r->used == 0) {
+  if (__atomic_load_n(&r->used, __ATOMIC_ACQUIRE) == 0) {
     r->op = op;
     r->data = data;
     r->size = size;
     r->sock = comm->socks + comm->nextSock;
     r->offset = 0;
     r->result = ncclSuccess;
+    r->seq = comm->nextTaskSeq++;
     r->lastProgressNs = ncclNetSocketNowNs();
     comm->nextSock = (comm->nextSock + 1) % comm->nSocks;
-    r->used = 1;
+    __atomic_store_n(&r->used, 1, __ATOMIC_RELEASE);
     *req = r;
     pthread_mutex_lock(&res->threadLock);
     queue->next = (queue->next+1)%queue->len;
