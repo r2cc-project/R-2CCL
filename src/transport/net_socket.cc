@@ -139,6 +139,15 @@ enum ncclNetSocketCommState {
   ncclNetSocketCommStateRecv = 5,
 };
 
+enum ncclNetSocketRequestState {
+  ncclNetSocketRequestStateFree = 0,
+  ncclNetSocketRequestStateSize = 1,
+  ncclNetSocketRequestStatePayload = 2,
+  ncclNetSocketRequestStateAck = 3,
+  ncclNetSocketRequestStateDone = 4,
+  ncclNetSocketRequestStateFailed = 5,
+};
+
 struct ncclNetSocketCommStage {
   enum ncclNetSocketCommState state;
   uint8_t iteration;
@@ -165,6 +174,11 @@ struct ncclNetSocketTask {
   uint64_t lastProgressNs;
 };
 
+struct ncclNetSocketAck {
+  uint64_t seq;
+  int size;
+};
+
 struct ncclNetSocketRequest {
   int op;
   void* data;
@@ -172,10 +186,12 @@ struct ncclNetSocketRequest {
   int ctrlData;
   int ctrlOffset;
   struct ncclSocket* ctrlSock;
-  int ackData;
+  struct ncclNetSocketAck ackData;
   int ackOffset;
+  struct ncclSocket* ackSock;
   int offset;
   int used;
+  uint64_t seq;
   struct ncclNetSocketComm* comm;
   struct ncclNetSocketTask* tasks[MAX_SOCKETS];
   int nSubs;
@@ -212,12 +228,14 @@ struct ncclNetSocketListenComm {
 
 struct ncclNetSocketComm {
   struct ncclSocket ctrlSock;
+  struct ncclSocket ackSock;
   struct ncclSocket socks[MAX_SOCKETS];
   int dev;
   int cudaDev;
   int nSocks;
   int nThreads;
   int nextSock;
+  uint64_t nextRequestSeq;
   int failed;
   struct ncclNetSocketRequest requests[MAX_REQUESTS];
   pthread_t helperThread[MAX_THREADS];
@@ -240,14 +258,43 @@ static inline bool ncclNetSocketUpdateProgress(uint64_t* lastProgressNs, int pre
   return true;
 }
 
-static inline void ncclNetSocketCompleteRequest(struct ncclNetSocketRequest* r, int* done, int* size) {
-  if (size) *size = r->size;
-  *done = 1;
-  r->used = 0;
+static inline bool ncclNetSocketRequestActive(struct ncclNetSocketRequest* r) {
+  return r->used != ncclNetSocketRequestStateFree;
+}
+
+static inline void ncclNetSocketReleaseTasks(struct ncclNetSocketRequest* r) {
   for (int i=0; i<r->nSubs; i++) {
     struct ncclNetSocketTask* sub = r->tasks[i];
-    sub->used = 0;
+    if (sub) {
+      sub->used = 0;
+      r->tasks[i] = NULL;
+    }
   }
+  r->nSubs = 0;
+}
+
+static inline void ncclNetSocketRequestDone(struct ncclNetSocketRequest* r) {
+  ncclNetSocketReleaseTasks(r);
+  r->lastProgressNs = ncclNetSocketNowNs();
+  r->used = ncclNetSocketRequestStateDone;
+}
+
+static inline void ncclNetSocketReapRequest(struct ncclNetSocketRequest* r, int* done, int* size) {
+  if (size) *size = r->size;
+  *done = 1;
+  ncclNetSocketReleaseTasks(r);
+  r->used = ncclNetSocketRequestStateFree;
+}
+
+static inline void ncclNetSocketStartAck(struct ncclNetSocketRequest* r) {
+  memset(&r->ackData, 0, sizeof(r->ackData));
+  if (r->op == NCCL_SOCKET_RECV) {
+    r->ackData.seq = r->seq;
+    r->ackData.size = r->size;
+  }
+  r->ackOffset = 0;
+  r->lastProgressNs = ncclNetSocketNowNs();
+  r->used = ncclNetSocketRequestStateAck;
 }
 
 void* persistentSocketThread(void *args_) {
@@ -397,8 +444,9 @@ ncclResult_t ncclNetSocketConnect(int dev, void* opaqueHandle, void** sendComm, 
   comm->nThreads = handle->nThreads;
   comm->dev = dev;
   CUDACHECK(cudaGetDevice(&comm->cudaDev));
-  for (; i<comm->nSocks+1; i++) {
-    sock = (i == comm->nSocks) ? &comm->ctrlSock : comm->socks+i;
+  for (; i<comm->nSocks+2; i++) {
+    sock = (i == comm->nSocks) ? &comm->ctrlSock :
+      (i == comm->nSocks+1) ? &comm->ackSock : comm->socks+i;
     NCCLCHECK(ncclSocketInit(sock, &handle->connectAddr, handle->magic, ncclSocketTypeNetSocket, NULL, 1));
 
     stage->sock = sock;
@@ -438,7 +486,7 @@ ncclResult_t ncclNetSocketAccept(void* listenComm, void** recvComm, ncclNetDevic
   rComm->nThreads = lComm->nThreads;
   rComm->dev = lComm->dev;
   CUDACHECK(cudaGetDevice(&rComm->cudaDev));
-  for (; i<rComm->nSocks+1; i++) {
+  for (; i<rComm->nSocks+2; i++) {
     uint8_t sendSockIdx;
 
     NCCLCHECK(ncclCalloc(&sock, 1));
@@ -460,6 +508,8 @@ socket_recv:
 
     if (sendSockIdx == rComm->nSocks)
       memcpy(&rComm->ctrlSock, sock, sizeof(struct ncclSocket));
+    else if (sendSockIdx == rComm->nSocks+1)
+      memcpy(&rComm->ackSock, sock, sizeof(struct ncclSocket));
     else
       memcpy(rComm->socks+sendSockIdx, sock, sizeof(struct ncclSocket));
     free(sock);
@@ -477,7 +527,7 @@ socket_recv:
 ncclResult_t ncclNetSocketGetRequest(struct ncclNetSocketComm* comm, int op, void* data, int size, struct ncclNetSocketRequest** req) {
   for (int i=0; i<MAX_REQUESTS; i++) {
     struct ncclNetSocketRequest* r = comm->requests+i;
-    if (r->used == 0) {
+    if (r->used == ncclNetSocketRequestStateFree) {
       uint64_t nowNs = ncclNetSocketNowNs();
       r->op = op;
       r->data = data;
@@ -485,10 +535,12 @@ ncclResult_t ncclNetSocketGetRequest(struct ncclNetSocketComm* comm, int op, voi
       r->ctrlData = size;
       r->ctrlOffset = 0;
       r->ctrlSock = &comm->ctrlSock;
-      r->ackData = 0;
+      memset(&r->ackData, 0, sizeof(r->ackData));
       r->ackOffset = 0;
+      r->ackSock = &comm->ackSock;
       r->offset = 0;
-      r->used = 1;
+      r->used = ncclNetSocketRequestStateSize;
+      r->seq = comm->nextRequestSeq++;
       r->comm = comm;
       r->nSubs = 0;
       r->lastProgressNs = nowNs;
@@ -545,6 +597,200 @@ ncclResult_t ncclNetSocketGetTask(struct ncclNetSocketComm* comm, int op, void* 
   return ncclInternalError;
 }
 
+static ncclResult_t ncclNetSocketProgressSize(struct ncclNetSocketRequest* r, int* ctrlBlocked) {
+  int prevOffset = r->ctrlOffset;
+  ncclResult_t ret = ncclSocketProgress(r->op, r->ctrlSock, &r->ctrlData, sizeof(int), &r->ctrlOffset);
+
+  if (ret != ncclSuccess) {
+    r->used = ncclNetSocketRequestStateFailed;
+    ncclNetSocketMarkFailed(r->comm);
+    WARN("NET/Socket : ctrl socket failure");
+    return ncclSuccess;
+  }
+
+  if (!ncclNetSocketUpdateProgress(&r->lastProgressNs, prevOffset, r->ctrlOffset) &&
+      r->ctrlOffset < (int)sizeof(int) &&
+      ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
+    r->used = ncclNetSocketRequestStateFailed;
+    ncclNetSocketMarkFailed(r->comm);
+    WARN("NET/Socket : request stalled");
+    return ncclSuccess;
+  }
+
+  if (r->ctrlOffset < (int)sizeof(int)) {
+    *ctrlBlocked = 1;
+    return ncclSuccess;
+  }
+
+  // Check size is less or equal to the size provided by the user
+  if (r->op == NCCL_SOCKET_RECV && r->ctrlData > r->size) {
+    char line[SOCKET_NAME_MAXLEN+1];
+    union ncclSocketAddress addr;
+    NCCLCHECK(ncclSocketGetAddr(r->ctrlSock, &addr));
+    WARN("NET/Socket : peer %s message truncated : receiving %d bytes instead of %d. If you believe your socket network is in healthy state, \
+        there may be a mismatch in collective sizes or environment settings (e.g. NCCL_PROTO, NCCL_ALGO) between ranks",
+        ncclSocketToString(&addr, line), r->ctrlData, r->size);
+    return ncclInvalidUsage;
+  }
+  r->size = r->ctrlData;
+  r->offset = 0;
+  r->used = ncclNetSocketRequestStatePayload;
+
+  int chunkOffset = 0, i = 0;
+  if (r->comm->nSocks > 0) {
+    // Each request can be divided up to nSocks tasks.
+    int taskSize = std::max(MIN_CHUNKSIZE, DIVUP(r->size, r->comm->nSocks));
+    while (chunkOffset < r->size) {
+      int chunkSize = std::min(taskSize, r->size-chunkOffset);
+      NCCLCHECK(ncclNetSocketGetTask(r->comm, r->op, (char*)(r->data)+chunkOffset, chunkSize, r->tasks+i++));
+      chunkOffset += chunkSize;
+    }
+  }
+  r->nSubs = i;
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclNetSocketProgressPayload(struct ncclNetSocketRequest* r, int* ctrlBlocked) {
+  int payloadDone = 0;
+  if (r->nSubs > 0) {
+    int nCompleted = 0;
+    uint64_t nowNs = ncclNetSocketNowNs();
+    for (int i=0; i<r->nSubs; i++) {
+      struct ncclNetSocketTask* sub = r->tasks[i];
+      if (sub->result != ncclSuccess) {
+        r->used = ncclNetSocketRequestStateFailed;
+        ncclNetSocketMarkFailed(r->comm);
+        WARN("NET/Socket : subtask failure");
+        return ncclSuccess;
+      }
+      if (sub->offset == sub->size) {
+        nCompleted++;
+      } else if (ncclNetSocketProgressTimedOut(__atomic_load_n(&sub->lastProgressNs, __ATOMIC_RELAXED), nowNs)) {
+        r->used = ncclNetSocketRequestStateFailed;
+        ncclNetSocketMarkFailed(r->comm);
+        WARN("NET/Socket : request stalled");
+        return ncclSuccess;
+      }
+    }
+    if (nCompleted == r->nSubs) payloadDone = 1;
+  } else {
+    // With no helper sockets, payload shares ctrlSock and must remain ordered with size headers.
+    if (r->offset < r->size) {
+      int prevOffset = r->offset;
+      ncclResult_t ret = ncclSocketProgress(r->op, r->ctrlSock, r->data, r->size, &r->offset);
+      if (ret != ncclSuccess) {
+        r->used = ncclNetSocketRequestStateFailed;
+        ncclNetSocketMarkFailed(r->comm);
+        WARN("NET/Socket : ctrl socket failure");
+        return ncclSuccess;
+      }
+      if (!ncclNetSocketUpdateProgress(&r->lastProgressNs, prevOffset, r->offset) &&
+          r->offset < r->size &&
+          ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
+        r->used = ncclNetSocketRequestStateFailed;
+        ncclNetSocketMarkFailed(r->comm);
+        WARN("NET/Socket : request stalled");
+        return ncclSuccess;
+      }
+    }
+    if (r->offset == r->size) {
+      payloadDone = 1;
+    } else {
+      *ctrlBlocked = 1;
+    }
+  }
+
+  if (payloadDone) {
+    ncclNetSocketReleaseTasks(r);
+    if (ncclParamSocketPeerAck()) {
+      // For TCP, local send completion only means the kernel accepted bytes.
+      // Wait for a peer ACK so blackholed traffic is visible to the stall timer.
+      ncclNetSocketStartAck(r);
+    } else {
+      ncclNetSocketRequestDone(r);
+    }
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclNetSocketProgressAck(struct ncclNetSocketRequest* r, int* ackBlocked) {
+  int ackOp = r->op == NCCL_SOCKET_SEND ? NCCL_SOCKET_RECV : NCCL_SOCKET_SEND;
+  int prevOffset = r->ackOffset;
+  ncclResult_t ret = ncclSocketProgress(ackOp, r->ackSock, &r->ackData, sizeof(r->ackData), &r->ackOffset);
+  if (ret != ncclSuccess) {
+    r->used = ncclNetSocketRequestStateFailed;
+    ncclNetSocketMarkFailed(r->comm);
+    WARN("NET/Socket : peer ACK socket failure");
+    return ncclSuccess;
+  }
+  if (!ncclNetSocketUpdateProgress(&r->lastProgressNs, prevOffset, r->ackOffset) &&
+      r->ackOffset < (int)sizeof(r->ackData) &&
+      ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
+    r->used = ncclNetSocketRequestStateFailed;
+    ncclNetSocketMarkFailed(r->comm);
+    WARN("NET/Socket : peer ACK stalled");
+    return ncclSuccess;
+  }
+  if (r->ackOffset < (int)sizeof(r->ackData)) {
+    *ackBlocked = 1;
+    return ncclSuccess;
+  }
+  if (r->op == NCCL_SOCKET_SEND && (r->ackData.seq != r->seq || r->ackData.size != r->size)) {
+    r->used = ncclNetSocketRequestStateFailed;
+    ncclNetSocketMarkFailed(r->comm);
+    WARN("NET/Socket : peer ACK mismatch : received seq %llu size %d expected seq %llu size %d",
+         (unsigned long long)r->ackData.seq, r->ackData.size, (unsigned long long)r->seq, r->size);
+    return ncclSuccess;
+  }
+  ncclNetSocketRequestDone(r);
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclNetSocketProgressComm(struct ncclNetSocketComm* comm) {
+  if (comm == NULL) return ncclInternalError;
+  if (__atomic_load_n(&comm->failed, __ATOMIC_RELAXED)) return ncclSuccess;
+
+  int ctrlBlocked = 0;
+  int ackBlocked = 0;
+  uint64_t lastSeq = 0;
+  int haveLastSeq = 0;
+
+  while (1) {
+    struct ncclNetSocketRequest* r = NULL;
+    for (int i=0; i<MAX_REQUESTS; i++) {
+      struct ncclNetSocketRequest* candidate = comm->requests+i;
+      if (!ncclNetSocketRequestActive(candidate)) continue;
+      if (haveLastSeq && candidate->seq <= lastSeq) continue;
+      if (r == NULL || candidate->seq < r->seq) r = candidate;
+    }
+    if (r == NULL) break;
+    lastSeq = r->seq;
+    haveLastSeq = 1;
+
+    if (r->used == ncclNetSocketRequestStateFailed) {
+      ncclNetSocketMarkFailed(comm);
+      return ncclSuccess;
+    }
+
+    if (r->used == ncclNetSocketRequestStateSize) {
+      if (!ctrlBlocked) NCCLCHECK(ncclNetSocketProgressSize(r, &ctrlBlocked));
+    }
+
+    if (r->used == ncclNetSocketRequestStatePayload) {
+      NCCLCHECK(ncclNetSocketProgressPayload(r, &ctrlBlocked));
+    }
+
+    if (ackBlocked) continue;
+    if (r->used == ncclNetSocketRequestStateAck) {
+      NCCLCHECK(ncclNetSocketProgressAck(r, &ackBlocked));
+    } else if (ncclParamSocketPeerAck() && r->used != ncclNetSocketRequestStateDone) {
+      // Keep ACK stream ordered. Later requests may move payload, but their ACKs wait here.
+      ackBlocked = 1;
+    }
+  }
+  return ncclSuccess;
+}
+
 ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
   *done = 0;
   struct ncclNetSocketRequest *r = (struct ncclNetSocketRequest*)request;
@@ -552,145 +798,19 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     WARN("NET/Socket : test called with NULL request");
     return ncclInternalError;
   }
-  // Check socket failure flag
+
+  NCCLCHECK(ncclNetSocketProgressComm(r->comm));
+
   if (r->comm && __atomic_load_n(&r->comm->failed, __ATOMIC_RELAXED)) {
     *done = -1;
     return ncclSuccess;
   }
-  if (r->used == 1) { /* try to send/recv size */
-    int prevOffset = r->ctrlOffset;
-    ncclResult_t ret = ncclSocketProgress(r->op, r->ctrlSock, &r->ctrlData, sizeof(int), &r->ctrlOffset);
-
-    if (ret != ncclSuccess) {
-      ncclNetSocketMarkFailed(r->comm);
-      WARN("NET/Socket : ctrl socket failure");
-      *done = -1;
-      return ncclSuccess;
-    }
-
-    // Check socket progress timeout
-    if (!ncclNetSocketUpdateProgress(&r->lastProgressNs, prevOffset, r->ctrlOffset) &&
-        r->ctrlOffset < (int)sizeof(int) &&
-        ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
-      ncclNetSocketMarkFailed(r->comm);
-      WARN("NET/Socket : request stalled");
-      *done = -1;
-      return ncclSuccess;
-    }
-
-    if (r->ctrlOffset < (int)sizeof(int)) return ncclSuccess; /* Not ready -- retry later */
-
-    // Check size is less or equal to the size provided by the user
-    if (r->op == NCCL_SOCKET_RECV && r->ctrlData > r->size) {
-      char line[SOCKET_NAME_MAXLEN+1];
-      union ncclSocketAddress addr;
-      NCCLCHECK(ncclSocketGetAddr(r->ctrlSock, &addr));
-      WARN("NET/Socket : peer %s message truncated : receiving %d bytes instead of %d. If you believe your socket network is in healthy state, \
-          there may be a mismatch in collective sizes or environment settings (e.g. NCCL_PROTO, NCCL_ALGO) between ranks",
-          ncclSocketToString(&addr, line), r->ctrlData, r->size);
-      return ncclInvalidUsage;
-    }
-    r->size = r->ctrlData;
-    r->offset = 0;
-    r->used = 2; // done exchanging size
-    // divide into subtasks
-    int chunkOffset = 0, i = 0;
-    if (r->comm->nSocks > 0) {
-      // each request can be divided up to nSocks tasks
-      int taskSize = std::max(MIN_CHUNKSIZE, DIVUP(r->size, r->comm->nSocks));
-      while (chunkOffset < r->size) {
-        int chunkSize = std::min(taskSize, r->size-chunkOffset);
-        NCCLCHECK(ncclNetSocketGetTask(r->comm, r->op, (char*)(r->data)+chunkOffset, chunkSize, r->tasks+i++));
-        chunkOffset += chunkSize;
-      }
-    }
-    r->nSubs = i;
+  if (r->used == ncclNetSocketRequestStateFailed) {
+    *done = -1;
+    return ncclSuccess;
   }
-  if (r->used == 2) { // already exchanged size
-    int payloadDone = 0;
-    if (r->nSubs > 0) {
-      int nCompleted = 0;
-      uint64_t nowNs = ncclNetSocketNowNs();
-      for (int i=0; i<r->nSubs; i++) {
-        struct ncclNetSocketTask* sub = r->tasks[i];
-        if (sub->result != ncclSuccess) {
-          ncclNetSocketMarkFailed(r->comm);
-          WARN("NET/Socket : subtask failure");
-          *done = -1;
-          return ncclSuccess;
-        }
-        if (sub->offset == sub->size) {
-          nCompleted++;
-        // Check socket progress timeout
-        } else if (ncclNetSocketProgressTimedOut(__atomic_load_n(&sub->lastProgressNs, __ATOMIC_RELAXED), nowNs)) {
-          ncclNetSocketMarkFailed(r->comm);
-          WARN("NET/Socket : request stalled");
-          *done = -1;
-          return ncclSuccess;
-        }
-      }
-      if (nCompleted == r->nSubs) payloadDone = 1;
-    } else { // progress request using main thread
-      if (r->offset < r->size) {
-        int prevOffset = r->offset;
-        ncclResult_t ret = ncclSocketProgress(r->op, r->ctrlSock, r->data, r->size, &r->offset);
-        if (ret != ncclSuccess) {
-          ncclNetSocketMarkFailed(r->comm);
-          WARN("NET/Socket : ctrl socket failure");
-          *done = -1;
-          return ncclSuccess;
-        }
-        // Check socket progress timeout
-        if (!ncclNetSocketUpdateProgress(&r->lastProgressNs, prevOffset, r->offset) &&
-            r->offset < r->size &&
-            ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
-          ncclNetSocketMarkFailed(r->comm);
-          WARN("NET/Socket : request stalled");
-          *done = -1;
-          return ncclSuccess;
-        }
-      }
-      if (r->offset == r->size) payloadDone = 1;
-    }
-    if (payloadDone) {
-      if (ncclParamSocketPeerAck()) {
-        // For TCP, local send completion only means the kernel accepted bytes.
-        // Wait for a peer ACK so blackholed traffic is visible to the stall timer.
-        r->ackData = r->op == NCCL_SOCKET_RECV ? r->size : 0;
-        r->ackOffset = 0;
-        r->lastProgressNs = ncclNetSocketNowNs();
-        r->used = 3;
-      } else {
-        ncclNetSocketCompleteRequest(r, done, size);
-      }
-    }
-  }
-  if (r->used == 3) { // payload done; exchange peer ACK
-    int ackOp = r->op == NCCL_SOCKET_SEND ? NCCL_SOCKET_RECV : NCCL_SOCKET_SEND;
-    int prevOffset = r->ackOffset;
-    ncclResult_t ret = ncclSocketProgress(ackOp, r->ctrlSock, &r->ackData, sizeof(int), &r->ackOffset);
-    if (ret != ncclSuccess) {
-      ncclNetSocketMarkFailed(r->comm);
-      WARN("NET/Socket : peer ACK socket failure");
-      *done = -1;
-      return ncclSuccess;
-    }
-    if (!ncclNetSocketUpdateProgress(&r->lastProgressNs, prevOffset, r->ackOffset) &&
-        r->ackOffset < (int)sizeof(int) &&
-        ncclNetSocketProgressTimedOut(r->lastProgressNs, ncclNetSocketNowNs())) {
-      ncclNetSocketMarkFailed(r->comm);
-      WARN("NET/Socket : peer ACK stalled");
-      *done = -1;
-      return ncclSuccess;
-    }
-    if (r->ackOffset < (int)sizeof(int)) return ncclSuccess;
-    if (r->op == NCCL_SOCKET_SEND && r->ackData != r->size) {
-      ncclNetSocketMarkFailed(r->comm);
-      WARN("NET/Socket : peer ACK size mismatch : received %d expected %d", r->ackData, r->size);
-      *done = -1;
-      return ncclSuccess;
-    }
-    ncclNetSocketCompleteRequest(r, done, size);
+  if (r->used == ncclNetSocketRequestStateDone) {
+    ncclNetSocketReapRequest(r, done, size);
   }
   return ncclSuccess;
 }
@@ -746,6 +866,8 @@ ncclResult_t ncclNetSocketClose(void* opaqueComm) {
     int ready;
     NCCLCHECK(ncclSocketReady(&comm->ctrlSock, &ready));
     if (ready) NCCLCHECK(ncclSocketClose(&comm->ctrlSock));
+    NCCLCHECK(ncclSocketReady(&comm->ackSock, &ready));
+    if (ready) NCCLCHECK(ncclSocketClose(&comm->ackSock));
     for (int i=0; i<comm->nSocks; i++) {
       NCCLCHECK(ncclSocketReady(&comm->socks[i], &ready));
       if (ready) NCCLCHECK(ncclSocketClose(&comm->socks[i]));
