@@ -125,12 +125,13 @@ NCCL_PARAM(SocketNsocksPerThread, "NSOCKS_PERTHREAD", -2);
 NCCL_PARAM(SocketNthreads, "SOCKET_NTHREADS", -2);
 NCCL_PARAM(R2ccTcpUserTimeoutMs, "R2CC_TCP_USER_TIMEOUT_MS", 0);
 
-// R2CC fault injection: close primary sockets after this many isend calls (0 = disabled)
+// Test-only fault injection: shut down primary sockets after N isend calls.
+// A value of 0 disables injection.
 static int r2ccInjectFailureAfter = -1;
 static long r2ccIsendCount = 0;
 
-// Set TCP keepalive and user timeout so dead paths are detected without
-// spuriously killing large healthy socket transfers.
+// Keepalive is enabled for idle dead-peer detection.  TCP_USER_TIMEOUT is
+// optional because too small a value can false-trip during large transfers.
 static ncclResult_t r2ccSetTcpKeepalive(int fd) {
   if (fd < 0) return ncclSuccess;
   int on = 1;
@@ -139,9 +140,8 @@ static ncclResult_t r2ccSetTcpKeepalive(int fd) {
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,   &idle,  sizeof(idle));
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,  &intvl, sizeof(intvl));
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,    &cnt,   sizeof(cnt));
-  // TCP_USER_TIMEOUT covers active transfers where keepalive doesn't fire.
-  // Leave it disabled by default; a too-small value can false-trip during
-  // large healthy socket allreduces.
+  // TCP_USER_TIMEOUT covers active transfers where keepalive will not fire.
+  // Leave it disabled by default unless the test explicitly requests it.
   int timeoutMs = ncclParamR2ccTcpUserTimeoutMs();
   if (timeoutMs > 0) {
     setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
@@ -192,7 +192,7 @@ struct ncclNetSocketRequest {
   struct ncclNetSocketComm* comm;
   struct ncclNetSocketTask* tasks[MAX_SOCKETS];
   int nSubs;
-  // R2CC fields for backup support
+  // Metadata consumed by the generic R2CC net failover path.
   int channel;
   int id;
   void* netComm;
@@ -233,9 +233,8 @@ struct ncclNetSocketComm {
   struct ncclNetSocketRequest requests[MAX_REQUESTS];
   pthread_t helperThread[MAX_THREADS];
   struct ncclNetSocketThreadResources threadResources[MAX_THREADS];
-  // Set by any persistentSocketThread that encounters a fatal I/O error.
-  // checkSwitchToBackup polls this so it detects failure even after SO_ERROR
-  // has been consumed by the thread's recv() call.
+  // Latched when a socket helper thread observes a fatal I/O error.  test()
+  // converts this into done=-1 so net.cc can enter hot repair.
   volatile int socketError;
 };
 
@@ -526,6 +525,9 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     WARN("NET/Socket : test called with NULL request");
     return ncclInternalError;
   }
+  // R2CC treats done=-1 as a repairable transport failure.  Return
+  // ncclSuccess so the proxy can coordinate OOB failover instead of aborting
+  // the communicator from inside the socket transport.
   if (r->comm && __atomic_load_n(&r->comm->socketError, __ATOMIC_ACQUIRE)) {
     WARN("NET/Socket: test comm socketError set; reporting done=-1 for OOB failover");
     *done = -1;
@@ -615,7 +617,7 @@ ncclResult_t ncclNetSocketDeregMr(void* comm, void* mhandle) { return ncclSucces
 ncclResult_t ncclNetSocketIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
   struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)sendComm;
 
-  // R2CC fault injection: shut down primary sockets after N sends to simulate a NIC failure.
+  // Test-only injection path used by the socket hot-repair harness.
   if (r2ccInjectFailureAfter == -1) {
     const char* env = getenv("R2CC_INJECT_FAILURE_AFTER");
     r2ccInjectFailureAfter = env ? atoi(env) : 0;
@@ -681,11 +683,11 @@ ncclResult_t ncclNetSocketClose(void* opaqueComm) {
   return ncclSuccess;
 }
 
-// R2CC backup support functions for Socket transport
+// Socket hooks used by the generic R2CC backup/failover interface.
 
-// Called on the sender after it decides to switch to backup.  Send a 0xBB
-// signal byte on the control socket so the receiver can detect the transition
-// even if setBackup/testBackup are re-enabled in the future.
+// Optional in-band backup marker retained for compatibility with the generic
+// net interface.  The TCP hot-repair path primarily uses the OOB
+// FAILOVER_HINT/FAILOVER_REQ protocol.
 ncclResult_t ncclNetSocketSetBackup(void* sendComm) {
   if (sendComm == NULL) return ncclSuccess;
   struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)sendComm;
@@ -696,8 +698,8 @@ ncclResult_t ncclNetSocketSetBackup(void* sendComm) {
   return ncclSuccess;
 }
 
-// Called on the receiver to check whether the sender has signalled a switch.
-// Returns *done = -1 (matching IB convention) when the 0xBB byte is seen.
+// Check whether the optional in-band backup marker arrived.  A marker maps to
+// done=-1, matching the generic net failover convention.
 ncclResult_t ncclNetSocketTestBackup(void* recvComm, int* done) {
   *done = 0;
   if (recvComm == NULL) return ncclSuccess;
@@ -768,20 +770,21 @@ ncclResult_t ncclNetSocketSetRequestOperation(void** request, int op) {
   return ncclSuccess;
 }
 
-// Called each sendProxyProgress tick to detect local TCP path failure.
-// Uses SO_ERROR (catches ETIMEDOUT after keepalive/TCP_USER_TIMEOUT) and a
-// non-blocking MSG_PEEK recv (catches EOF / ECONNRESET / ENOTCONN from
-// shutdown() during fault injection).  Returns *change = 1 to trigger failover.
+// Local-detection hook for TCP failures.  The OOB path primarily reacts through
+// ncclNetSocketTest(done=-1), but this keeps the generic checkSwitchToBackup
+// integration point useful if enabled in net.cc.  SO_ERROR catches asynchronous
+// socket failures, while MSG_PEEK catches EOF/reset on the control socket.
 ncclResult_t ncclNetSocketCheckSwitchToBackup(void* sendComm, int* change) {
   *change = 0;
   if (sendComm == NULL) return ncclSuccess;
 
   struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)sendComm;
 
-  // Fast path: a persistent thread already reported an I/O error.  SO_ERROR may
-  // have been consumed by that thread's recv() so we cannot rely on getsockopt.
+  // Fast path: a helper thread already reported an I/O error.  SO_ERROR may
+  // have been consumed by that thread's recv(), so getsockopt alone is not
+  // reliable here.
   if (__atomic_load_n(&comm->socketError, __ATOMIC_ACQUIRE)) {
-    INFO(NCCL_R2CC, "NET/Socket: CheckSwitchToBackup: socketError flag set — switching to backup");
+    INFO(NCCL_R2CC, "NET/Socket: CheckSwitchToBackup: socketError flag set; switching to backup");
     *change = 1;
     return ncclSuccess;
   }
@@ -797,7 +800,7 @@ ncclResult_t ncclNetSocketCheckSwitchToBackup(void* sendComm, int* change) {
     if (sfd < 0) { *change = 1; return true; }
     int err = 0; socklen_t el = sizeof(err);
     if (getsockopt(sfd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err != 0) {
-      INFO(NCCL_R2CC, "NET/Socket: CheckSwitchToBackup: %s SO_ERROR=%d (%s) — switching",
+      INFO(NCCL_R2CC, "NET/Socket: CheckSwitchToBackup: %s SO_ERROR=%d (%s); switching",
            label, err, strerror(err));
       *change = 1; return true;
     }
@@ -807,20 +810,20 @@ ncclResult_t ncclNetSocketCheckSwitchToBackup(void* sendComm, int* change) {
   // Check ctrl socket SO_ERROR first.
   if (checkFd(fd, "ctrlSock")) return ncclSuccess;
 
-  // Check each data socket SO_ERROR — these are the active transfer paths
+  // Check each data socket SO_ERROR.  These are the active transfer paths
   // and will hit TCP_USER_TIMEOUT before the idle ctrl socket does.
   for (int i = 0; i < comm->nSocks; i++) {
     char label[32]; snprintf(label, sizeof(label), "sock[%d]", i);
     if (checkFd(comm->socks[i].fd, label)) return ncclSuccess;
   }
 
-  // Non-blocking peek on the ctrl socket to catch EOF (shutdown/fault-inject)
-  // or ECONNRESET.  Only check ctrl here since data sockets are owned by
-  // persistent threads and MSG_PEEK from two threads is not safe.
+  // Non-blocking peek on the control socket catches EOF or reset.  Only check
+  // the control socket here; data sockets are owned by helper threads, and
+  // peeking from two threads is not safe.
   char probe;
   ssize_t n = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
   if (n == 0) {
-    INFO(NCCL_R2CC, "NET/Socket: CheckSwitchToBackup: EOF on ctrl socket — switching");
+    INFO(NCCL_R2CC, "NET/Socket: CheckSwitchToBackup: EOF on ctrl socket; switching");
     *change = 1;
   } else if (n < 0) {
     int e = errno;

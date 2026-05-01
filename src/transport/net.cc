@@ -1967,6 +1967,8 @@ static void r2ccTraceProxyState(
 
 static constexpr int R2CC_FAILOVER_DIR_S2R = 0;
 
+// Roll the send proxy back to the absolute step agreed on by the peer, then
+// route subsequent network operations through the pre-established backup comm.
 static inline void r2ccSendRollbackCommToAbs(struct ncclProxyArgs* args, struct sendNetResources* targetRes,
                                              uint64_t rollbackAbsStep) {
   if (targetRes == NULL) return;
@@ -1998,6 +2000,9 @@ static inline ncclResult_t r2ccSendStartFailoverReq(struct ncclProxyArgs* args, 
   uint64_t nextEpoch = targetRes->failoverEpoch + 1;
   if (epochFloor > nextEpoch) nextEpoch = epochFloor;
   targetRes->failoverEpoch = nextEpoch;
+  // For receiver-triggered failover, the receiver's hint is the safe replay
+  // point. The sender may have completed local socket sends whose data the
+  // receiver did not safely consume before the TCP path failed.
   uint64_t localDoneAbs = triggerSub->base + triggerSub->done;
   uint64_t reqAbsStep = localDoneAbs;
   if (triggerReason && strcmp(triggerReason, "recv_failover_hint") == 0 && triggerAbsStep < reqAbsStep) {
@@ -2174,7 +2179,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
   }
   args->idle = 1;
   if (args->state == ncclProxyOpProgress) {
-    // Poll OOB mailbox and process failover ACKs per backup context.
+    // Poll OOB mailbox for receiver hints and failover ACKs per backup context.
     OobNet& oob = OobNet::Get();
     oob.PollHotRepair();
     const uint64_t nowMs = r2ccNowMs();
@@ -2294,9 +2299,11 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           TRACE(NCCL_NET, "sub->reg=%d, connFifo[buffSlot].size=%ld, (*recvTail > tail)=%d, (p == NCCL_PROTO_LL)=%d, a=%d, b=%d, done=%ld, trasnmitted=%ld, recvTail=%ld", sub->reg, connFifo[buffSlot].size, (*recvTail > tail), (p == NCCL_PROTO_LL), a, b, sub->done, sub->transmitted, (*recvTail));
         }
 
-
-        // transmitted == recvTail && transmitted all allocated successful, but didn't got a 
         ssize_t connFifoSize = connFifo[buffSlot].size;
+        // During backup replay, the sender may revisit a FIFO slot whose
+        // primary-path size metadata was already consumed. If the receiver has
+        // advertised credit for the step, use the normal slice size so the
+        // replay can be posted on the backup connection.
         if (resources->useBackup && connFifoSize == -1 && ((*recvTail > tail) || p == NCCL_PROTO_LL)) {
           connFifoSize = stepSize * args->sliceSteps;
           INFO(NCCL_R2CC,
@@ -2428,13 +2435,9 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
         NCCLCHECK(proxyState->ncclNet->test(sub->requests[buffSlot], &done, &size));
         INFO(NCCL_R2CC, "SEND: Test result done=%d for request %p, channel=%d", done, sub->requests[buffSlot], sub->channelId);
         if (done == -1){
-          // std::this_thread::sleep_for(std::chrono::milliseconds(120000));
-
-          // std::this_thread::sleep_for(std::chrono::milliseconds(5000));
-          //if(!resources->useBackup)
-          //  NCCLCHECK(proxyState->ncclNet->setBackup(resources->netSendCommBackup));
-
-          // return ncclInternalError;
+          // A local send-side socket error is not enough to choose a safe
+          // replay point. Wait for the receiver's FAILOVER_HINT, which carries
+          // the receiver's last safe absolute step.
           INFO(NCCL_R2CC, "SEND: test returned -1, channel=%d, useBackup=%d; waiting for receiver FAILOVER_HINT",
                sub->channelId, resources->useBackup);
           TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d: test done=-1", args->id, sub->channelId, sub->base+sub->done, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
@@ -2936,12 +2939,15 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         
 
         if (done == 0) {
-          // Receiver does not initiate failover locally. Sender drives failover via OOB.
+          // No local failure yet. Continue polling until the request completes
+          // or the socket transport reports a repairable failure.
           r2ccTraceProxyState("RECV", args->id, subGroup->channelId, R2CC_PROXY_STAGE_WAIT_RECV_TEST, subGroup,
                               resources->useBackup, 0, "recv_wait_no_local_failover", false);
         }
         else if (done == -1){
-          // Keep receiver passive: failover is coordinated by sender OOB request.
+          // The receiver observes the failed TCP request first and advertises
+          // its safe absolute step. The sender converts that hint into a
+          // FAILOVER_REQ, switches to backup, and replays from the hinted step.
           INFO(NCCL_R2CC, "RECV: test returned -1 while waiting sender failover req channel=%d useBackup=%d",
                subGroup->channelId, resources->useBackup);
           uint64_t recvAbsStep = subGroup->base + step;
