@@ -1,4 +1,4 @@
-# R<sup>2</sup>CCL: Reliable and Resilient Collective Communication
+# R2CC: Reliable and Resilient Collective Communication
 
 ## Overview
 R<sup>2</sup>CCL is a fault tolerant communication library that provides lossless, low overhead failover by exploiting multi-NIC hardware. It is designed as a drop in replacement for NCCL to minimize full job terminations from network failures.
