@@ -15,6 +15,8 @@
 #include <poll.h>
 #include <limits.h>
 #include <fcntl.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 
 /* Init functions */
 static int ncclNetIfs = -1;
@@ -121,6 +123,31 @@ ncclResult_t ncclNetSocketGetProperties(int dev, ncclNetProperties_t* props) {
 
 NCCL_PARAM(SocketNsocksPerThread, "NSOCKS_PERTHREAD", -2);
 NCCL_PARAM(SocketNthreads, "SOCKET_NTHREADS", -2);
+NCCL_PARAM(R2ccTcpUserTimeoutMs, "R2CC_TCP_USER_TIMEOUT_MS", 0);
+
+// Test-only fault injection: shut down primary sockets after N isend calls.
+// A value of 0 disables injection.
+static int r2ccInjectFailureAfter = -1;
+static long r2ccIsendCount = 0;
+
+// Keepalive is enabled for idle dead-peer detection.  TCP_USER_TIMEOUT is
+// optional because too small a value can false-trip during large transfers.
+static ncclResult_t r2ccSetTcpKeepalive(int fd) {
+  if (fd < 0) return ncclSuccess;
+  int on = 1;
+  setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+  int idle = 2, intvl = 1, cnt = 3;
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,   &idle,  sizeof(idle));
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,  &intvl, sizeof(intvl));
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,    &cnt,   sizeof(cnt));
+  // TCP_USER_TIMEOUT covers active transfers where keepalive will not fire.
+  // Leave it disabled by default unless the test explicitly requests it.
+  int timeoutMs = ncclParamR2ccTcpUserTimeoutMs();
+  if (timeoutMs > 0) {
+    setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+  }
+  return ncclSuccess;
+}
 
 enum ncclNetSocketCommState {
   ncclNetSocketCommStateStart = 0,
@@ -165,7 +192,7 @@ struct ncclNetSocketRequest {
   struct ncclNetSocketComm* comm;
   struct ncclNetSocketTask* tasks[MAX_SOCKETS];
   int nSubs;
-  // R2CC fields for backup support
+  // Metadata consumed by the generic R2CC net failover path.
   int channel;
   int id;
   void* netComm;
@@ -206,6 +233,9 @@ struct ncclNetSocketComm {
   struct ncclNetSocketRequest requests[MAX_REQUESTS];
   pthread_t helperThread[MAX_THREADS];
   struct ncclNetSocketThreadResources threadResources[MAX_THREADS];
+  // Latched when a socket helper thread observes a fatal I/O error.  test()
+  // converts this into done=-1 so net.cc can enter hot repair.
+  volatile int socketError;
 };
 
 void* persistentSocketThread(void *args_) {
@@ -226,6 +256,7 @@ void* persistentSocketThread(void *args_) {
             r->result = ncclSocketProgress(r->op, r->sock, r->data, r->size, &r->offset);
             if (r->result != ncclSuccess) {
               WARN("NET/Socket : socket progress error");
+              __atomic_store_n(&comm->socketError, 1, __ATOMIC_RELEASE);
               return NULL;
             }
             idle = 0;
@@ -362,6 +393,7 @@ ncclResult_t ncclNetSocketConnect(int dev, void* opaqueHandle, void** sendComm, 
 socket_connect_check:
     NCCLCHECK(ncclSocketReady(sock, &ready));
     if (! ready) return ncclSuccess;
+    NCCLCHECK(r2ccSetTcpKeepalive(sock->fd));
     stage->state = ncclNetSocketCommStateSend;
 
 socket_send:
@@ -404,6 +436,7 @@ ncclResult_t ncclNetSocketAccept(void* listenComm, void** recvComm, ncclNetDevic
 socket_accept_check:
     NCCLCHECK(ncclSocketReady(sock, &ready));
     if (!ready) return ncclSuccess;
+    NCCLCHECK(r2ccSetTcpKeepalive(sock->fd));
 
     stage->state = ncclNetSocketCommStateRecv;
 socket_recv:
@@ -492,10 +525,23 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     WARN("NET/Socket : test called with NULL request");
     return ncclInternalError;
   }
+  // R2CC treats done=-1 as a repairable transport failure.  Return
+  // ncclSuccess so the proxy can coordinate OOB failover instead of aborting
+  // the communicator from inside the socket transport.
+  if (r->comm && __atomic_load_n(&r->comm->socketError, __ATOMIC_ACQUIRE)) {
+    WARN("NET/Socket: test comm socketError set; reporting done=-1 for OOB failover");
+    *done = -1;
+    return ncclSuccess;
+  }
   if (r->used == 1) { /* try to send/recv size */
     int data = r->size;
     int offset = 0;
-    NCCLCHECK(ncclSocketProgress(r->op, r->ctrlSock, &data, sizeof(int), &offset));
+    ncclResult_t progErr = ncclSocketProgress(r->op, r->ctrlSock, &data, sizeof(int), &offset);
+    if (progErr != ncclSuccess) {
+      WARN("NET/Socket: test ctrl-sock error; reporting done=-1 for OOB failover");
+      *done = -1;
+      return ncclSuccess;
+    }
 
     if (offset == 0) return ncclSuccess; /* Not ready -- retry later */
 
@@ -533,7 +579,11 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
       int nCompleted = 0;
       for (int i=0; i<r->nSubs; i++) {
         struct ncclNetSocketTask* sub = r->tasks[i];
-        if (sub->result != ncclSuccess) return sub->result;
+        if (sub->result != ncclSuccess) {
+          WARN("NET/Socket: test data-sock[%d] error; reporting done=-1 for OOB failover", i);
+          *done = -1;
+          return ncclSuccess;
+        }
         if (sub->offset == sub->size) nCompleted++;
       }
       if (nCompleted == r->nSubs) {
@@ -566,6 +616,20 @@ ncclResult_t ncclNetSocketDeregMr(void* comm, void* mhandle) { return ncclSucces
 
 ncclResult_t ncclNetSocketIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
   struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)sendComm;
+
+  // Test-only injection path used by the socket hot-repair harness.
+  if (r2ccInjectFailureAfter == -1) {
+    const char* env = getenv("R2CC_INJECT_FAILURE_AFTER");
+    r2ccInjectFailureAfter = env ? atoi(env) : 0;
+  }
+  if (r2ccInjectFailureAfter > 0 && ++r2ccIsendCount == (long)r2ccInjectFailureAfter) {
+    INFO(NCCL_R2CC, "NET/Socket: injecting failure after %ld sends (ctrlSock fd=%d)",
+         r2ccIsendCount, comm->ctrlSock.fd);
+    // shutdown (not close) so the fd stays valid but further I/O fails immediately.
+    shutdown(comm->ctrlSock.fd, SHUT_RDWR);
+    for (int i = 0; i < comm->nSocks; i++) shutdown(comm->socks[i].fd, SHUT_RDWR);
+  }
+
   NCCLCHECK(ncclNetSocketGetRequest(comm, NCCL_SOCKET_SEND, data, size, (struct ncclNetSocketRequest**)request));
   return ncclSuccess;
 }
@@ -619,15 +683,34 @@ ncclResult_t ncclNetSocketClose(void* opaqueComm) {
   return ncclSuccess;
 }
 
-// R2CC backup support functions for Socket transport
+// Socket hooks used by the generic R2CC backup/failover interface.
+
+// Optional in-band backup marker retained for compatibility with the generic
+// net interface.  The TCP hot-repair path primarily uses the OOB
+// FAILOVER_HINT/FAILOVER_REQ protocol.
 ncclResult_t ncclNetSocketSetBackup(void* sendComm) {
-  // Socket doesn't need special backup setup
+  if (sendComm == NULL) return ncclSuccess;
+  struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)sendComm;
+  if (comm->ctrlSock.fd >= 0) {
+    uint8_t sig = 0xBB;
+    send(comm->ctrlSock.fd, &sig, 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+  }
   return ncclSuccess;
 }
 
+// Check whether the optional in-band backup marker arrived.  A marker maps to
+// done=-1, matching the generic net failover convention.
 ncclResult_t ncclNetSocketTestBackup(void* recvComm, int* done) {
-  // For socket, we don't have a separate backup test mechanism
   *done = 0;
+  if (recvComm == NULL) return ncclSuccess;
+  struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)recvComm;
+  if (comm->ctrlSock.fd < 0) return ncclSuccess;
+  uint8_t sig = 0;
+  ssize_t n = recv(comm->ctrlSock.fd, &sig, 1, MSG_PEEK | MSG_DONTWAIT);
+  if (n == 1 && sig == 0xBB) {
+    recv(comm->ctrlSock.fd, &sig, 1, MSG_DONTWAIT);  // consume
+    *done = -1;
+  }
   return ncclSuccess;
 }
 
@@ -687,21 +770,67 @@ ncclResult_t ncclNetSocketSetRequestOperation(void** request, int op) {
   return ncclSuccess;
 }
 
+// Local-detection hook for TCP failures.  The OOB path primarily reacts through
+// ncclNetSocketTest(done=-1), but this keeps the generic checkSwitchToBackup
+// integration point useful if enabled in net.cc.  SO_ERROR catches asynchronous
+// socket failures, while MSG_PEEK catches EOF/reset on the control socket.
 ncclResult_t ncclNetSocketCheckSwitchToBackup(void* sendComm, int* change) {
-  // For Socket transport, we don't have automatic failure detection
-  // The application layer should handle connection failures
   *change = 0;
-  if (sendComm == NULL) {
+  if (sendComm == NULL) return ncclSuccess;
+
+  struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)sendComm;
+
+  // Fast path: a helper thread already reported an I/O error.  SO_ERROR may
+  // have been consumed by that thread's recv(), so getsockopt alone is not
+  // reliable here.
+  if (__atomic_load_n(&comm->socketError, __ATOMIC_ACQUIRE)) {
+    INFO(NCCL_R2CC, "NET/Socket: CheckSwitchToBackup: socketError flag set; switching to backup");
+    *change = 1;
     return ncclSuccess;
   }
-  
-  struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)sendComm;
-  // Check if the control socket is still connected
-  int ready;
-  NCCLCHECK(ncclSocketReady(&comm->ctrlSock, &ready));
-  if (!ready) {
-    // Socket is closed, should switch to backup
+
+  int fd = comm->ctrlSock.fd;
+  if (fd < 0) {
     *change = 1;
+    return ncclSuccess;
+  }
+
+  // Helper lambda to check one fd for async socket errors.
+  auto checkFd = [&](int sfd, const char* label) -> bool {
+    if (sfd < 0) { *change = 1; return true; }
+    int err = 0; socklen_t el = sizeof(err);
+    if (getsockopt(sfd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err != 0) {
+      INFO(NCCL_R2CC, "NET/Socket: CheckSwitchToBackup: %s SO_ERROR=%d (%s); switching",
+           label, err, strerror(err));
+      *change = 1; return true;
+    }
+    return false;
+  };
+
+  // Check ctrl socket SO_ERROR first.
+  if (checkFd(fd, "ctrlSock")) return ncclSuccess;
+
+  // Check each data socket SO_ERROR.  These are the active transfer paths
+  // and will hit TCP_USER_TIMEOUT before the idle ctrl socket does.
+  for (int i = 0; i < comm->nSocks; i++) {
+    char label[32]; snprintf(label, sizeof(label), "sock[%d]", i);
+    if (checkFd(comm->socks[i].fd, label)) return ncclSuccess;
+  }
+
+  // Non-blocking peek on the control socket catches EOF or reset.  Only check
+  // the control socket here; data sockets are owned by helper threads, and
+  // peeking from two threads is not safe.
+  char probe;
+  ssize_t n = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+  if (n == 0) {
+    INFO(NCCL_R2CC, "NET/Socket: CheckSwitchToBackup: EOF on ctrl socket; switching");
+    *change = 1;
+  } else if (n < 0) {
+    int e = errno;
+    if (e != EAGAIN && e != EWOULDBLOCK) {
+      INFO(NCCL_R2CC, "NET/Socket: CheckSwitchToBackup: recv errno=%d (%s) — switching", e, strerror(e));
+      *change = 1;
+    }
   }
   return ncclSuccess;
 }
