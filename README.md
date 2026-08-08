@@ -1,3 +1,35 @@
+# To Artifact Evaluation Reviewers
+
+R2CC is a fault-tolerant communication library designed for multi-NIC environments. Evaluating its core functionality requires at least two GPU servers equipped with multiple network interfaces.
+
+The full performance evaluation in our paper was conducted on a rented multi-node H100 cluster with eight GPUs per server. Due to the cost and temporary nature of this platform, we cannot provide continuous access to it throughout the Artifact Evaluation period.
+
+R2CC was primarily developed and tested on Clemson `r7525` nodes in CloudLab, including experiments involving real NIC failures. For this Artifact Evaluation, we provide a public CloudLab profile and a pre-built image containing the R2CC source code, dependencies, and experiment scripts. When the required nodes are available, evaluators can use them to quickly instantiate the environment and reproduce the experiment.
+
+After successfully instantiating the provided profile on two BF2-equipped `r7525` nodes, evaluators can reproduce the real NIC-failure and experiment shown in the video below by running three environment-setup scripts and one experiment script.
+
+For the complete experimental design and reproduction instructions for the `r7525` platform, please refer to [`examples/cloudlab_r7525/README.md`](./examples/cloudlab_r7525/README.md).
+
+## Platform and Availability
+
+The Clemson `r7525` is currently the only CloudLab node type equipped with multi-NIC and GPU. Due to hardware and firmware issues affecting its BlueField-2 SmartNICs, only 6 of the original 15 `r7525` nodes remain equipped with BF2 SmartNICs, which have 3 NIC ports per server. See the [CloudLab announcement regarding the `r7525` nodes](https://www.cloudlab.us/portal-news.php?idx=138).
+
+Importantly, CloudLab advance reservation only reserves `r7525` nodes; it does not guarantee that the reserved nodes will be equipped with BF2. Access to the required multi-NIC configuration therefore depends on BF2 availability at experiment instantiation time. If no BF2-equipped nodes are available, the provided CloudLab profile cannot be instantiated.
+
+For evaluators with CloudLab access, we recommend requesting an `r7525` reservation at least two weeks in advance because these nodes are highly contended. A CloudLab reservation can typically cover up to approximately 14 days.
+
+We will also make every effort to reserve the required machines and provide access to evaluators. We will keep the availability information below up to date.
+
+## Latest Server Availability Update
+
+Based on our latest communication with CloudLab operator, an existing BF2 allocation is scheduled to end on **August 12, 2026, at 6:00 PM EDT**. We will attempt to secure the released nodes at that time. If successful, our planned evaluator access window will be:
+
+> **August 12, 2026, 6:00 PM EDT – August 17, 2026, 7:00 AM EDT**
+
+Because allocation depends on real-time availability, this access window cannot be guaranteed.
+
+# Original README
+
 # R2CC: Reliable and Resilient Collective Communication
 
 ## Overview
