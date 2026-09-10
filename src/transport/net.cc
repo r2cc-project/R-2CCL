@@ -145,6 +145,10 @@ struct sendNetResources {
   uint64_t failoverReqAbsStep;
   uint64_t failoverWaitStartMs;
   uint64_t failoverWaitLastWarnMs;
+  int stallTimeoutLogged;
+  // Primary requests across proxy ops; diagnostic stall reasons must not reset this timer.
+  int outstandingSends;
+  uint64_t lastSendProgressMs;
   int stallReason;
   uint64_t stallStartMs;
   uint64_t stallLastWarnMs;
@@ -281,6 +285,7 @@ struct setupReq {
   int connIndex;
 };
 
+NCCL_PARAM(R2ccFailoverTimeoutMs, "R2CC_FAILOVER_TIMEOUT_MS", 5000);
 NCCL_PARAM(RecvTimeout, "IB_TIMEOUT", 20);
 NCCL_PARAM(RecvRetryCnt, "IB_RETRY_CNT", 7);
 NCCL_PARAM(R2CCFailoverWaitMaxMs, "R2CC_FAILOVER_WAIT_MAX_MS", -1);
@@ -301,6 +306,7 @@ static ncclResult_t sendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
   int proxyRank;
   int64_t netId;
   NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, peerInfo->rank, &netId, &req.netDev, &proxyRank));
+  if (connIndex == 0 && graph == &comm->graphs[NCCL_ALGO_RING]) comm->r2ccChanSendDev[channelId] = req.netDev;
   INFO(NCCL_R2CC, "sendSetup: rank %d->%d, channel %d, got netDev=%d", 
        myInfo->rank, peerInfo->rank, channelId, req.netDev);
   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->busId, netId, 1, &req.useGdr));
@@ -340,6 +346,7 @@ static ncclResult_t recvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
   int proxyRank;
   int64_t netId;
   NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, myInfo->rank, &netId, &req.netDev, &proxyRank));
+  if (connIndex == 0 && graph == &comm->graphs[NCCL_ALGO_RING]) comm->r2ccChanRecvDev[channelId] = req.netDev;
   INFO(NCCL_R2CC, "recvSetup: rank %d<-%d, channel %d, got netDev=%d from topology", 
        myInfo->rank, peerInfo->rank, channelId, req.netDev);
   
@@ -802,6 +809,9 @@ static ncclResult_t sendProxySetup(struct ncclProxyConnection* connection, struc
   resources->failoverWaitStartMs = 0;
   resources->failoverWaitLastWarnMs = 0;
   resources->stallReason = 0;
+  resources->stallTimeoutLogged = 0;
+  resources->outstandingSends = 0;
+  resources->lastSendProgressMs = 0;
   resources->stallStartMs = 0;
   resources->stallLastWarnMs = 0;
   resources->stallPosted = 0;
@@ -1983,11 +1993,19 @@ static inline void r2ccSendRollbackCommToDone(struct ncclProxyArgs* args, struct
   }
 }
 
-static inline ncclResult_t r2ccSendStartFailoverReq(struct ncclProxyArgs* args, struct ncclProxySubArgs* triggerSub,
+static inline ncclResult_t r2ccSendStartFailoverReq(struct ncclProxyState* proxyState, struct ncclProxyArgs* args, struct ncclProxySubArgs* triggerSub,
                                                     struct sendNetResources* targetRes, uint64_t epochFloor,
                                                     const char* triggerReason, uint64_t triggerAbsStep, int triggerPeer) {
   if (targetRes == NULL || triggerSub == NULL) return ncclSuccess;
   if (targetRes->failoverWaitAck) return ncclSuccess;
+
+  // Retire the primary before dropping proxy references or allowing backup writes.
+  // All triggers (CQ error, receiver hint, timer) use the same cleanup path.
+  if (!targetRes->useBackup && proxyState->ncclNet->abortComm != NULL) {
+    NCCLCHECK(proxyState->ncclNet->abortComm(targetRes->netSendComm));
+    targetRes->outstandingSends = 0;
+    targetRes->lastSendProgressMs = 0;
+  }
 
   uint64_t nextEpoch = targetRes->failoverEpoch + 1;
   if (epochFloor > nextEpoch) nextEpoch = epochFloor;
@@ -2042,7 +2060,7 @@ static inline ncclResult_t r2ccSendCheckFailoverAck(struct sendNetResources* tar
   return ncclSuccess;
 }
 
-static inline ncclResult_t r2ccSendCheckFailoverHint(struct ncclProxyArgs* args, struct ncclProxySubArgs* sub,
+static inline ncclResult_t r2ccSendCheckFailoverHint(struct ncclProxyState* proxyState, struct ncclProxyArgs* args, struct ncclProxySubArgs* sub,
                                                      struct sendNetResources* resources, bool* triggered) {
   if (triggered) *triggered = false;
   if (args == NULL || sub == NULL || resources == NULL) return ncclSuccess;
@@ -2070,7 +2088,7 @@ static inline ncclResult_t r2ccSendCheckFailoverHint(struct ncclProxyArgs* args,
        "SEND: received FAILOVER_HINT ch=%d conn=%d hintEpoch=%" PRIu64 " recvAbs=%" PRIu64 " peer=%d",
        resources->channelId, resources->connIndex, hintEpoch, hintRecvAbs,
        (hintPeer >= 0) ? hintPeer : resources->tpRemoteRank);
-  NCCLCHECK(r2ccSendStartFailoverReq(args, sub, resources, hintEpoch, "recv_failover_hint", hintRecvAbs, hintPeer));
+  NCCLCHECK(r2ccSendStartFailoverReq(proxyState, args, sub, resources, hintEpoch, "recv_failover_hint", hintRecvAbs, hintPeer));
   if (triggered) *triggered = true;
   return ncclSuccess;
 }
@@ -2165,8 +2183,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
   if (args->state == ncclProxyOpProgress) {
     // Poll OOB mailbox and process failover ACKs per backup context.
     OobNet& oob = OobNet::Get();
-    oob.PollHotRepair();
-    const uint64_t nowMs = r2ccNowMs();
+    if (proxyState->r2ccOobEnabled) oob.PollHotRepair();
     bool anyStepSyncWait = false;
     for (int s=0; s<args->nsubs; s++) {
       struct ncclProxySubArgs* sub = args->subs+s;
@@ -2179,10 +2196,38 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           break;
         }
       }
-      if (seenComm) continue;
+      if (seenComm || !proxyState->r2ccOobEnabled) continue;
+
+      const int64_t timeoutMs = ncclParamR2ccFailoverTimeoutMs();
+      const uint64_t nowMs = r2ccNowMs();
+      if (timeoutMs > 0 && !resources->useBackup && resources->outstandingSends > 0 &&
+          !resources->failoverWaitAck && !resources->stepSyncRequested &&
+          nowMs - resources->lastSendProgressMs > (uint64_t)timeoutMs &&
+          proxyState->ncclNet->abortComm != NULL) {
+        // Ops on a connection are serialized by proxyAppendPtr/nextPeer. Within
+        // the active op, choose the oldest outstanding sub, not a blocked enqueue.
+        struct ncclProxySubArgs* oldestSub = NULL;
+        for (int t = 0; t < args->nsubs; ++t) {
+          struct ncclProxySubArgs* candidate = args->subs + t;
+          if (candidate->connection->transportResources != resources ||
+              candidate->done >= candidate->transmitted) continue;
+          if (oldestSub == NULL || candidate->base + candidate->done < oldestSub->base + oldestSub->done)
+            oldestSub = candidate;
+        }
+        if (oldestSub != NULL) {
+          INFO(NCCL_R2CC, "SEND: sender_stall_timeout ch=%d peer=%d waitedMs=%" PRIu64,
+               resources->channelId, resources->tpRemoteRank, nowMs - resources->lastSendProgressMs);
+          NCCLCHECK(r2ccSendStartFailoverReq(proxyState, args, oldestSub, resources, 0, "sender_stall_timeout",
+                                             oldestSub->base + oldestSub->done, resources->tpRemoteRank));
+          r2ccSendClearStall(resources);
+          r2ccTraceProxyState("SEND", args->id, resources->channelId, R2CC_PROXY_STAGE_FAILOVER_SWITCH, oldestSub,
+                              resources->useBackup, resources->stepSyncRequested, "sender_stall_timeout", true);
+          args->idle = 0;
+        }
+      }
 
       bool hintTriggered = false;
-      NCCLCHECK(r2ccSendCheckFailoverHint(args, sub, resources, &hintTriggered));
+      NCCLCHECK(r2ccSendCheckFailoverHint(proxyState, args, sub, resources, &hintTriggered));
       if (hintTriggered) args->idle = 0;
 
       bool ackApplied = false;
@@ -2194,6 +2239,9 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
 
       resources->stepSyncRequested = resources->failoverWaitAck ? 1 : 0;
       if (resources->failoverWaitAck) {
+        // A receiver hint above may have just started the handshake after QP
+        // retirement. Sample now afterwards to avoid unsigned wait underflow.
+        const uint64_t nowMs = r2ccNowMs();
         if (r2ccShouldWarnStall(nowMs, &resources->failoverWaitStartMs, &resources->failoverWaitLastWarnMs, 5000, 30000)) {
           uint64_t waitedMs = nowMs - resources->failoverWaitStartMs;
           WARN("R2CC_STALL SEND waiting FAILOVER_ACK >5s ch=%d conn=%d epoch=%" PRIu64
@@ -2352,6 +2400,8 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
             NCCLCHECK(proxyState->ncclNet->isend(resources->useBackup ? resources->netSendCommBackup : resources->netSendComm , buff, size, resources->tpRank, mhandleToUse, sub->requests+buffSlot));
             
             if (sub->requests[buffSlot] != NULL) {
+              if (!resources->useBackup && resources->outstandingSends++ == 0)
+                resources->lastSendProgressMs = r2ccNowMs();
               INFO(NCCL_R2CC, "SEND: isend allocated request %p for channel=%d, buffSlot=%d", sub->requests[buffSlot], sub->channelId, buffSlot);
               TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d: allocate request success", args->id, sub->channelId, sub->base+sub->transmitted, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
               proxyState->ncclNet->setRequestChannel(&(sub->requests[buffSlot]), sub->channelId);
@@ -2410,6 +2460,10 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
         NCCLCHECK(proxyState->ncclNet->test(sub->requests[buffSlot], &done, &size));
         INFO(NCCL_R2CC, "SEND: Test result done=%d for request %p, channel=%d", done, sub->requests[buffSlot], sub->channelId);
         if (done == -1){
+          if (!proxyState->r2ccOobEnabled) {
+            WARN("NET: network request failed on R2CC child communicator");
+            return ncclRemoteError;
+          }
           // std::this_thread::sleep_for(std::chrono::milliseconds(120000));
 
           // std::this_thread::sleep_for(std::chrono::milliseconds(5000));
@@ -2419,7 +2473,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           // return ncclInternalError;
           INFO(NCCL_R2CC, "SEND ERROR PATH: test returned -1, channel=%d, useBackup=%d - THIS SHOULD NOT HAPPEN WITH MODE=1", sub->channelId, resources->useBackup);
           TRACE(NCCL_NET, "id=%d, channel=%d, step=%ld useBackup=%d, comm=%p, rank=%d, remoteRank=%d: test done=-1", args->id, sub->channelId, sub->base+sub->done, resources->useBackup, resources->useBackup ? resources->netSendCommBackup : resources->netSendComm, resources->tpRank, resources->tpRemoteRank);
-          NCCLCHECK(r2ccSendStartFailoverReq(args, sub, resources, 0, "sender_test_minus1",
+          NCCLCHECK(r2ccSendStartFailoverReq(proxyState, args, sub, resources, 0, "sender_test_minus1",
                                              sub->base + sub->done, resources->tpRemoteRank));
           r2ccSendClearStall(resources);
           r2ccTraceProxyState("SEND", args->id, sub->channelId, R2CC_PROXY_STAGE_FAILOVER_SWITCH, sub,
@@ -2428,6 +2482,10 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           break;
         }
         if (done) {
+          if (!resources->useBackup) {
+            resources->outstandingSends--;
+            resources->lastSendProgressMs = r2ccNowMs();
+          }
           // Add step completion timestamp for accurate measurement
           struct timespec step_time;
           clock_gettime(CLOCK_MONOTONIC, &step_time);
@@ -2493,6 +2551,23 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
         else {
           r2ccSendObserveStall(args, sub, resources, R2CC_SEND_STALL_WAIT_SEND_TEST,
                                done, buffSlot, -1, 0, 0);
+          const int64_t timeoutMs = ncclParamR2ccFailoverTimeoutMs();
+          // Retain only the one-time backup diagnostic; primary failover is
+          // driven exclusively by connection progress above.
+          if (timeoutMs > 0 && proxyState->r2ccOobEnabled && resources->useBackup &&
+              !resources->failoverWaitAck && !resources->stepSyncRequested &&
+              resources->stallReason == R2CC_SEND_STALL_WAIT_SEND_TEST &&
+              r2ccNowMs() - resources->stallStartMs > (uint64_t)timeoutMs) {
+            uint64_t waitedMs = r2ccNowMs() - resources->stallStartMs;
+            if (resources->useBackup) {
+              if (!resources->stallTimeoutLogged) {
+                INFO(NCCL_R2CC, "SEND: sender_stall_timeout ch=%d peer=%d waitedMs=%" PRIu64
+                     " already on backup; no further failover available",
+                     sub->channelId, resources->tpRemoteRank, waitedMs);
+                resources->stallTimeoutLogged = 1;
+              }
+            }
+          }
         }
       }
     }
@@ -2762,20 +2837,20 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
   if (args->state == ncclProxyOpProgress) {
     // Poll OOB and ingest pending failover requests (apply happens at post/test checkpoints).
     OobNet& oob = OobNet::Get();
-    oob.PollHotRepair();
+    if (proxyState->r2ccOobEnabled) oob.PollHotRepair();
 
     int p = args->protocol;
     int maxDepth = std::min(NCCL_STEPS, NCCL_SHARED_STEPS/args->nsubs);
     for (int s=0; s<args->nsubs; s+=args->subs[s].groupSize) {
       struct ncclProxySubArgs* subGroup = args->subs+s;
       bool failoverApplied = false;
-      NCCLCHECK(r2ccRecvApplyPendingFailoverReq(args, subGroup, &failoverApplied));
+      if (proxyState->r2ccOobEnabled) NCCLCHECK(r2ccRecvApplyPendingFailoverReq(args, subGroup, &failoverApplied));
       if (failoverApplied) {
         args->idle = 0;
         continue;
       }
       struct recvNetResources* subGroupRes = (struct recvNetResources*) (subGroup->connection->transportResources);
-      if (subGroupRes->waitFailoverReq) {
+      if (proxyState->r2ccOobEnabled && subGroupRes->waitFailoverReq) {
         NCCLCHECK(r2ccRecvHandleWaitFailoverReq(subGroup, subGroupRes));
         r2ccTraceProxyState("RECV", args->id, subGroup->channelId, R2CC_PROXY_STAGE_WAIT_RECV_TEST, subGroup,
                             subGroupRes->useBackup, 0, "wait_failover_req_skip_post", false);
@@ -2878,13 +2953,13 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
     for (int s=0; s<args->nsubs; s+=args->subs[s].groupSize) {
       struct ncclProxySubArgs* subGroup = args->subs+s;
       bool failoverApplied = false;
-      NCCLCHECK(r2ccRecvApplyPendingFailoverReq(args, subGroup, &failoverApplied));
+      if (proxyState->r2ccOobEnabled) NCCLCHECK(r2ccRecvApplyPendingFailoverReq(args, subGroup, &failoverApplied));
       if (failoverApplied) {
         args->idle = 0;
         continue;
       }
       struct recvNetResources* subGroupRes = (struct recvNetResources*) (subGroup->connection->transportResources);
-      if (subGroupRes->waitFailoverReq) {
+      if (proxyState->r2ccOobEnabled && subGroupRes->waitFailoverReq) {
         NCCLCHECK(r2ccRecvHandleWaitFailoverReq(subGroup, subGroupRes));
         r2ccTraceProxyState("RECV", args->id, subGroup->channelId, R2CC_PROXY_STAGE_WAIT_RECV_TEST, subGroup,
                             subGroupRes->useBackup, 0, "wait_failover_req_skip_test", false);
@@ -2923,6 +2998,10 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
                               resources->useBackup, 0, "recv_wait_no_local_failover", false);
         }
         else if (done == -1){
+          if (!proxyState->r2ccOobEnabled) {
+            WARN("NET: network request failed on R2CC child communicator");
+            return ncclRemoteError;
+          }
           // Keep receiver passive: failover is coordinated by sender OOB request.
           INFO(NCCL_R2CC, "RECV: test returned -1 while waiting sender failover req channel=%d useBackup=%d",
                subGroup->channelId, resources->useBackup);
@@ -2940,7 +3019,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           resources->waitFailoverHintLastSendMs = 0;
           resources->waitFailoverHintSendCount = 0;
           NCCLCHECK(r2ccRecvSendFailoverHint(subGroup, resources, hintEpoch, recvAbsStep, false));
-          WARN("R2CC_RECV failover trigger: test=-1, enter wait_failover_req ch=%d conn=%d epoch=%" PRIu64
+          INFO(NCCL_R2CC, "R2CC_RECV failover trigger: test=-1, enter wait_failover_req ch=%d conn=%d epoch=%" PRIu64
                " peer=%d step=%" PRIu64 " absStep=%" PRIu64 " useBackup=%d",
                subGroup->channelId, resources->connIndex, resources->lastFailoverEpoch,
                resources->tpRemoteRank, step, recvAbsStep, resources->useBackup);

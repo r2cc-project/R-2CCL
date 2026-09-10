@@ -5,6 +5,7 @@
 /install
 .vscode
 *.log
+!examples/cloudlab_r7525/logs/0[1-6].*.log
 .DS_Store
 docs/*
 !docs/HOT_REPAIR_FAILOVER_REFACTOR_PLAN.md

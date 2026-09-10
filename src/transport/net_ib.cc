@@ -951,6 +951,7 @@ struct ncclIbMrHandle {
 struct alignas(32) ncclIbNetCommBase {
   int ndevs;
   bool isSend;
+  bool aborted; // Retired comm: never reuse slots or interpret its CQEs.
   struct ncclIbRequest reqs[MAX_REQUESTS];
   struct ncclIbQp qps[NCCL_IB_MAX_QPS];
   int nqps;
@@ -1918,9 +1919,13 @@ fail:
 }
 
 ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbRequest** req) {
+  if (base->aborted) { *req = NULL; return ncclRemoteError; }
   for (int i=0; i<MAX_REQUESTS; i++) {
     struct ncclIbRequest* r = base->reqs+i;
     if (r->type == NCCL_NET_IB_REQ_UNUSED) {
+      // A reused slot must not inherit failure or timeout-child state.
+      r->failed = 0;
+      r->timeoutRequest = NULL;
       r->base = base;
       r->sock = NULL;
       r->devBases[0] = NULL;
@@ -1938,7 +1943,57 @@ ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbReque
 
 ncclResult_t ncclIbFreeRequest(struct ncclIbRequest* r) {
   INFO(NCCL_R2CC, "ncclIbFreeRequest: Freeing request %p, base=%p", r, r ? r->base : NULL);
+  r->timeoutRequest = NULL;
   r->type = NCCL_NET_IB_REQ_UNUSED;
+  return ncclSuccess;
+}
+
+ncclResult_t ncclIbAbortComm(void* sendComm) {
+  struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
+  if (comm == NULL || comm->base.aborted) return ncclSuccess;
+
+  // Every QP and CQ here belongs to this comm, including merged-device QPs.
+  // ERR flushes outstanding WRs. Destroy before releasing slots so DMA cannot
+  // race buffer reuse on the backup; retain MRs/CQs until normal closeSend.
+  for (int q = 0; q < comm->base.nqps; q++) {
+    struct ibv_qp* qp = comm->base.qps[q].qp;
+    if (qp == NULL) continue;
+    struct ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_ERR;
+    NCCLCHECK(wrap_ibv_modify_qp(qp, &attr, IBV_QP_STATE));
+  }
+  for (int q = 0; q < comm->base.nqps; q++) {
+    if (comm->base.qps[q].qp == NULL) continue;
+    NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
+    comm->base.qps[q].qp = NULL;
+  }
+  comm->base.aborted = true;
+  for (int i = 0; i < comm->base.ndevs; i++) {
+    struct ibv_wc wcs[16];
+    int count;
+    do {
+      // Discard success/error/flush CQEs without looking up their old wr_ids.
+      NCCLCHECK(wrap_ibv_poll_cq(comm->devs[i].base.cq, 16, wcs, &count));
+    } while (count != 0);
+  }
+
+  int released = 0;
+  for (int i = 0; i < MAX_REQUESTS; i++) {
+    struct ncclIbRequest* req = comm->base.reqs + i;
+    // TimeoutPost allocates children in the same comm's pool. Sweeping the
+    // entire pool releases both parents and children exactly once, including
+    // batched sends not yet posted and parents already returned by test(-1).
+    if (req->type != NCCL_NET_IB_REQ_UNUSED) {
+      NCCLCHECK(ncclIbFreeRequest(req));
+      released++;
+    }
+    req->base = &comm->base;
+    req->timeoutRequest = NULL;
+    memset(req->events, 0, sizeof(req->events));
+  }
+  memset(comm->fifoReqs, 0, sizeof(comm->fifoReqs));
+  INFO(NCCL_R2CC, "NET/IB: abortComm released=%d remaining=0 comm=%p", released, comm);
   return ncclSuccess;
 }
 
@@ -2207,6 +2262,12 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
 ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
   // TRACE(NCCL_INIT, "ibisend start");
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
+  if (comm != NULL && comm->base.aborted) {
+    // A shared user that has not switched yet must also see test(-1), without
+    // allocating a slot or posting on the retired QPs.
+    *request = comm->base.reqs;
+    return ncclSuccess;
+  }
   if(comm == NULL) {
     // TRACE(NCCL_INIT, "sendComm_backup is NULL");
   }
@@ -2620,6 +2681,12 @@ static bool r2ccShouldInjectFailure(struct ncclIbRequest* r) {
 
 ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
   struct ncclIbRequest *r = (struct ncclIbRequest*)request;
+  if (r->base->aborted) {
+    // Old handles may survive in other proxy subs sharing this comm. Do not
+    // decode late completions against freed slots or follow timeout children.
+    *done = -1;
+    return ncclSuccess;
+  }
   static int testCount = 0;
   testCount++;
   if (testCount % 100000 == 0) {
@@ -2629,7 +2696,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
     int childDone = 0;
     ncclIbTest(r->timeoutRequest, &childDone, NULL);
     if(childDone == -1){
-      WARN("R2CC_TEST_FAIL role=%s reason=timeout_child req=%p type=%d channel=%d step=%d comm=%p",
+      INFO(NCCL_R2CC, "R2CC_TEST_FAIL role=%s reason=timeout_child req=%p type=%d channel=%d step=%d comm=%p",
            operations[r->operation], r, r->type, r->channel, r->step, r->comm);
       NCCLCHECK(ncclIbFreeRequest(r));
       *done = -1;  // net disconnection.
@@ -2645,7 +2712,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
   }
 
   if (r2ccShouldInjectFailure(r)) {
-    WARN("R2CC_TEST_FAIL role=%s reason=injected req=%p type=%d channel=%d step=%d comm=%p env=%s",
+    INFO(NCCL_R2CC, "R2CC_TEST_FAIL role=%s reason=injected req=%p type=%d channel=%d step=%d comm=%p env=%s",
          operations[r->operation], r, r->type, r->channel, r->step, r->comm, r2ccGetDisconnectedEnv());
     r->failed = 1;
     NCCLCHECK(ncclIbFreeRequest(r));
@@ -2655,7 +2722,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
 
 
   if(r->failed ==1){
-    WARN("R2CC_TEST_FAIL role=%s reason=request_marked_failed req=%p type=%d channel=%d step=%d comm=%p",
+    INFO(NCCL_R2CC, "R2CC_TEST_FAIL role=%s reason=request_marked_failed req=%p type=%d channel=%d step=%d comm=%p",
          operations[r->operation], r, r->type, r->channel, r->step, r->comm);
     TRACE(NCCL_INIT, "%s request args_id=%d, channel=%d, step=%d, comm=%p failed", operations[r->operation], r->id, r->channel, r->step, r->comm);
     
@@ -2668,7 +2735,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
     NCCLCHECK(ncclIbStatsCheckFatalCount(&r->base->stats,__func__));
     if (r->events[0] == 0 && r->events[1] == 0) {
       if(r->failed ==1){
-        WARN("R2CC_TEST_FAIL role=%s reason=request_marked_failed_post_poll req=%p type=%d channel=%d step=%d comm=%p",
+        INFO(NCCL_R2CC, "R2CC_TEST_FAIL role=%s reason=request_marked_failed_post_poll req=%p type=%d channel=%d step=%d comm=%p",
              operations[r->operation], r, r->type, r->channel, r->step, r->comm);
         TRACE(NCCL_INIT, "%s request args_id=%d, channel=%d, step=%d, comm=%p failed", operations[r->operation], r->id, r->channel, r->step, r->comm);
         NCCLCHECK(ncclIbFreeRequest(r));
@@ -3125,5 +3192,6 @@ ncclNet_t ncclNetIb = {
   setRequestStep,
   setRequestOperation,
   checkSwitchToBackup,
-  ncclIbTimeoutPost
+  ncclIbTimeoutPost,
+  ncclIbAbortComm
 };

@@ -14,7 +14,8 @@ LIBSRCFILES := \
 	$(wildcard graph/*.cc) \
 	$(wildcard misc/*.cc) \
 	$(wildcard transport/*.cc) \
-	$(wildcard r2cc/oob/*.cc)
+	$(wildcard r2cc/oob/*.cc) \
+	$(wildcard r2cc/allreduce/*.cc)
 
 ##### lib files
 LIBNAME     := libnccl.so

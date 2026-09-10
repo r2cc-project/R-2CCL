@@ -443,6 +443,20 @@ struct ncclComm {
   int cpuArch;   // architecture - As defined in src/include/graph.h, e.g. x86/arm/ppc/mixed
   int cpuVendor; // vendor - As defined in src/include/graph.h
 
+  // R2CC state is private to this communicator (OOB is parent-only).
+  int r2ccIsChild;
+  int r2ccChanSendDev[MAXCHANNELS];
+  int r2ccChanRecvDev[MAXCHANNELS];
+  uint64_t r2ccFailedChanMask;
+  int r2ccBalanceEnabled;
+  int r2ccMaskReady;
+  int r2ccMaskNode;
+  int r2ccRepairNode; // node + 1, zero means no repair observed
+  int r2ccRepairSynced;
+  uint64_t r2ccRepairDevs;
+  unsigned r2ccFallbackWarnings;
+  struct r2ccAllReduceState* r2ccAllReduce;
+
   int node;
   int nNodes;
   int localRank;

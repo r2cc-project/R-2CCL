@@ -117,6 +117,11 @@ typedef struct {
 
   ncclResult_t (*ncclIbTimeoutPost)(void* comm, void* request);
 
+  // R2CC extension: permanently retire a send comm before failover. Quiesce its
+  // QPs and release all outstanding requests, including timeout children. Old
+  // request handles remain testable as failed until closeSend; no slot is reused.
+  ncclResult_t (*abortComm)(void* sendComm);
+
 } ncclNet_v8_t;
 
 typedef ncclNet_v8_t ncclNet_t;

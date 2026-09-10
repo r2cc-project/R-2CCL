@@ -1,0 +1,74 @@
+[trace] log=0 channel=-1 stall_iters=2000 transitions=0 NCCL_DEBUG=WARN TRACE_ONLY=0
+[preflight] running connect cmd: ./nic/connect_nic1.sh
+Warning: Permanently added '192.168.100.2' (ECDSA) to the list of known hosts.
+[preflight] connect done
+[preflight] start ping warmup targets=10.10.2.5 10.10.3.6 tries=8 count=1 wait_s=1
+[preflight] ping 10.10.2.5 OK (attempt 1/8)
+[preflight] ping 10.10.3.6 OK (attempt 1/8)
+[preflight] ping warmup done
+Warning: Permanently added 'node-2,10.10.1.4' (ECDSA) to the list of known hosts.
+[Rank 1] Running on node-1.r2cc.softmeasure-pg0.clemson.cloudlab.us (Local Rank 1)
+[Rank 0] Running on node-1.r2cc.softmeasure-pg0.clemson.cloudlab.us (Local Rank 0)
+Config: iters=10, bytes=4294967296 (4.00 GiB), count=1073741824 floats
+Config: start_disconnect_delay_ms=4000
+Config: disconnect_cmd=./nic/disconnect_nic1.sh, reconnect_cmd=./nic/connect_nic1.sh
+[Rank 0] Connecting NIC at start using: ./nic/connect_nic1.sh
+[Rank 2] Running on node-2.r2cc.softmeasure-pg0.clemson.cloudlab.us (Local Rank 0)
+[Rank 3] Running on node-2.r2cc.softmeasure-pg0.clemson.cloudlab.us (Local Rank 1)
+Warning: Permanently added '192.168.100.2' (ECDSA) to the list of known hosts.
+[Rank 0] NIC connect command completed.
+[Rank 0] Initializing NCCL Communicator...
+NCCL version 2.23.4+cuda12.2
+[Rank 2] Initializing NCCL Communicator...
+[Rank 1] Initializing NCCL Communicator...
+[Rank 3] Initializing NCCL Communicator...
+[Rank 1] NCCL Initialization Complete.
+[Rank 0] NCCL Initialization Complete.
+[Rank 2] NCCL Initialization Complete.
+[Rank 3] NCCL Initialization Complete.
+[Rank 0] Arming NIC disconnect at program start (delay 4000 ms) using: ./nic/disconnect_nic1.sh
+[Rank 0] Iter 1/10 START: allreduce 4.00 GiB
+[Rank 0] Iter 1/10 END: OK (elapsed 885 ms)
+[Rank 0] Iter 2/10 START: allreduce 4.00 GiB
+[Rank 0] Iter 2/10 END: OK (elapsed 816 ms)
+[Rank 0] Iter 3/10 START: allreduce 4.00 GiB
+[Rank 0] Iter 3/10 END: OK (elapsed 842 ms)
+[Rank 0] Iter 4/10 START: allreduce 4.00 GiB
+[Rank 0] Iter 4/10 END: OK (elapsed 841 ms)
+[Rank 0] Iter 5/10 START: allreduce 4.00 GiB
+Warning: Permanently added '192.168.100.2' (ECDSA) to the list of known hosts.
+[Rank 0] Iter 5/10 END: OK (elapsed 843 ms)
+[Rank 0] Iter 6/10 START: allreduce 4.00 GiB
+Warning: Permanently added '192.168.100.2' (ECDSA) to the list of known hosts.
+[Rank 0] NIC disconnect command completed.
+[Rank 0] Iter 6/10 END: OK (elapsed 1313 ms)
+[Rank 0] Iter 7/10 START: allreduce 4.00 GiB
+[Rank 0] Iter 7/10 END: OK (elapsed 1136 ms)
+[Rank 0] Iter 8/10 START: allreduce 4.00 GiB
+[Rank 0] Iter 8/10 END: OK (elapsed 1161 ms)
+[Rank 0] Iter 9/10 START: allreduce 4.00 GiB
+[Rank 0] Iter 9/10 END: OK (elapsed 1128 ms)
+[Rank 0] Iter 10/10 START: allreduce 4.00 GiB
+[Rank 0] Iter 10/10 END: OK (elapsed 1130 ms)
+[Rank 0] Reconnecting NIC using: ./nic/connect_nic1.sh
+Warning: Permanently added '192.168.100.2' (ECDSA) to the list of known hosts.
+[Rank 0] NIC reconnect command completed.
+[Rank 0] IB RX per-iteration (MB, port_rcv_data *4B):
+Iter   Time(ms)   mlx5_0_RX    mlx5_2_RX    mlx5_3_RX   
+1      885        2165         2136         2166        
+2      816        2165         2239         2293        
+3      842        2165         2319         2361        
+4      841        2165         2338         2355        
+5      843        2165         2348         2337        
+6      1313       3203         1251         2279        
+7      1136       3249         0            3174        
+8      1161       3249         0            3178        
+9      1128       3249         0            3149        
+10     1130       3249         0            3180        
+[Rank 0] TEST PASS: All allreduces completed and verified.
+[Rank 1] Exiting.
+[Rank 0] Exiting.
+[Rank 3] Exiting.
+[Rank 2] Exiting.
+[trace] view_lines=64 state_lines=0
+[trace] failover_iter=7 rule=first iteration where mlx5_2_RX < 20

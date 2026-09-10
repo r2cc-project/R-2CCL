@@ -711,6 +711,10 @@ ncclResult_t ncclNetSocketTimeoutPost(void* comm, void* mhandle) {
   return ncclSuccess;
 }
 
+ncclResult_t ncclNetSocketAbortComm(void* sendComm) {
+  return ncclSuccess;
+}
+
 ncclNet_t ncclNetSocket = {
   "Socket",
   ncclNetSocketInit,
@@ -742,5 +746,6 @@ ncclNet_t ncclNetSocket = {
   ncclNetSocketSetRequestStep,
   ncclNetSocketSetRequestOperation,
   ncclNetSocketCheckSwitchToBackup,
-  ncclNetSocketTimeoutPost
+  ncclNetSocketTimeoutPost,
+  ncclNetSocketAbortComm
 };

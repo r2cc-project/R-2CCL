@@ -892,7 +892,7 @@ ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, int index
     //if(matchBusId)printf("P2P mode2 matchBusId=%d\n currentBusId=%s\n targetBusIdEnv=%s\n", matchBusId, currentBusId, targetBusIdEnv);
   }
   
-  if (useAllNicEnv && atoi(useAllNicEnv) != 0 && type == GPU && resultType == NET) {
+  if ((system->r2ccUseAllNic || (useAllNicEnv && atoi(useAllNicEnv) != 0)) && type == GPU && resultType == NET) {
     for (int i=0; i<system->nodes[resultType].count; i++) {
       if (paths[i].bw > 0) {
         (*locals)[count++] = i;
@@ -1001,7 +1001,7 @@ ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int ch
   }
   
   useAllNicEnv = getenv("R2CC_USE_ALL_NIC");
-  if (useAllNicEnv && atoi(useAllNicEnv) != 0) {
+  if (system->r2ccUseAllNic || (useAllNicEnv && atoi(useAllNicEnv) != 0)) {
     net = channelId % localNetCount;
   } else if (testMode != 0 && matchBusId) {
     net = channelId % localNetCount;

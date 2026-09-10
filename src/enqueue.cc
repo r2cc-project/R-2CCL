@@ -756,35 +756,10 @@ static ncclResult_t scheduleCollTasksToPlan(
   if (forceDistributeChannels) mxchannelsRaw = std::max(0, comm->nChannels - 2);
   uint32_t availMask = (mxchannelsRaw >= MAXCHANNELS) ? 0xffffffffu : ((1u << mxchannelsRaw) - 1);
 
-  // failure2SameServer
-  const char* failure2SameServer_str = getenv("FAILURE2_SAME_SERVER");
-  int failure_num = 0;
-
-  // R2CC_MODE=2,3: Exclude channels for failed NIC(s). Channels are assumed to be
-  // distributed round-robin over net devices, so all channels mapping to a failed
-  // netDev must be removed (sparse channel set).
   const char* r2ccMode = getenv("R2CC_MODE");
   int mode = r2ccMode ? atoi(r2ccMode) : 0;
-  int nNetDevs = 0;
-  uint32_t failedMask = 0;
-  // Prefer global failed-channel mask if present (computed via bootstrapAllGather).
-  uint64_t globalFailed = OobNet::Get().GlobalFailedChannelMask();
-  if (globalFailed) {
-    uint64_t validMask = (mxchannelsRaw >= 64) ? ~0ull : ((1ull << mxchannelsRaw) - 1);
-    failedMask = (uint32_t)(globalFailed & validMask);
-    availMask &= ~failedMask;
-  } else if (mode > 1) {
-    failure_num = (failure2SameServer_str && atoi(failure2SameServer_str) == 1) ? 2 : 1;
-    NCCLCHECK(comm->ncclNet->devices(&nNetDevs));
-    if (nNetDevs > 0 && failure_num > 0) {
-      int failedStartDev = std::max(0, nNetDevs - failure_num);
-      for (int c = 0; c < mxchannelsRaw; c++) {
-        int dev = c % nNetDevs;
-        if (dev >= failedStartDev) failedMask |= (1u << c);
-      }
-      availMask &= ~failedMask;
-    }
-  }
+  uint32_t failedMask = comm->r2ccBalanceEnabled ? (uint32_t)comm->r2ccFailedChanMask : 0;
+  availMask &= ~failedMask;
 
   // Ordered list of available (healthy) channels for standard/collnet collectives.
   int availChans[MAXCHANNELS];
@@ -796,8 +771,7 @@ static ncclResult_t scheduleCollTasksToPlan(
   if (mxchannels == 0 && mxchannelsRaw > 0) {
     // Should never happen in normal setups, but avoid hard failure if masking logic
     // ends up excluding all channels.
-    WARN("R2CC_MODE=%d: all channels were masked off (mxchannelsRaw=%d nNetDevs=%d failure_num=%d). Falling back to use all channels.",
-         mode, mxchannelsRaw, nNetDevs, failure_num);
+    WARN("R2CC_MODE=%d: all %d channels masked off; using all channels", mode, mxchannelsRaw);
     for (int c = 0; c < mxchannelsRaw && c < MAXCHANNELS; c++) availChans[availCount++] = c;
     mxchannels = availCount;
   }
