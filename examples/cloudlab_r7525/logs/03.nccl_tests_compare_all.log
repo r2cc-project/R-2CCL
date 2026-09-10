@@ -1,0 +1,88 @@
+[nccl-tests] R2CC_MODE=0 NCCL_IB_HCA=mlx5_0,mlx5_2,mlx5_3 R2CC_FAILED_NODE=0 R2CC_FAILED_HCA=mlx5_2
+[nccl-tests] all_reduce_perf -b 256M -e 4G -f 4 -g 1 -c 1 -n 5 -w 2 -d float -o sum
+Warning: Permanently added 'node-2,10.10.1.4' (ECDSA) to the list of known hosts.
+# nccl-tests version 2.20.0 (b4d5bee) nccl-headers=22304 nccl-library=22304
+# Collective test starting: all_reduce_perf
+# nThread 1 nGpus 1 minBytes 268435456 maxBytes 4294967296 step: 4(factor) warmup iters: 2 iters: 5 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid 266872 on     node-1 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  1 Group  0 Pid 266873 on     node-1 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  2 Group  0 Pid 185893 on     node-2 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  3 Group  0 Pid 185894 on     node-2 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+NCCL version 2.23.4+cuda12.2
+#
+#                                                              out-of-place                       in-place
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)        
+   268435456      67108864     float     sum      -1  81597.3    3.29    4.93       0  52526.9    5.11    7.67       0
+  1073741824     268435456     float     sum      -1   208131    5.16    7.74       0   209995    5.11    7.67       0
+  4294967296    1073741824     float     sum      -1   838982    5.12    7.68       0   837241    5.13    7.69       0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 7.23037 
+#
+# Collective test concluded: all_reduce_perf
+#
+
+[nccl-tests] rc=0  Out of bounds values : 0 OK
+[nccl-tests] R2CC_MODE=2 NCCL_IB_HCA=mlx5_0,mlx5_2,mlx5_3 R2CC_FAILED_NODE=0 R2CC_FAILED_HCA=mlx5_2
+[nccl-tests] all_reduce_perf -b 256M -e 4G -f 4 -g 1 -c 1 -n 5 -w 2 -d float -o sum
+Warning: Permanently added 'node-2,10.10.1.4' (ECDSA) to the list of known hosts.
+# nccl-tests version 2.20.0 (b4d5bee) nccl-headers=22304 nccl-library=22304
+# Collective test starting: all_reduce_perf
+# nThread 1 nGpus 1 minBytes 268435456 maxBytes 4294967296 step: 4(factor) warmup iters: 2 iters: 5 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid 266974 on     node-1 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  1 Group  0 Pid 266975 on     node-1 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  2 Group  0 Pid 185979 on     node-2 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  3 Group  0 Pid 185980 on     node-2 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+NCCL version 2.23.4+cuda12.2
+#
+#                                                              out-of-place                       in-place
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)        
+   268435456      67108864     float     sum      -1  79968.0    3.36    5.04       0  88471.6    3.03    4.55       0
+  1073741824     268435456     float     sum      -1   333491    3.22    4.83       0   322527    3.33    4.99       0
+  4294967296    1073741824     float     sum      -1  1243981    3.45    5.18       0  1244254    3.45    5.18       0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 4.96106 
+#
+# Collective test concluded: all_reduce_perf
+#
+
+[nccl-tests] rc=0  Out of bounds values : 0 OK
+[nccl-tests] R2CC_MODE=3 NCCL_IB_HCA=mlx5_0,mlx5_2,mlx5_3 R2CC_FAILED_NODE=0 R2CC_FAILED_HCA=mlx5_2
+[nccl-tests] all_reduce_perf -b 256M -e 4G -f 4 -g 1 -c 1 -n 5 -w 2 -d float -o sum
+Warning: Permanently added 'node-2,10.10.1.4' (ECDSA) to the list of known hosts.
+# nccl-tests version 2.20.0 (b4d5bee) nccl-headers=22304 nccl-library=22304
+# Collective test starting: all_reduce_perf
+# nThread 1 nGpus 1 minBytes 268435456 maxBytes 4294967296 step: 4(factor) warmup iters: 2 iters: 5 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid 267075 on     node-1 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  1 Group  0 Pid 267076 on     node-1 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  2 Group  0 Pid 186060 on     node-2 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  3 Group  0 Pid 186061 on     node-2 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+NCCL version 2.23.4+cuda12.2
+#
+#                                                              out-of-place                       in-place
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)        
+   268435456      67108864     float     sum      -1   114585    2.34    3.51       0  88385.4    3.04    4.56       0
+  1073741824     268435456     float     sum      -1   407209    2.64    3.96       0   360520    2.98    4.47       0
+  4294967296    1073741824     float     sum      -1  1515938    2.83    4.25       0  1471623    2.92    4.38       0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 4.18667 
+#
+# Collective test concluded: all_reduce_perf
+#
+
+[nccl-tests] rc=0  Out of bounds values : 0 OK
+
+===== comparison (-b 256M -e 4G -f 4 -g 1 -c 1 -n 5 -w 2 -d float -o sum) =====
+bytes        | baseline_healthy                 | balance_unhealthy                | r2cc_allreduce_unhealthy        
+268435456    | 4.93/7.67 (wrong 0/0)            | 5.04/4.55 (wrong 0/0)            | 3.51/4.56 (wrong 0/0)           
+1073741824   | 7.74/7.67 (wrong 0/0)            | 4.83/4.99 (wrong 0/0)            | 3.96/4.47 (wrong 0/0)           
+4294967296   | 7.68/7.69 (wrong 0/0)            | 5.18/5.18 (wrong 0/0)            | 4.25/4.38 (wrong 0/0)           
+(cells: busbw out-of-place/in-place GB/s, then #wrong out-of-place/in-place)

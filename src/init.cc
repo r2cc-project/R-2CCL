@@ -15,7 +15,9 @@
 #include "coll_net.h"
 #include "enqueue.h"
 #include "graph.h"
+#include "graph/topo.h"
 #include "r2cc/oob/oob_udp.h"
+#include "r2cc_allreduce.h"
 #include "argcheck.h"
 #include "tuner.h"
 #include <fcntl.h>
@@ -792,7 +794,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   timers[TIMER_INIT_ALLGATHER] = clockNano() - timers[TIMER_INIT_ALLGATHER];
 
   // R2CC: Initialize OOB UDP Network (Includes internal verification)
-  NCCLCHECKGOTO(OobNet::Get().Init(rank, nranks, comm->bootstrap), ret, fail);
+  if (parent == NULL) NCCLCHECKGOTO(OobNet::Get().Init(rank, nranks, comm->bootstrap), ret, fail);
 
 
   // MNNVL support
@@ -859,6 +861,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   timers[TIMER_INIT_TOPO] = clockNano();
   // Topo detection / System graph creation
   NCCLCHECKGOTO(ncclTopoGetSystem(comm, &comm->topo), ret, fail);
+  comm->topo->r2ccUseAllNic = (parent != NULL);
   // Compute paths between GPUs and NICs
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
   // Remove inaccessible GPUs and unused NICs
@@ -1414,7 +1417,7 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   double sum_timers = 0;
   uint64_t timers[TIMERS_INIT_COUNT] = {0};
   
-  INFO(NCCL_R2CC, "R2CC log system is active - ncclCommInitRankFunc starting for rank %d", comm->rank);
+  INFO(NCCL_R2CC, "R2CC log system is active - ncclCommInitRankFunc starting for rank %d", job->parent ? job->parent->rank : job->myrank);
   unsigned long long commIdHash;
 
   timers[TIMER_INIT_TOTAL] = clockNano();
@@ -1465,6 +1468,11 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     timers[TIMER_INIT_BOOTSTRAP] = clockNano();
     NCCLCHECKGOTO(bootstrapInit(job->nId, (struct ncclBootstrapHandle*)job->commId, comm), res, fail);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano() - timers[TIMER_INIT_BOOTSTRAP];
+  }
+  comm->r2ccIsChild = job->parent != NULL;
+  for (int c = 0; c < MAXCHANNELS; c++) {
+    comm->r2ccChanSendDev[c] = -1;
+    comm->r2ccChanRecvDev[c] = -1;
   }
   comm->cudaArch = cudaArch;
 
@@ -2144,6 +2152,7 @@ ncclResult_t ncclCommDestroy(ncclComm_t comm) {
   comm->destroyFlag = 1;
   /* init thread must be joined before we destroy the comm. */
   NCCLCHECK(ncclCommEnsureReady(comm));
+  NCCLCHECK(r2ccAllReduceDestroy(comm, false));
   NCCLCHECKGOTO(ncclCalloc(&job, 1), res, fail);
   job->comm = comm;
   NCCLCHECKGOTO(ncclAsyncLaunch((struct ncclAsyncJob*)job, commReclaim, NULL, free, comm), res, fail);
@@ -2172,6 +2181,7 @@ ncclResult_t ncclCommAbort(ncclComm_t comm) {
   /* init thread must be joined before we destroy the comm,
    * and we should ignore the init error here. */
   (void)ncclCommEnsureReady(comm);
+  (void)r2ccAllReduceDestroy(comm, true);
 
   // once the comm is ready, we can access ranks etc
   int rank = comm->rank, nranks = comm->nRanks, cudaDev = comm->cudaDev;

@@ -1815,6 +1815,7 @@ ncclResult_t ncclProxyCreate(struct ncclComm* comm) {
   struct ncclProxyState* proxyState = comm->proxyState;
   if (proxyState->refCount == 1) {
     /* we have to make sure all following fields in comm have been initialized. */
+    proxyState->r2ccOobEnabled = !comm->r2ccIsChild;
     proxyState->tpRank = comm->rank;
     proxyState->tpnRanks = comm->nRanks;
     proxyState->tpLocalnRanks = comm->localRanks;

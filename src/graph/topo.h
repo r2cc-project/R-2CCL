@@ -154,6 +154,7 @@ struct ncclTopoNodeSet {
 
 struct ncclTopoSystem {
   int systemId;
+  int r2ccUseAllNic; // Split children distribute channels over every reachable NIC.
   uint64_t hostHashes[NCCL_TOPO_MAX_NODES];
   int nHosts;
   struct ncclTopoNodeSet nodes[NCCL_TOPO_NODE_TYPES];

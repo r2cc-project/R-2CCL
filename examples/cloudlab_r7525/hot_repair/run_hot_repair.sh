@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Core driver of the real-disconnect tests. Normally started through the wrappers in the example root:
+#   ../01.hot_repair_to_balance.sh          (R2CC_AR_AFTER_REPAIR=2: hot repair -> Balance)
+#   ../02.hot_repair_to_r2cc_allreduce.sh   (R2CC_AR_AFTER_REPAIR=3: hot repair -> R2CC-AllReduce)
 # CLI:
 #   ./run_hot_repair.sh
 #   ./run_hot_repair.sh -log 1   # enable NCCL INFO trace logs
 #   ./run_hot_repair.sh -log 0   # disable NCCL INFO trace logs (default)
+
+# Always run from the example root so ./nic, ./hot_repair and ./logs resolve (also inside test_hot_repair,
+# which calls ./nic/disconnect_nic1.sh and ./nic/connect_nic1.sh relative to the working directory).
+EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${EXAMPLE_DIR}"
+export OMPI_MCA_btl_tcp_if_include="${OMPI_MCA_btl_tcp_if_include:-eno33np0}"
 LOG_FLAG=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -64,8 +73,10 @@ else
 fi
 
 mkdir -p "${LOG_DIR}"
-RAW_LOG="${LOG_DIR}/test_hot_repair_${LOG_TAG}.raw.log"
-TRACE_LOG="${LOG_DIR}/test_hot_repair_${LOG_TAG}.trace.log"
+RAW_LOG="${RAW_LOG:-${LOG_DIR}/test_hot_repair_${LOG_TAG}.raw.log}"
+# The driver keeps a private copy of the run output to compute its summary. It is a temporary file unless the
+# caller sets TRACE_LOG (the 01/02 wrappers already save the complete terminal output to logs/<NN>.<name>.log).
+if [[ -n "${TRACE_LOG:-}" ]]; then TRACE_TMP=0; else TRACE_LOG="$(mktemp)"; TRACE_TMP=1; fi
 
 preflight_ping_target() {
   local ip="$1"
@@ -164,7 +175,7 @@ extract_failover_iter() {
 }
 
 echo "[trace] log=${LOG_FLAG} channel=${R2CC_TRACE_CHANNEL} stall_iters=${R2CC_TRACE_STALL_ITERS} transitions=${R2CC_TRACE_TRANSITIONS} NCCL_DEBUG=${NCCL_DEBUG} TRACE_ONLY=${TRACE_ONLY}"
-echo "[trace] trace_log=${TRACE_LOG} save_raw_log=${SAVE_RAW_LOG}"
+[[ "${TRACE_TMP}" == "1" ]] || echo "[trace] trace_log=${TRACE_LOG} save_raw_log=${SAVE_RAW_LOG}"
 
 run_preflight_connect
 run_preflight_ping
@@ -172,7 +183,7 @@ run_preflight_ping
 mpirun_cmd=(
   mpirun -np 4
   -host localhost:2,node-2:2
-  -mca pml ob1 -mca btl tcp,self
+  -mca pml ob1 -mca btl tcp,self -mca btl_tcp_if_include eno33np0
   -x R2CC_TRACE_CHANNEL
   -x R2CC_TRACE_STALL_ITERS
   -x R2CC_TRACE_TRANSITIONS
@@ -184,13 +195,19 @@ mpirun_cmd=(
   -x NCCL_SOCKET_IFNAME=eno33np0
   -x NCCL_IB_HCA=mlx5_0,mlx5_2,mlx5_3
   -x NCCL_IB_MERGE_NICS=0
-  -x NCCL_R2CC_FAILOVER_TIMEOUT_MS=5000
-  -x NCCL_IB_TIMEOUT=16
-  -x NCCL_IB_RETRY_CNT=1
+  -x "NCCL_R2CC_FAILOVER_TIMEOUT_MS=${R2CC_FAILOVER_TIMEOUT_MS:-${NCCL_R2CC_FAILOVER_TIMEOUT_MS:-5000}}"
+  -x "NCCL_IB_TIMEOUT=${NCCL_IB_TIMEOUT:-16}"
+  -x "NCCL_IB_RETRY_CNT=${NCCL_IB_RETRY_CNT:-1}"
   -x NCCL_ALGO=Ring
-  -x R2CC_AR_START_DISCONNECT_DELAY_MS=4000
-  ./test_hot_repair
+  -x "R2CC_AR_START_DISCONNECT_DELAY_MS=${R2CC_AR_START_DISCONNECT_DELAY_MS:-4000}"
 )
+for var in R2CC_MODE R2CC_FAILED_NODE R2CC_FAILED_HCA R2CC_FAILED_NIC_COUNT \
+           R2CC_AR_STAGE2_CHUNKS R2CC_AR_SCHEDULE R2CC_AR_MIN_BYTES R2CC_AR_AFTER_REPAIR; do
+  if [[ -v "$var" ]]; then
+    mpirun_cmd+=(-x "$var")
+  fi
+done
+mpirun_cmd+=(./hot_repair/test_hot_repair)
 
 set +e
 if [[ "${SAVE_RAW_LOG}" == "1" ]]; then
@@ -225,7 +242,7 @@ if [[ "${SAVE_RAW_LOG}" == "1" ]]; then
   echo "[trace] raw_log=${RAW_LOG} raw_lines=${raw_lines}"
 fi
 echo "[trace] view_lines=${view_lines} state_lines=${state_lines}"
-echo "[trace] view_log=${VIEW_LOG}"
+[[ "${TRACE_TMP}" == "1" ]] || echo "[trace] view_log=${VIEW_LOG}"
 echo "[trace] failover_iter=${failover_iter} rule=first iteration where mlx5_2_RX < 20"
 if [[ "${SAMPLE_LINES}" =~ ^[0-9]+$ ]] && (( SAMPLE_LINES > 0 )); then
   echo "----- SAMPLE HEAD (${SAMPLE_LINES}) -----"
@@ -234,6 +251,7 @@ if [[ "${SAMPLE_LINES}" =~ ^[0-9]+$ ]] && (( SAMPLE_LINES > 0 )); then
   tail -n "${SAMPLE_LINES}" "${VIEW_LOG}" || true
 fi
 
+[[ "${TRACE_TMP}" == "1" ]] && rm -f "${TRACE_LOG}"
 exit "${mpirun_rc}"
 
 # NCCL_R2CC_FAILOVER_TIMEOUT_MS=500   Should set according your scale and NCCL native timeout and retry env.

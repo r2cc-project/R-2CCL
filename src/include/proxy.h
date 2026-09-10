@@ -280,6 +280,7 @@ struct ncclIpcHdr {
 };
 
 struct ncclProxyState {
+  int r2ccOobEnabled;
   int refCount;
   int tpRank;
   int tpnRanks;

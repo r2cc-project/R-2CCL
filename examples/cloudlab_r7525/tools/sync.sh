@@ -10,7 +10,7 @@ fi
 
 REMOTE_HOST="node-2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 LOCAL_DIR="$REPO_ROOT/"
 REMOTE_DIR="/mydata/R2CC/"
 

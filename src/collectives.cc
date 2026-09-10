@@ -4,6 +4,7 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+#include "r2cc_allreduce.h"
 #include "argcheck.h" // Need some checks here since we access comm
 #include "collectives.h"
 #include "enqueue.h"
@@ -83,6 +84,12 @@ NCCL_API(ncclResult_t, ncclAllGather, const void* sendbuff, void* recvbuff, size
     ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream);
 ncclResult_t ncclAllGather(const void* sendbuff, void* recvbuff, size_t sendcount,
     ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream) {
+  NCCLCHECK(CommCheck(comm, "AllGather", "comm"));
+  NCCLCHECK(ncclCommEnsureReady(comm));
+  if (!comm->r2ccIsChild) {
+    const char* r2ccMode = getenv("R2CC_MODE");
+    NCCLCHECK(r2ccPrepareBalance(comm, r2ccMode ? atoi(r2ccMode) : 0));
+  }
   // Just pass the size of one message and not the total bytes sent/received.
   constexpr nvtxPayloadSchemaEntry_t AllGatherSchema[] = {
     {0, NVTX_PAYLOAD_ENTRY_TYPE_SIZE, "Message size [bytes]"}
@@ -116,14 +123,15 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
 
 
   size_t totalUserBytes = count * ncclTypeSize(datatype);
-  bool parallel = totalUserBytes <= 134217728;
+  NCCLCHECK(CommCheck(comm, "AllReduce", "comm"));
+  NCCLCHECK(ncclCommEnsureReady(comm));
 
   // auto t0 = std::chrono::high_resolution_clock::now();
   
   // R2CC: If any peer reports a hot-repair event through OOB, gather per-rank failed
   // channel masks via bootstrapAllGather, combine (per-node then global OR), and
   // force Balance mode (R2CC_MODE=2) from this AllReduce onwards.
-  {
+  if (!comm->r2ccIsChild) {
     const char* env = getenv("R2CC_MODE");
     int curMode = env ? atoi(env) : 0;
     OobNet& oob = OobNet::Get();
@@ -133,8 +141,7 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
 
     // Only perform the bootstrap allgather once (v1). This requires all ranks to
     // observe the hot-repair signal before entering this branch.
-    static std::atomic<int> hrSynced{0};
-    if (hrSynced.load(std::memory_order_relaxed) == 0 && (seen || localMask != 0)) {
+    if (comm->r2ccRepairSynced == 0 && (seen || localMask != 0)) {
       int nranks = comm->nRanks;
       uint64_t* allMasks = (uint64_t*)calloc((size_t)nranks, sizeof(uint64_t));
       if (allMasks) {
@@ -160,6 +167,10 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
           globalMask = merged;
         }
 
+        for (int r = 0; r < nranks; r++) {
+          if (allMasks[r]) { comm->r2ccRepairNode = comm->rankToNode[r]+1; break; }
+        }
+        comm->r2ccMaskReady = 0;
         oob.SetGlobalFailedChannelMask(globalMask);
         if (comm->rank == 0) {
           INFO(NCCL_R2CC, "R2CC: hot-repair gather complete: localMask=0x%lx globalMask=0x%lx",
@@ -169,15 +180,16 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
       } else {
         WARN("R2CC: hot-repair gather failed to allocate allMasks");
       }
-      hrSynced.store(1, std::memory_order_relaxed);
+      comm->r2ccRepairSynced = 1;
     }
 
     if (curMode < 2 && (globalMask != 0 || seen || localMask != 0)) {
-      setenv("R2CC_MODE", "2", 1);
+      const char* after = getenv("R2CC_AR_AFTER_REPAIR");
+      setenv("R2CC_MODE", after && atoi(after) == 3 ? "3" : "2", 1);
       static std::atomic<int> switched{0};
       int expected = 0;
       if (switched.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
-        INFO(NCCL_R2CC, "R2CC: hot-repair detected, forcing R2CC_MODE=2");
+        INFO(NCCL_R2CC, "R2CC: hot-repair detected, forcing R2CC_MODE=%s", getenv("R2CC_MODE"));
       }
     }
   }
@@ -186,7 +198,13 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
   // R2CC_MODE=3/4/5: Split AllReduce implementation  
   const char* r2ccMode = getenv("R2CC_MODE");
   int mode = r2ccMode ? atoi(r2ccMode) : 0;
-  if (mode >= 3 && mode <= 5 && totalUserBytes > 16384) {
+  NCCLCHECK(r2ccPrepareBalance(comm, mode));
+  if (mode == 3) {
+    ncclInfo info = {ncclFuncAllReduce, "AllReduce", sendbuff, recvbuff, count, datatype, op, 0,
+                     comm, stream, ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS};
+    return r2ccAllReduce(&info);
+  }
+  if (mode >= 4 && mode <= 5 && totalUserBytes > 16384) {
     // Get number of network devices to simulate failed NIC
     int nNetDevs;
     NCCLCHECK(comm->ncclNet->devices(&nNetDevs));
@@ -204,49 +222,7 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
       size_t mainCount = originalCount * (nNetDevs - failure_num) / nNetDevs;
       size_t subCount = originalCount - mainCount;
       
-      // MODE=3: Both phases
-      // MODE=4: Only Phase 1 (AllReduce)
-      // MODE=5: Only Phase 2 (Broadcast)
-      if(mode == 3 and parallel){
-        NCCLCHECK(ncclGroupStart());
-        struct ncclInfo info1 = { ncclFuncAllReduce, "AllReduce",
-          sendbuff, recvbuff, mainCount, datatype, op, 0, comm, stream, /* Args */
-          ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
-        NCCLCHECK(ncclEnqueueCheck(&info1));
-        // Calculate offset for remaining data
-        size_t offset = mainCount * elementSize;
-        const void* bcastSendbuff = (const char*)sendbuff + offset;
-        void* bcastRecvbuff = (char*)recvbuff + offset;
-        
-        struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
-          bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
-          BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
-        NCCLCHECK(ncclEnqueueCheck(&info2));
-        NCCLCHECK(ncclGroupEnd());
-      }
-      else if(mode == 3 and !parallel){
-	      NCCLCHECK(ncclGroupStart());
-        struct ncclInfo info1 = { ncclFuncAllReduce, "AllReduce",
-          sendbuff, recvbuff, mainCount, datatype, op, 0, comm, stream, /* Args */
-          ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
-        NCCLCHECK(ncclEnqueueCheck(&info1));
-        NCCLCHECK(ncclGroupEnd());
-
-
-	      NCCLCHECK(ncclGroupStart());
-        // Calculate offset for remaining data
-        size_t offset = mainCount * elementSize;
-        const void* bcastSendbuff = (const char*)sendbuff + offset;
-        void* bcastRecvbuff = (char*)recvbuff + offset;
-
-        struct ncclInfo info2 = { ncclFuncBroadcast, "Broadcast",
-          bcastSendbuff, bcastRecvbuff, subCount, datatype, ncclSum /*unused*/, 0 /*root: rank 0*/, comm, stream, /* Args */
-          BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS };
-        NCCLCHECK(ncclEnqueueCheck(&info2));
-        NCCLCHECK(ncclGroupEnd());
-
-      }
-      else if(mode == 4){
+      if (mode == 4) {
         // Phase 1: AllReduce with reduced data
         NCCLCHECK(ncclGroupStart());
         struct ncclInfo info1 = { ncclFuncAllReduce, "AllReduce",
@@ -295,6 +271,12 @@ NCCL_API(ncclResult_t, ncclBroadcast, const void* sendbuff, void* recvbuff, size
     ncclComm_t comm, cudaStream_t stream);
 ncclResult_t ncclBroadcast(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype, int root,
     ncclComm_t comm, cudaStream_t stream) {
+  NCCLCHECK(CommCheck(comm, "Broadcast", "comm"));
+  NCCLCHECK(ncclCommEnsureReady(comm));
+  if (!comm->r2ccIsChild) {
+    const char* r2ccMode = getenv("R2CC_MODE");
+    NCCLCHECK(r2ccPrepareBalance(comm, r2ccMode ? atoi(r2ccMode) : 0));
+  }
   struct NvtxParamsBroadcast {
     size_t bytes;
     int root;
@@ -325,6 +307,12 @@ NCCL_API(ncclResult_t, ncclReduce, const void* sendbuff, void* recvbuff, size_t 
     ncclDataType_t datatype, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream);
 ncclResult_t ncclReduce(const void* sendbuff, void* recvbuff, size_t count,
     ncclDataType_t datatype, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
+  NCCLCHECK(CommCheck(comm, "Reduce", "comm"));
+  NCCLCHECK(ncclCommEnsureReady(comm));
+  if (!comm->r2ccIsChild) {
+    const char* r2ccMode = getenv("R2CC_MODE");
+    NCCLCHECK(r2ccPrepareBalance(comm, r2ccMode ? atoi(r2ccMode) : 0));
+  }
   struct NvtxParamsReduce {
     size_t bytes;
     int root;
@@ -350,6 +338,12 @@ NCCL_API(ncclResult_t, ncclReduceScatter, const void* sendbuff, void* recvbuff, 
     ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
 ncclResult_t ncclReduceScatter(const void* sendbuff, void* recvbuff, size_t recvcount,
     ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
+  NCCLCHECK(CommCheck(comm, "ReduceScatter", "comm"));
+  NCCLCHECK(ncclCommEnsureReady(comm));
+  if (!comm->r2ccIsChild) {
+    const char* r2ccMode = getenv("R2CC_MODE");
+    NCCLCHECK(r2ccPrepareBalance(comm, r2ccMode ? atoi(r2ccMode) : 0));
+  }
   struct NvtxParamsReduceScatter {
     size_t bytes;
     ncclRedOp_t op;

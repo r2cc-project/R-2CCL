@@ -957,9 +957,9 @@ ncclResult_t ncclTopoCompute(ncclTopoSystem* system, struct ncclTopoGraph* graph
   int cpuArch, cpuVendor, cpuModel;
   NCCLCHECK(ncclTopoCpuType(system, &cpuArch, &cpuVendor, &cpuModel));
 
-  // Optional override: use all NICs even if they are farther (PHB/SYS).
+  // Split children (or an explicit override) use all NICs, including PHB/SYS.
   const char* useAllNicEnv = getenv("R2CC_USE_ALL_NIC");
-  if (useAllNicEnv && atoi(useAllNicEnv) != 0 && system->nodes[NET].count > 0) {
+  if ((system->r2ccUseAllNic || (useAllNicEnv && atoi(useAllNicEnv) != 0)) && system->nodes[NET].count > 0) {
     graph->crossNic = 1;   // allow cross-ASIC/port NICs
     graph->typeInter = PATH_SYS; // allow SYS/PHB/PIX paths
     // Use all NETs reachable from GPU 0 (common single-GPU case).
