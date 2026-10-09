@@ -289,6 +289,7 @@ NCCL_PARAM(R2ccFailoverTimeoutMs, "R2CC_FAILOVER_TIMEOUT_MS", 5000);
 NCCL_PARAM(RecvTimeout, "IB_TIMEOUT", 20);
 NCCL_PARAM(RecvRetryCnt, "IB_RETRY_CNT", 7);
 NCCL_PARAM(R2CCFailoverWaitMaxMs, "R2CC_FAILOVER_WAIT_MAX_MS", -1);
+NCCL_PARAM(R2ccStopDrainMs, "R2CC_STOP_DRAIN_MS", 10000);
 
 
 // Forward declaration
@@ -2093,10 +2094,22 @@ static inline ncclResult_t r2ccSendCheckFailoverHint(struct ncclProxyState* prox
   return ncclSuccess;
 }
 
+// Operations still running when the proxy is asked to stop are drained, as in NCCL: a rank whose kernels have finished
+// can still have network transfers in flight that its peers wait for, and the stop can also come from another local
+// rank closing its proxy connection. They are only abandoned on abort, or when they have not finished within
+// R2CC_STOP_DRAIN_MS, so that an operation on a dead connection cannot block the teardown. Only the progress thread of
+// a proxy calls this, so the time it first saw the stop is kept per thread.
+static inline bool r2ccProxyShutdownExpired(struct ncclProxyState* proxyState) {
+  static thread_local uint64_t stopSeenMs = 0;
+  if (proxyState->abortFlag && __atomic_load_n(proxyState->abortFlag, __ATOMIC_ACQUIRE) != 0) return true;
+  if (!proxyState->progressState.stop) return false;
+  uint64_t nowMs = r2ccNowMs();
+  if (stopSeenMs == 0) stopSeenMs = nowMs;
+  return nowMs - stopSeenMs > (uint64_t)ncclParamR2ccStopDrainMs();
+}
+
 static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
-  // During proxy shutdown, force-complete outstanding ops to avoid teardown races.
-  if (proxyState->progressState.stop ||
-      (proxyState->abortFlag && __atomic_load_n(proxyState->abortFlag, __ATOMIC_ACQUIRE) != 0)) {
+  if (r2ccProxyShutdownExpired(proxyState)) {
     args->done = args->nsubs;
     args->state = ncclProxyOpNone;
     args->idle = 1;
@@ -2601,10 +2614,14 @@ static inline void r2ccRecvRollbackCommToAbs(struct ncclProxyArgs* args, struct 
     struct ncclProxySubArgs* sub = args->subs + s;
     struct recvNetResources* subRes = (struct recvNetResources*) (sub->connection->transportResources);
     if (subRes != targetRes) continue;
+    // Resume exactly where the sender resumes. The sender resends from its done step and cannot go further back
+    // (its GPU may already have refilled those send slots), and every step below that step reached this buffer
+    // before the failure, because the sender saw it complete. Those steps may not have been handed to the GPU or
+    // consumed yet, so they are kept: received moves to the resume point, transmitted and done only move back, and
+    // the loops below pass the remaining steps to the GPU before new data arrives over the backup connection. No
+    // flush is posted for them; they arrived before the failure was detected and the OOB handshake completed.
     uint64_t rollbackStep = 0;
     if (senderDoneAbs > sub->base) rollbackStep = senderDoneAbs - sub->base;
-    // Sender is authoritative, but never fast-forward local receive state.
-    if (rollbackStep > sub->done) rollbackStep = sub->done;
     if (rollbackStep > sub->posted) rollbackStep = sub->posted;
     for (int i = 0; i < NCCL_STEPS; ++i) {
       sub->requests[i] = NULL;
@@ -2613,8 +2630,8 @@ static inline void r2ccRecvRollbackCommToAbs(struct ncclProxyArgs* args, struct 
     sub->recvRequestsSubCount = 0;
     sub->posted = rollbackStep;
     sub->received = rollbackStep;
-    sub->transmitted = rollbackStep;
-    sub->done = rollbackStep;
+    if (sub->transmitted > rollbackStep) sub->transmitted = rollbackStep;
+    if (sub->done > rollbackStep) sub->done = rollbackStep;
     sub->mhandle = subRes->mhandlesBackup[args->protocol];
     subRes->useBackup = 1;
     subRes->waitFailoverReq = 0;
@@ -2745,9 +2762,7 @@ static inline ncclResult_t r2ccRecvApplyPendingFailoverReq(struct ncclProxyArgs*
 }
 
 static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
-  // During proxy shutdown, force-complete outstanding ops to avoid teardown races.
-  if (proxyState->progressState.stop ||
-      (proxyState->abortFlag && __atomic_load_n(proxyState->abortFlag, __ATOMIC_ACQUIRE) != 0)) {
+  if (r2ccProxyShutdownExpired(proxyState)) {
     args->done = args->nsubs;
     args->state = ncclProxyOpNone;
     args->idle = 1;
