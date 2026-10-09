@@ -117,12 +117,24 @@ int main(int argc, char* argv[]) {
   const char* reconnect_cmd = "./nic/connect_nic1.sh";
 
   const int start_disconnect_delay_ms = get_env_int("R2CC_AR_START_DISCONNECT_DELAY_MS", -1);
+  // Graph mode: the AllReduce is captured once into a CUDA graph and every iteration replays it.
+  // R2CC_TEST_RECAPTURE_AT=<n> re-captures the graph after iteration n (e.g. after the failure).
+  const int use_graph = get_env_int("R2CC_TEST_GRAPH", 0);
+  const int recapture_at = get_env_int("R2CC_TEST_RECAPTURE_AT", -1);
+  // New buffer on the failure path: after iteration R2CC_TEST_NEWBUF_AT the AllReduce moves to a buffer allocated
+  // at that point (a new address); with R2CC_TEST_REGISTER=1 it is also registered with ncclCommRegister first.
+  const int newbuf_at = get_env_int("R2CC_TEST_NEWBUF_AT", -1);
+  const int do_register = get_env_int("R2CC_TEST_REGISTER", 0);
+  // R2CC_TEST_EAGER_BEFORE_RECAPTURE=1: run one AllReduce outside capture before re-capturing (lets R2CC switch
+  // mode and create its sub-communicators, which cannot happen inside a capture).
+  const int eager_before_recapture = get_env_int("R2CC_TEST_EAGER_BEFORE_RECAPTURE", 0);
 
   if (myRank == 0) {
     printf("Config: iters=%d, bytes=%zu (%.2f GiB), count=%zu floats\n",
            iters, bytes, (double)bytes / (1024.0 * 1024.0 * 1024.0), bytes / sizeof(float));
     printf("Config: start_disconnect_delay_ms=%d\n", start_disconnect_delay_ms);
     printf("Config: disconnect_cmd=%s, reconnect_cmd=%s\n", disconnect_cmd, reconnect_cmd);
+    printf("Config: graph=%d recapture_at=%d newbuf_at=%d register=%d eager_before_recapture=%d\n", use_graph, recapture_at, newbuf_at, do_register, eager_before_recapture);
   }
 
   if (myRank == 0) {
@@ -175,6 +187,32 @@ int main(int argc, char* argv[]) {
     iter_ms_log.resize(iters, 0);
   }
 
+  void* reg_handle = nullptr;
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t graph_exec = nullptr;
+  auto capture = [&]() {
+    if (graph_exec) { CUDACHECK(cudaGraphExecDestroy(graph_exec)); graph_exec = nullptr; }
+    if (graph) { CUDACHECK(cudaGraphDestroy(graph)); graph = nullptr; }
+    auto t0 = std::chrono::steady_clock::now();
+    CUDACHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    NCCLCHECK(ncclAllReduce(d_buf, d_buf, count, ncclFloat, ncclSum, comm, stream));
+    CUDACHECK(cudaStreamEndCapture(stream, &graph));
+    auto t1 = std::chrono::steady_clock::now();
+    CUDACHECK(cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0));
+    auto t2 = std::chrono::steady_clock::now();
+    size_t nodes = 0; CUDACHECK(cudaGraphGetNodes(graph, NULL, &nodes));
+    printf("[Rank %d] Captured AllReduce into a CUDA graph: capture %.1f ms, instantiate %.1f ms, %zu nodes\n", myRank,
+           std::chrono::duration<double, std::milli>(t1 - t0).count(), std::chrono::duration<double, std::milli>(t2 - t1).count(), nodes);
+  };
+  auto eager = [&]() {
+    auto t0 = std::chrono::steady_clock::now();
+    NCCLCHECK(ncclAllReduce(d_buf, d_buf, count, ncclFloat, ncclSum, comm, stream));
+    CUDACHECK(cudaStreamSynchronize(stream));
+    printf("[Rank %d] Eager AllReduce before re-capture took %.0f ms\n", myRank,
+           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  };
+  if (use_graph) capture();
+
   std::thread disconnect_thread;
   if (myRank == 0 && start_disconnect_delay_ms >= 0) {
     printf("[Rank 0] Arming NIC disconnect at program start (delay %d ms) using: %s\n",
@@ -215,7 +253,11 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    NCCLCHECK(ncclAllReduce(d_buf, d_buf, count, ncclFloat, ncclSum, comm, stream));
+    if (use_graph) {
+      CUDACHECK(cudaGraphLaunch(graph_exec, stream));
+    } else {
+      NCCLCHECK(ncclAllReduce(d_buf, d_buf, count, ncclFloat, ncclSum, comm, stream));
+    }
     CUDACHECK(cudaStreamSynchronize(stream));
 
     if (myRank == 0) {
@@ -259,6 +301,26 @@ int main(int argc, char* argv[]) {
 
     if (!iter_ok) {
       overall_ok = false;
+    }
+
+    if (newbuf_at == iter + 1) {
+      float* nbuf = nullptr;
+      CUDACHECK(cudaMalloc(&nbuf, bytes));
+      printf("[Rank %d] Switching to a new buffer %p (old %p)\n", myRank, (void*)nbuf, (void*)d_buf);
+      if (do_register) {
+        auto t0 = std::chrono::steady_clock::now();
+        NCCLCHECK(ncclCommRegister(comm, nbuf, bytes, &reg_handle));
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        printf("[Rank %d] ncclCommRegister of the new buffer took %lld ms\n", myRank, (long long)ms);
+      }
+      CUDACHECK(cudaFree(d_buf));
+      d_buf = nbuf;
+      if (use_graph) { MPICHECK(MPI_Barrier(MPI_COMM_WORLD)); capture(); }
+    }
+    if (use_graph && recapture_at == iter + 1) {
+      MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+      if (eager_before_recapture) eager();
+      capture();
     }
 
     if (myRank == 0) {
@@ -317,6 +379,9 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  if (reg_handle) NCCLCHECK(ncclCommDeregister(comm, reg_handle));
+  if (graph_exec) CUDACHECK(cudaGraphExecDestroy(graph_exec));
+  if (graph) CUDACHECK(cudaGraphDestroy(graph));
   CUDACHECK(cudaFree(d_buf));
   CUDACHECK(cudaStreamDestroy(stream));
   ncclCommDestroy(comm);
