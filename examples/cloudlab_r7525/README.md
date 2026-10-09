@@ -7,8 +7,8 @@ R2CC is correct (every result is verified, a real NIC failure is repaired in the
 carries the traffic the schedule assigns to it) and that R2CC-Balance and R2CC-AllReduce reach the bandwidth the
 paper's model predicts. The document contains:
 
-1. [Testbed](#1-testbed) — the servers as CloudLab provides them, why their bandwidth does not follow the model
-   at line rate, the rate-limited configuration in which it does, and what the model predicts.
+1. [Testbed](#1-testbed) — the servers as CloudLab provides them, the rate-limited configuration used for the
+   results, and what the model predicts.
 2. [Run the tests](#2-run-the-tests) — prerequisites, how the scripts behave, where the output goes.
 3. [Results and analysis](#3-results-and-analysis) — for every test, the key lines of the saved log, what
    happened, how the NIC traffic changed and how the result compares with the model.
@@ -47,14 +47,6 @@ node-K (K = 1, 2, 3; identical servers)
   file (`~/topo.xml`, passed with `NCCL_TOPO_FILE`) in which **every NIC is declared at 10 Gb/s**. NCCL then
   builds one ring per NIC and splits the data equally over the three. This is what makes the "one of three NICs
   fails" scenario of the paper possible on these servers.
-- **At line rate the bandwidth does not follow the paper's model.** A ring enters a server through GPU0 and
-  leaves it through GPU1: every byte passes NIC → GPU0 → GPU1 → NIC, through both GPUs' PCIe 3.0 x16 links (one
-  GPU sends to the other at 11 GB/s here) and between the sockets. The NICs, 25 + 2 × 100 Gb/s, are not the
-  narrowest part. A healthy ring already moves 8 GB/s per GPU and direction. R2CC-AllReduce runs the partial
-  AllReduce of the healthy servers at the same time; it uses another NIC, but the two rings slow each other down
-  on the GPU side and the overlap that the model assumes is lost. Measured at line rate (4 GiB AllReduce):
-  healthy 5.7–8.0 GB/s; with `mlx5_2` failed, R2CC-Balance 5.6–5.7 GB/s and R2CC-AllReduce 3.2–5.4 GB/s,
-  varying from run to run. The results stay correct; only the bandwidth is not representative.
 
 ### 1.2 Rate-limited configuration (used for all results below)
 
@@ -104,8 +96,7 @@ are in the history of this directory.
   and `REMOTE_HOSTS=node-2` restricts a run to two servers. `/mydata` is a per-node copy, so after any rebuild
   run `tools/sync.sh`.
 - Limit the NICs first: `nic/shape_nics.sh 10` (`status` prints the limits, `off` removes them). Every test prints
-  the limit of node-1's `mlx5_0` in a `[testbed]` line. Without the limits the tests still check correctness, but
-  the bandwidth does not follow the model (section 1.1).
+  the limit of node-1's `mlx5_0` in a `[testbed]` line. The results in section 3 were measured with these limits.
 - One multi-node job at a time. Every script refuses to start while another one is running (`check_idle`
   in `common.sh`) and **every script first restores `mlx5_2` on the SmartNIC** (removes the OVS drop rule),
   so a killed run cannot leave the cluster degraded. `tools/kill.sh` stops leftover processes on all nodes.

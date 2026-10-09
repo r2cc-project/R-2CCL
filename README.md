@@ -27,13 +27,6 @@ We provide a pre-built CloudLab image, the test scripts and the logs of running 
 - [Experiments](./examples/cloudlab_r7525/README.md) — six ready-to-run tests, the testbed topology, and the expected results with their analysis.
 - [Logs](./examples/cloudlab_r7525/logs) — the terminal output of running these experiments on three CloudLab servers, one run per test.
 
-## Todo List
-1. Live Migration: Seamless failover via multi-NIC registration and DMA rollback. ✔️
-2. R<sup>2</sup>CCL-Balance: Load-balancing for remaining healthy interfaces. ✔️
-3. R<sup>2</sup>CCL-AllReduce: Implementation on top of NCCL sub-communicators (partial AllReduce on the healthy servers + pipelined Reduce/Broadcast of the tail), verified with nccl-tests `-c 1`, real NIC disconnects and CUDA graph capture. ✔️
-4. CloudLab r7525 examples and test scripts for two or three servers. ✔️
-5. Bandwidth of R<sup>2</sup>CCL-Balance and R<sup>2</sup>CCL-AllReduce measured on three CloudLab servers against the model of the paper. ✔️
-
 ## Test scripts and results
 We provide a complete set of test scripts and the results of running them in [examples/cloudlab_r7525](./examples/cloudlab_r7525): hot repair of a real NIC failure (injected at runtime with an OVS drop rule on the BlueField SmartNIC) followed by R<sup>2</sup>CCL-Balance or R<sup>2</sup>CCL-AllReduce, and nccl-tests correctness/bandwidth runs of plain NCCL, Balance and R<sup>2</sup>CCL-AllReduce. The scripts use every server of the CloudLab experiment; the saved run of every test, on three servers, is in [examples/cloudlab_r7525/logs](./examples/cloudlab_r7525/logs). See [examples/cloudlab_r7525/README.md](./examples/cloudlab_r7525/README.md) for the scripts, the testbed, the annotated results and their comparison with the model, and [r7525_setup.md](./examples/cloudlab_r7525/r7525_setup.md) for setting up the CloudLab servers.
 

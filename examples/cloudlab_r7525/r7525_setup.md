@@ -91,8 +91,8 @@ cd /mydata/R2CC/examples/cloudlab_r7525
 ./nic/shape_nics.sh off       # removes the limits
 ```
 
-The limits make the declared speed of `topo.xml` the real one; README.md, section 1, explains why the bandwidth
-results depend on it. Every test prints the limit of node-1's `mlx5_0` in a `[testbed]` line.
+The limits make the declared speed of `topo.xml` the real one (README.md, section 1.2). Every test prints the
+limit of node-1's `mlx5_0` in a `[testbed]` line.
 
 ## Directory structure
 
