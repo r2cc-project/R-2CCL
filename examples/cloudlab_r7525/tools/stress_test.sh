@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Repeat one of the hot-repair tests N times and summarise pass/diff/segfault/timeout counts and the
-# iteration in which failover happened (first iteration with mlx5_2 RX < 20 MB).
+# Repeat one of the hot-repair tests N times and summarise pass/diff/missed/segfault/timeout counts and the
+# iteration in which failover happened (first iteration with mlx5_2 RX < 20 MB). missed = exit code 3, the cut
+# did not hit a running AllReduce.
 set -euo pipefail
 
 usage() {
@@ -57,7 +58,7 @@ fi
 mkdir -p "${LOG_DIR}"
 SUMMARY_LOG="${LOG_DIR}/stress_summary_${RUN_TAG}.log"
 
-pass_count=0; diff_count=0; segfault_count=0; timeout_count=0; unknown_count=0
+pass_count=0; diff_count=0; missed_count=0; segfault_count=0; timeout_count=0; unknown_count=0
 declare -A failover_hist=()
 
 for ((i=1; i<=rounds; i++)); do
@@ -73,9 +74,11 @@ for ((i=1; i<=rounds; i++)); do
   result="unknown"
   if grep -qiE 'Segmentation fault|Caught signal 11|exited on signal 11|Signal: Segmentation fault' "${run_log}"; then
     result="segment_fault"; ((segfault_count+=1))
-  elif grep -q 'diff=' "${run_log}" || grep -q 'TEST FAIL: Verification failed' "${run_log}"; then
+  elif [[ "${rc}" -eq 2 ]] || grep -q 'diff=' "${run_log}" || grep -q 'TEST FAIL: Verification failed' "${run_log}"; then
     result="diff"; ((diff_count+=1))
-  elif grep -q 'TEST PASS' "${run_log}"; then
+  elif [[ "${rc}" -eq 3 ]]; then
+    result="missed"; ((missed_count+=1))
+  elif [[ "${rc}" -eq 0 ]] && grep -q 'TEST PASS' "${run_log}"; then
     result="pass"; ((pass_count+=1))
   elif [[ "${rc}" -eq 124 ]]; then
     result="timeout"; ((timeout_count+=1))
@@ -97,6 +100,7 @@ done
   echo "rounds=${rounds}"
   echo "pass=${pass_count}"
   echo "diff=${diff_count}"
+  echo "missed=${missed_count}"
   echo "segment_fault=${segfault_count}"
   echo "timeout=${timeout_count}"
   echo "unknown=${unknown_count}"

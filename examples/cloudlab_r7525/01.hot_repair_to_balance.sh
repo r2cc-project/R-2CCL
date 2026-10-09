@@ -4,9 +4,11 @@
 #   hot_repair/test_hot_repair runs 10 x 4 GiB float AllReduce on all GPUs. 4 s after start the SmartNIC
 #   drops all traffic of node-1's mlx5_2 (nic/disconnect_nic1.sh). R2CC detects the failure mid-collective,
 #   live-migrates the in-flight transfers to the backup connection, and from the next AllReduce on
-#   (R2CC_AR_AFTER_REPAIR=2) re-balances all traffic over the remaining NICs. Every iteration is verified;
-#   the final table shows per-iteration time and per-HCA RX bytes (mlx5_2 goes to 0 after failover).
-#   The NIC is reconnected at the end. Expect: TEST PASS.
+#   (R2CC_AR_AFTER_REPAIR=2) re-balances all traffic over the remaining NICs. Every element of every iteration
+#   is checked on every rank; the final table shows per-iteration time and per-HCA RX bytes (mlx5_2 goes to 0
+#   after failover). The NIC is reconnected at the end. Expect: TEST PASS, exit code 0. Exit code 2 = wrong
+#   results, 3 = the cut did not hit a running AllReduce (run again).
+#   Checker self-test: R2CC_TEST_CORRUPT=3 (or 3,nan) spoils one output element in iteration 3; expect exit code 2.
 #
 # Usage: ./01.hot_repair_to_balance.sh [-log 0|1]        (-log 1 = keep NCCL INFO R2CC trace lines)
 #   Nothing is written to disk by default; SAVE_LOG=1 also saves the terminal output to logs/local/.

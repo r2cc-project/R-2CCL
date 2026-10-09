@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <algorithm>
+#include <atomic>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -37,10 +40,35 @@
   } \
 } while (0)
 
-__global__ void fill_kernel(float* buf, size_t n, float val) {
+// Input of rank r at element i in iteration it: a pseudo-random integer below mask+1, stored as float. mask is chosen
+// so that the sum over all ranks stays below 2^24: every summation order then gives the exact result, the output can
+// be compared exactly, and data that ends up at the wrong position or iteration does not match what is expected there.
+__host__ __device__ inline unsigned int input_value(unsigned long long idx, int rank, int iter, unsigned int mask) {
+  unsigned long long x = idx + 0x9E3779B97F4A7C15ull * (unsigned long long)(rank * 4096 + iter + 1);
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+  x ^= x >> 31;
+  return (unsigned int)x & mask;
+}
+
+__global__ void fill_kernel(float* buf, size_t n, int rank, int iter, unsigned int mask) {
   size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n) {
-    buf[idx] = val;
+    buf[idx] = (float)input_value(idx, rank, iter, mask);
+  }
+}
+
+// Compares every element with the exact sum over all ranks; NaN and Inf never match.
+__global__ void check_kernel(const float* buf, size_t n, int nRanks, int iter, unsigned int mask,
+                             unsigned long long* mismatches, unsigned long long* first_bad) {
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n) return;
+  unsigned int expect = 0;
+  for (int r = 0; r < nRanks; ++r) expect += input_value(idx, r, iter, mask);
+  float got = buf[idx];
+  if (!isfinite(got) || got != (float)expect) {
+    atomicAdd(mismatches, 1ull);
+    atomicMin(first_bad, (unsigned long long)idx);
   }
 }
 
@@ -112,29 +140,29 @@ int main(int argc, char* argv[]) {
 
   const size_t bytes = 4ull * 1024 * 1024 * 1024; // 4 GiB
   const int iters = 10;
-  const int verify_samples = 4;
   const char* disconnect_cmd = "./nic/disconnect_nic1.sh";
   const char* reconnect_cmd = "./nic/connect_nic1.sh";
 
   const int start_disconnect_delay_ms = get_env_int("R2CC_AR_START_DISCONNECT_DELAY_MS", -1);
-  // Graph mode: the AllReduce is captured once into a CUDA graph and every iteration replays it.
-  // R2CC_TEST_RECAPTURE_AT=<n> re-captures the graph after iteration n (e.g. after the failure).
-  const int use_graph = get_env_int("R2CC_TEST_GRAPH", 0);
-  const int recapture_at = get_env_int("R2CC_TEST_RECAPTURE_AT", -1);
-  // New buffer on the failure path: after iteration R2CC_TEST_NEWBUF_AT the AllReduce moves to a buffer allocated
-  // at that point (a new address); with R2CC_TEST_REGISTER=1 it is also registered with ncclCommRegister first.
-  const int newbuf_at = get_env_int("R2CC_TEST_NEWBUF_AT", -1);
-  const int do_register = get_env_int("R2CC_TEST_REGISTER", 0);
-  // R2CC_TEST_EAGER_BEFORE_RECAPTURE=1: run one AllReduce outside capture before re-capturing (lets R2CC switch
-  // mode and create its sub-communicators, which cannot happen inside a capture).
-  const int eager_before_recapture = get_env_int("R2CC_TEST_EAGER_BEFORE_RECAPTURE", 0);
+  // Checker self-test: R2CC_TEST_CORRUPT=<n>[,nan] overwrites one output element of rank 0 in iteration n (a wrong
+  // value, or NaN) before it is checked. The run must then end in TEST FAIL with a non-zero exit code.
+  int corrupt_at = -1, corrupt_nan = 0;
+  if (const char* c = getenv("R2CC_TEST_CORRUPT")) {
+    corrupt_at = atoi(c);
+    corrupt_nan = strstr(c, "nan") != nullptr;
+  }
+  // Inputs are integers below 2^(24 - rank_bits); the sum over nRanks <= 2^rank_bits ranks stays below 2^24.
+  int rank_bits = 0;
+  while ((1 << rank_bits) < nRanks) ++rank_bits;
+  const unsigned int mask = (1u << (24 - rank_bits)) - 1;
 
   if (myRank == 0) {
     printf("Config: iters=%d, bytes=%zu (%.2f GiB), count=%zu floats\n",
            iters, bytes, (double)bytes / (1024.0 * 1024.0 * 1024.0), bytes / sizeof(float));
     printf("Config: start_disconnect_delay_ms=%d\n", start_disconnect_delay_ms);
     printf("Config: disconnect_cmd=%s, reconnect_cmd=%s\n", disconnect_cmd, reconnect_cmd);
-    printf("Config: graph=%d recapture_at=%d newbuf_at=%d register=%d eager_before_recapture=%d\n", use_graph, recapture_at, newbuf_at, do_register, eager_before_recapture);
+    if (corrupt_at >= 0) printf("Config: checker self-test in iteration %d (%s)\n", corrupt_at, corrupt_nan ? "NaN" : "wrong value");
+    printf("Config: every element of every iteration is checked on every rank; inputs are integers below %u\n", mask + 1);
   }
 
   if (myRank == 0) {
@@ -173,53 +201,42 @@ int main(int argc, char* argv[]) {
 
   float* d_buf = nullptr;
   CUDACHECK(cudaMalloc(&d_buf, bytes));
+  unsigned long long* d_stats = nullptr;   // [0] mismatching elements, [1] lowest mismatching index
+  CUDACHECK(cudaMalloc(&d_stats, 2 * sizeof(unsigned long long)));
 
   int threads = 256;
   int blocks = (int)((count + threads - 1) / threads);
 
   bool overall_ok = true;
+  unsigned long long local_mismatches = 0;
   std::vector<IbDevCounters> ib_devs;
   std::vector<std::vector<unsigned long long>> rx_log;
   std::vector<long long> iter_ms_log;
+  std::vector<double> iter_t0, iter_t1;   // seconds since program start, rank 0
   if (myRank == 0) {
     ib_devs = init_ib_counters();
     rx_log.resize(iters);
     iter_ms_log.resize(iters, 0);
+    iter_t0.resize(iters, 0);
+    iter_t1.resize(iters, 0);
   }
-
-  void* reg_handle = nullptr;
-  cudaGraph_t graph = nullptr;
-  cudaGraphExec_t graph_exec = nullptr;
-  auto capture = [&]() {
-    if (graph_exec) { CUDACHECK(cudaGraphExecDestroy(graph_exec)); graph_exec = nullptr; }
-    if (graph) { CUDACHECK(cudaGraphDestroy(graph)); graph = nullptr; }
-    auto t0 = std::chrono::steady_clock::now();
-    CUDACHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    NCCLCHECK(ncclAllReduce(d_buf, d_buf, count, ncclFloat, ncclSum, comm, stream));
-    CUDACHECK(cudaStreamEndCapture(stream, &graph));
-    auto t1 = std::chrono::steady_clock::now();
-    CUDACHECK(cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0));
-    auto t2 = std::chrono::steady_clock::now();
-    size_t nodes = 0; CUDACHECK(cudaGraphGetNodes(graph, NULL, &nodes));
-    printf("[Rank %d] Captured AllReduce into a CUDA graph: capture %.1f ms, instantiate %.1f ms, %zu nodes\n", myRank,
-           std::chrono::duration<double, std::milli>(t1 - t0).count(), std::chrono::duration<double, std::milli>(t2 - t1).count(), nodes);
+  const auto prog_start = std::chrono::steady_clock::now();
+  auto since_start = [&](std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double>(t - prog_start).count();
   };
-  auto eager = [&]() {
-    auto t0 = std::chrono::steady_clock::now();
-    NCCLCHECK(ncclAllReduce(d_buf, d_buf, count, ncclFloat, ncclSum, comm, stream));
-    CUDACHECK(cudaStreamSynchronize(stream));
-    printf("[Rank %d] Eager AllReduce before re-capture took %.0f ms\n", myRank,
-           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-  };
-  if (use_graph) capture();
 
   std::thread disconnect_thread;
+  std::atomic<int> disconnect_rc{-1};
+  double disconnect_t0 = -1, disconnect_t1 = -1;   // command start / end, seconds since program start
   if (myRank == 0 && start_disconnect_delay_ms >= 0) {
     printf("[Rank 0] Arming NIC disconnect at program start (delay %d ms) using: %s\n",
            start_disconnect_delay_ms, disconnect_cmd);
-    disconnect_thread = std::thread([start_disconnect_delay_ms, disconnect_cmd]() {
+    disconnect_thread = std::thread([&, start_disconnect_delay_ms, disconnect_cmd]() {
       if (start_disconnect_delay_ms > 0) usleep((useconds_t)start_disconnect_delay_ms * 1000);
+      disconnect_t0 = since_start(std::chrono::steady_clock::now());
       int rc = system(disconnect_cmd);
+      disconnect_t1 = since_start(std::chrono::steady_clock::now());
+      disconnect_rc = rc;
       if (rc != 0) {
         printf("[Rank 0] NIC disconnect command failed, rc=%d\n", rc);
       } else {
@@ -229,17 +246,13 @@ int main(int argc, char* argv[]) {
   }
 
   for (int iter = 0; iter < iters; ++iter) {
-    float base = (float)(iter + 1);
-    float in_val = base + (float)myRank;
-    double expected = (double)base * nRanks + ((double)nRanks * (nRanks - 1) / 2.0);
-
     auto iter_start = std::chrono::steady_clock::now();
     if (myRank == 0) {
       printf("[Rank 0] Iter %d/%d START: allreduce %.2f GiB\n", iter + 1, iters,
              (double)bytes / (1024.0 * 1024.0 * 1024.0));
     }
 
-    fill_kernel<<<blocks, threads, 0, stream>>>(d_buf, count, in_val);
+    fill_kernel<<<blocks, threads, 0, stream>>>(d_buf, count, myRank, iter, mask);
     CUDACHECK(cudaGetLastError());
 
     std::vector<unsigned long long> rx_start;
@@ -253,12 +266,9 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    if (use_graph) {
-      CUDACHECK(cudaGraphLaunch(graph_exec, stream));
-    } else {
-      NCCLCHECK(ncclAllReduce(d_buf, d_buf, count, ncclFloat, ncclSum, comm, stream));
-    }
+    NCCLCHECK(ncclAllReduce(d_buf, d_buf, count, ncclFloat, ncclSum, comm, stream));
     CUDACHECK(cudaStreamSynchronize(stream));
+    auto iter_end = std::chrono::steady_clock::now();   // the reported time covers input fill and collective only
 
     if (myRank == 0) {
       rx_log[iter].resize(ib_devs.size(), 0);
@@ -275,58 +285,41 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    bool iter_ok = true;
-    if (verify_samples > 0) {
-      std::vector<size_t> samples;
-      samples.push_back(0);
-      if (count > 1) samples.push_back(count / 2);
-      if (count > 2) samples.push_back(count - 1);
-      while ((int)samples.size() < verify_samples) {
-        size_t idx = (samples.back() * 1315423911u + 12345u) % count;
-        samples.push_back(idx);
-      }
-
-      for (size_t idx : samples) {
-        float host_val = 0.0f;
-        CUDACHECK(cudaMemcpy(&host_val, d_buf + idx, sizeof(float), cudaMemcpyDeviceToHost));
-        double diff = fabs((double)host_val - expected);
-        if (diff > 1e-3) {
-          printf("[Rank %d] Iter %d sample idx=%zu got=%f expected=%f diff=%f\n",
-                 myRank, iter + 1, idx, host_val, (float)expected, (float)diff);
-          iter_ok = false;
-          break;
-        }
-      }
+    if (myRank == 0 && corrupt_at == iter + 1) {
+      size_t idx = count / 3 + 12345;
+      float bad = 0.0f;
+      CUDACHECK(cudaMemcpy(&bad, d_buf + idx, sizeof(float), cudaMemcpyDeviceToHost));
+      bad = corrupt_nan ? NAN : bad + 1.0f;
+      CUDACHECK(cudaMemcpy(d_buf + idx, &bad, sizeof(float), cudaMemcpyHostToDevice));
+      printf("[Rank 0] Checker self-test: wrote %s to element %zu of iteration %d\n", corrupt_nan ? "NaN" : "a wrong value",
+             idx, iter + 1);
     }
 
+    // Check every element, outside the timed part of the iteration.
+    unsigned long long stats[2] = {0, ULLONG_MAX};
+    CUDACHECK(cudaMemcpyAsync(d_stats, stats, sizeof(stats), cudaMemcpyHostToDevice, stream));
+    check_kernel<<<blocks, threads, 0, stream>>>(d_buf, count, nRanks, iter, mask, d_stats, d_stats + 1);
+    CUDACHECK(cudaGetLastError());
+    CUDACHECK(cudaMemcpyAsync(stats, d_stats, sizeof(stats), cudaMemcpyDeviceToHost, stream));
+    CUDACHECK(cudaStreamSynchronize(stream));
+    bool iter_ok = stats[0] == 0;
     if (!iter_ok) {
+      size_t idx = (size_t)stats[1];
+      float got = 0.0f;
+      CUDACHECK(cudaMemcpy(&got, d_buf + idx, sizeof(float), cudaMemcpyDeviceToHost));
+      unsigned int expect = 0;
+      for (int r = 0; r < nRanks; ++r) expect += input_value(idx, r, iter, mask);
+      printf("[Rank %d] Iter %d: %llu of %zu elements wrong, first at index %zu: got=%f expected=%u diff=%f\n",
+             myRank, iter + 1, stats[0], count, idx, got, expect, (double)got - expect);
       overall_ok = false;
-    }
-
-    if (newbuf_at == iter + 1) {
-      float* nbuf = nullptr;
-      CUDACHECK(cudaMalloc(&nbuf, bytes));
-      printf("[Rank %d] Switching to a new buffer %p (old %p)\n", myRank, (void*)nbuf, (void*)d_buf);
-      if (do_register) {
-        auto t0 = std::chrono::steady_clock::now();
-        NCCLCHECK(ncclCommRegister(comm, nbuf, bytes, &reg_handle));
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-        printf("[Rank %d] ncclCommRegister of the new buffer took %lld ms\n", myRank, (long long)ms);
-      }
-      CUDACHECK(cudaFree(d_buf));
-      d_buf = nbuf;
-      if (use_graph) { MPICHECK(MPI_Barrier(MPI_COMM_WORLD)); capture(); }
-    }
-    if (use_graph && recapture_at == iter + 1) {
-      MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
-      if (eager_before_recapture) eager();
-      capture();
+      local_mismatches += stats[0];
     }
 
     if (myRank == 0) {
-      auto iter_end = std::chrono::steady_clock::now();
       auto iter_ms = std::chrono::duration_cast<std::chrono::milliseconds>(iter_end - iter_start).count();
       iter_ms_log[iter] = (long long)iter_ms;
+      iter_t0[iter] = since_start(iter_start);
+      iter_t1[iter] = since_start(iter_end);
       printf("[Rank 0] Iter %d/%d END: %s (elapsed %lld ms)\n",
              iter + 1, iters, iter_ok ? "OK" : "FAIL", (long long)iter_ms);
     }
@@ -369,24 +362,70 @@ int main(int argc, char* argv[]) {
 
   int local_ok = overall_ok ? 1 : 0;
   int global_ok = 0;
+  unsigned long long all_mismatches = 0;
   MPICHECK(MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD));
+  MPICHECK(MPI_Reduce(&local_mismatches, &all_mismatches, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
 
+  // Exit code: 0 pass, 2 wrong results, 3 a NIC failure was injected but not observed during a collective
+  // (1 is what the CUDA/NCCL/MPI error checks above exit with).
+  int status = global_ok ? 0 : 2;
   if (myRank == 0) {
-    if (global_ok) {
-      printf("[Rank 0] TEST PASS: All allreduces completed and verified.\n");
-    } else {
+    printf("[Rank 0] Verification: all %zu elements of each of the %d iterations checked on all %d ranks: %llu wrong\n",
+           count, iters, nRanks, all_mismatches);
+    if (start_disconnect_delay_ms >= 0) {
+      // The cut port is node-1's mlx5_2, the second counter. The iteration that was in flight when it was cut
+      // received part of its share over it; the following ones receive nothing over it.
+      const size_t port = 1;
+      unsigned long long full = 0;
+      for (int it = 0; it < iters; ++it) full = std::max(full, rx_log[it].size() > port ? rx_log[it][port] : 0ull);
+      int cut = -1;
+      for (int it = 0; it < iters && cut < 0; ++it) {
+        if (rx_log[it].size() > port && rx_log[it][port] < full * 9 / 10) cut = it;
+      }
+      const unsigned long long idle_mb = 20;
+      bool quiet_after = cut >= 0;
+      for (int it = cut + 1; cut >= 0 && it < iters; ++it) quiet_after = quiet_after && rx_log[it][port] < idle_mb;
+      char buf[512];
+      if (!ib_devs[port].available) {
+        snprintf(buf, sizeof(buf), "mlx5_2 counters unavailable");
+        if (status == 0) status = 3;
+      } else if (disconnect_rc != 0) {
+        snprintf(buf, sizeof(buf), "disconnect command failed (rc=%d)", disconnect_rc.load());
+        if (status == 0) status = 3;
+      } else if (cut < 0) {
+        snprintf(buf, sizeof(buf), "mlx5_2 kept its full share in every iteration: no failure observed");
+        if (status == 0) status = 3;
+      } else if (rx_log[cut][port] < idle_mb) {
+        snprintf(buf, sizeof(buf), "mlx5_2 was already down when iteration %d started (%llu MB): the cut did not hit a collective in flight; run again",
+                 cut + 1, rx_log[cut][port]);
+        if (status == 0) status = 3;
+      } else if (!quiet_after) {
+        snprintf(buf, sizeof(buf), "mlx5_2 still carried traffic after iteration %d", cut + 1);
+        if (status == 0) status = 3;
+      } else {
+        snprintf(buf, sizeof(buf), "mlx5_2 cut during iteration %d (%llu of %llu MB received before the cut; command ran %.2f-%.2f s, "
+                 "iteration %.2f-%.2f s), no traffic on it in iterations %d-%d, all of them completed",
+                 cut + 1, rx_log[cut][port], full, disconnect_t0, disconnect_t1, iter_t0[cut], iter_t1[cut], cut + 2, iters);
+      }
+      printf("[Rank 0] Failure evidence: %s\n", buf);
+    }
+    if (status == 0) {
+      printf("[Rank 0] TEST PASS: all AllReduces completed and every element of every iteration is correct%s.\n",
+             start_disconnect_delay_ms >= 0 ? ", including the one the NIC failure hit" : "");
+    } else if (status == 2) {
       printf("[Rank 0] TEST FAIL: Verification failed on at least one rank/iteration.\n");
+    } else {
+      printf("[Rank 0] TEST FAIL: the NIC failure did not hit a running AllReduce (see Failure evidence above).\n");
     }
   }
+  MPICHECK(MPI_Bcast(&status, 1, MPI_INT, 0, MPI_COMM_WORLD));
 
-  if (reg_handle) NCCLCHECK(ncclCommDeregister(comm, reg_handle));
-  if (graph_exec) CUDACHECK(cudaGraphExecDestroy(graph_exec));
-  if (graph) CUDACHECK(cudaGraphDestroy(graph));
+  CUDACHECK(cudaFree(d_stats));
   CUDACHECK(cudaFree(d_buf));
   CUDACHECK(cudaStreamDestroy(stream));
   ncclCommDestroy(comm);
   MPICHECK(MPI_Finalize());
 
   printf("[Rank %d] Exiting.\n", myRank);
-  return 0;
+  return status;
 }
