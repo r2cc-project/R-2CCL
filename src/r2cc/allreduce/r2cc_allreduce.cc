@@ -58,8 +58,10 @@ static ncclResult_t agreeParameters(struct ncclComm* comm) {
   if (st->paramsReady) return ncclSuccess;
   r2ccAllReduceState::Parameters local = {};
   local.chunks = std::max(1, std::min(kMaxChunks, envInt("R2CC_AR_STAGE2_CHUNKS", 4)));
-  // Serial Stage 1 avoids main/tail contention on the two-node PCIe testbed.
-  local.schedule = std::max(0, std::min(3, envInt("R2CC_AR_SCHEDULE", 2)));
+  // Stage 1 runs concurrently once the healthy nodes have a NIC to reserve for the partial AllReduce
+  // (three or more nodes). With a single healthy node the partial AllReduce is intra-node, and serial
+  // Stage 1 avoids main/tail contention on the two-node PCIe testbed.
+  local.schedule = std::max(0, std::min(3, envInt("R2CC_AR_SCHEDULE", comm->nNodes >= 3 ? 1 : 2)));
   const char* minimum = getenv("R2CC_AR_MIN_BYTES");
   local.minBytes = minimum ? strtoull(minimum, NULL, 0) : 16777216;
   local.failedNode = localFailedNode(comm);
@@ -131,6 +133,38 @@ static ncclResult_t computeFailedChannelMask(struct ncclComm* comm, int failedNo
   comm->r2ccMaskNode = failedNode;
   INFO(NCCL_R2CC, "R2CC mask comm=%p rank=%d failedNode=%d mask=0x%lx", comm, comm->rank, failedNode, (unsigned long)comm->r2ccFailedChanMask);
 exit:
+  free(masks);
+  return ret;
+}
+
+// Healthy child: keep only the channels on the NIC slots the degraded node lost, so the partial
+// AllReduce runs on the bandwidth the main AllReduce leaves idle instead of competing with it.
+// Channels without a NIC on this rank (intra-node hops) do not vote.
+static ncclResult_t computeReservedChannelMask(struct ncclComm* comm, uint64_t failedDevs) {
+  if (comm->runtimeConn && !comm->initAlgoChannels[NCCL_ALGO_RING]) {
+    NCCLCHECK(ncclTransportRingConnect(comm));
+    comm->initAlgoChannels[NCCL_ALGO_RING] = true;
+  }
+  uint64_t* masks = NULL;
+  NCCLCHECK(ncclCalloc(&masks, comm->nRanks));
+  for (int c = 0; c < comm->nChannels; c++) {
+    for (int d : {comm->r2ccChanSendDev[c], comm->r2ccChanRecvDev[c]}) {
+      if (d >= 0 && d < 64 && !(failedDevs & (1ull << d))) masks[comm->rank] |= 1ull << c;
+    }
+  }
+  ncclResult_t ret = bootstrapAllGather(comm->bootstrap, masks, sizeof(uint64_t));
+  if (ret == ncclSuccess) {
+    uint64_t mask = 0, all = comm->nChannels >= 64 ? ~0ull : (1ull << comm->nChannels) - 1;
+    for (int r = 0; r < comm->nRanks; r++) mask |= masks[r];
+    // No channel on the reserved slot: leave the child on all NICs rather than mask everything.
+    if ((mask & all) != all) {
+      comm->r2ccFailedChanMask = mask;
+      comm->r2ccMaskReady = 1;
+      comm->r2ccBalanceEnabled = 1;
+    }
+    INFO(NCCL_R2CC, "R2CC reserved mask comm=%p rank=%d nChannels=%d mask=0x%lx applied=%d",
+         comm, comm->rank, comm->nChannels, (unsigned long)mask, comm->r2ccBalanceEnabled);
+  }
   free(masks);
   return ret;
 }
@@ -250,6 +284,12 @@ static ncclResult_t prepare(struct ncclComm* comm, int node, int helper) {
     NCCLCHECK(agreeSetup(comm, ret, &ok));
   }
   if (ok) {
+    // Inside a single healthy node there is no NIC to reserve.
+    ret = ncclSuccess;
+    if (st->healthy && st->healthy->nNodes >= 2) ret = computeReservedChannelMask(st->healthy, st->params.failedDevs);
+    NCCLCHECK(agreeSetup(comm, ret, &ok));
+  }
+  if (ok) {
     ret = ncclCommSplit(comm, comm->node == node || comm->rank == helper ? 0 : NCCL_SPLIT_NOCOLOR,
                        comm->rank, &st->aPlusH, NULL);
     NCCLCHECK(agreeSetup(comm, ret, &ok));
@@ -297,7 +337,6 @@ static ncclResult_t run(struct ncclInfo* info) {
   else if (es <= 0 || info->count < minBytes/(size_t)es + (minBytes%(size_t)es != 0)) { reason = 1; why = "message below minimum size"; }
   else if (info->op != ncclSum && info->op != ncclProd && info->op != ncclMin && info->op != ncclMax) { reason = 2; why = "average or user reduction"; }
   else if (ncclGroupDepth) { reason = 3; why = "user group"; }
-  else if (capture != cudaStreamCaptureStatusNone) { reason = 4; why = "stream capture"; }
   else if (!comm->config.blocking) { reason = 5; why = "nonblocking communicator"; }
   if (reason < 0) {
     if (total > 0) tail = (info->count / total)*failed + ((info->count % total)*failed)/total;
@@ -306,8 +345,15 @@ static ncclResult_t run(struct ncclInfo* info) {
     if (!main || !tail) { reason = 6; why = "empty main or tail"; }
   }
   if (reason < 0) {
-    NCCLCHECK(prepare(comm, node, helper));
-    if (comm->r2ccAllReduce->state != 1) { reason = 7; why = "subcommunicator setup failed"; }
+    // The sub-communicators, streams and events are created on the first eligible call; that cannot happen
+    // inside a stream capture. Once they exist the schedule is captured like any other NCCL work: the
+    // internal streams fork from the user's stream through events and join it again at the end.
+    if (capture != cudaStreamCaptureStatusNone && st->state != 1) {
+      reason = 4; why = "stream capture before the sub-communicators exist (run one AllReduce outside capture first)";
+    } else {
+      NCCLCHECK(prepare(comm, node, helper));
+      if (st->state != 1) { reason = 7; why = "subcommunicator setup failed"; }
+    }
   }
   int k = std::min<size_t>(params.chunks, tail);
   INFO(NCCL_R2CC, "R2CC AllReduce count=%zu mainCount=%zu tailCount=%zu K=%d failedNode=%d h=%d X=%.6f schedule=%d fallback=%d",
