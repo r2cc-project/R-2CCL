@@ -15,27 +15,27 @@ R<sup>2</sup>CCL is a fault tolerant communication library that provides lossles
 
 ⚖️ **Topology-Aware Load Balancing (R2CC-Balance)**: After a failure, R2CC dynamically redistributes traffic across the remaining healthy NICs. It is fully aware of PCIe, NUMA, and NVLink (PXN) topology to maximize remaining bandwidth.
 
-🚀 **Failure-Optimized AllReduce (R2CC-AllReduce)**: Introduces a novel schedule that prevents degraded servers from bottlenecking the cluster by intelligently combining global and partial AllReduce operations. The current implementation builds the schedule from NCCL collectives on sub-communicators: an AllReduce of the first (1−X) of the data on all ranks, a partial AllReduce of the remaining X on the healthy servers, and a pipelined Reduce-to-helper + Broadcast of that tail back to the degraded server (X = lost bandwidth fraction).
+🚀 **Failure-Optimized AllReduce (R2CC-AllReduce)**: Introduces a novel schedule that prevents degraded servers from bottlenecking the cluster by intelligently combining global and partial AllReduce operations. It is built from standard NCCL collectives on two sub-communicators created with `ncclCommSplit`, without custom kernels: an AllReduce of the first (1−X) of the data on all ranks, a partial AllReduce of the remaining X among the healthy servers on the NIC slot the degraded server lost, running concurrently with the first one, and a pipelined Reduce onto a healthy helper rank followed by a Broadcast of that tail to all ranks (X = lost bandwidth fraction). The collectives run on separate CUDA streams ordered by events, so the whole schedule can also be captured in a CUDA graph.
 
 <p align="center"><img width="100%" src="./fig/overview.png"></p><br/>
 
 ## Demo
 https://github.com/user-attachments/assets/8511cbf4-843a-4399-a742-d986eac55eb9
 
-We provide a pre-built CloudLab image, the test scripts and the logs of running them, so the demo and the other experiments can be reproduced on two r7525 servers:
-- [Setup guide](./examples/cloudlab_r7525/r7525_setup.md) — instantiate the profile with the pre-built image, flash the SmartNICs, dump the topology.
-- [Experiments](./examples/cloudlab_r7525/README.md) — six ready-to-run tests.
-- [Logs](./examples/cloudlab_r7525/logs) — the terminal output of running these experiments on CloudLab, one run per test.
+We provide a pre-built CloudLab image, the test scripts and the logs of running them, so the demo and the other experiments can be reproduced on two or three r7525 servers. On three servers, with every NIC rate-limited to the same speed, the tests check the bandwidth of each schedule as well as its correctness: the measured results follow the model of the paper (one of three NICs failed: R2CC-Balance at 1/1.5 and R2CC-AllReduce at 1/1.375 of the healthy bandwidth).
+- [Setup guide](./examples/cloudlab_r7525/r7525_setup.md) — instantiate the profile with the pre-built image, flash the SmartNICs, configure the network, dump the topology, rate-limit the NICs.
+- [Experiments](./examples/cloudlab_r7525/README.md) — six ready-to-run tests, the testbed topology, and the expected results with their analysis.
+- [Logs](./examples/cloudlab_r7525/logs) — the terminal output of running these experiments on three CloudLab servers, one run per test.
 
 ## Todo List
 1. Live Migration: Seamless failover via multi-NIC registration and DMA rollback. ✔️
 2. R<sup>2</sup>CCL-Balance: Load-balancing for remaining healthy interfaces. ✔️
-3. R<sup>2</sup>CCL-AllReduce: Correct implementation on top of NCCL sub-communicators (partial AllReduce on the healthy servers + pipelined Reduce/Broadcast of the tail), verified with nccl-tests `-c 1` and real NIC disconnects. ✔️
-4. CloudLab r7525 examples and test scripts. ✔️
-5. Native implementation of R<sup>2</sup>CCL-AllReduce with a customized kernel (single-pass Stage 2).
+3. R<sup>2</sup>CCL-AllReduce: Implementation on top of NCCL sub-communicators (partial AllReduce on the healthy servers + pipelined Reduce/Broadcast of the tail), verified with nccl-tests `-c 1`, real NIC disconnects and CUDA graph capture. ✔️
+4. CloudLab r7525 examples and test scripts for two or three servers. ✔️
+5. Bandwidth of R<sup>2</sup>CCL-Balance and R<sup>2</sup>CCL-AllReduce measured on three CloudLab servers against the model of the paper. ✔️
 
 ## Test scripts and results
-We provide a complete set of test scripts and the results of running them in [examples/cloudlab_r7525](./examples/cloudlab_r7525): hot repair of a real NIC failure (injected at runtime with an OVS drop rule on the BlueField SmartNIC) followed by R<sup>2</sup>CCL-Balance or R<sup>2</sup>CCL-AllReduce, and nccl-tests correctness/bandwidth runs of plain NCCL, Balance and R<sup>2</sup>CCL-AllReduce. Each script saves its terminal output; the saved run of every test is in [examples/cloudlab_r7525/logs](./examples/cloudlab_r7525/logs). See [examples/cloudlab_r7525/README.md](./examples/cloudlab_r7525/README.md) for the scripts, the annotated results and the testbed caveats, and [r7525_setup.md](./examples/cloudlab_r7525/r7525_setup.md) for setting up the two CloudLab servers.
+We provide a complete set of test scripts and the results of running them in [examples/cloudlab_r7525](./examples/cloudlab_r7525): hot repair of a real NIC failure (injected at runtime with an OVS drop rule on the BlueField SmartNIC) followed by R<sup>2</sup>CCL-Balance or R<sup>2</sup>CCL-AllReduce, and nccl-tests correctness/bandwidth runs of plain NCCL, Balance and R<sup>2</sup>CCL-AllReduce. The scripts use every server of the CloudLab experiment; the saved run of every test, on three servers, is in [examples/cloudlab_r7525/logs](./examples/cloudlab_r7525/logs). See [examples/cloudlab_r7525/README.md](./examples/cloudlab_r7525/README.md) for the scripts, the testbed, the annotated results and their comparison with the model, and [r7525_setup.md](./examples/cloudlab_r7525/r7525_setup.md) for setting up the CloudLab servers.
 
 ## How to use R<sup>2</sup>CCL
 ### Build
@@ -69,7 +69,9 @@ To simplify testing the performance and reduce the complexity of triggering fail
 - `R2CC_FAILED_HCA=<name|index>[,…]`: NIC(s) considered failed (default: the last `R2CC_FAILED_NIC_COUNT` NICs).
 - `R2CC_FAILED_NODE=<n>`: server whose NICs failed (default 0).
 
-**R2CC-AllReduce knobs** (mode 3): `R2CC_AR_STAGE2_CHUNKS` (pipeline depth, default 4), `R2CC_AR_SCHEDULE` (0 all stages concurrent, 1 Stage 2 after Stage 1, 2 also serialize the partial AllReduce — default, 3 also serialize Reduce/Broadcast chunks), `R2CC_AR_MIN_BYTES` (below this AllReduce falls back to Balance, default 16 MiB).
+**R2CC-AllReduce knobs** (mode 3): `R2CC_AR_STAGE2_CHUNKS` (pipeline depth, default 4), `R2CC_AR_SCHEDULE` (0 all stages concurrent, 1 Stage 2 after Stage 1 — default with three or more servers, 2 also serialize the partial AllReduce — default with two servers, 3 also serialize Reduce/Broadcast chunks), `R2CC_AR_MIN_BYTES` (below this AllReduce falls back to Balance, default 16 MiB). R2CC-AllReduce needs three or more servers to be faster than Balance: with two, the partial AllReduce is intra-node and both schedules move the same data over the network.
+
+**CUDA graphs**: a graph captured before a failure keeps replaying correctly after a hot repair, over the backup connection. Balance and R2CC-AllReduce are applied when a collective is enqueued, so they take effect in graphs captured after the repair. R2CC-AllReduce creates its sub-communicators in the first eligible AllReduce, which must run outside a capture; a captured AllReduce before that falls back to Balance.
 
 **After a real hot repair**: `R2CC_AR_AFTER_REPAIR=2|3` selects Balance (default) or R2CC-AllReduce for the collectives that follow the repair.
 
@@ -89,11 +91,11 @@ mpirun -x R2CC_MODE=1 -np 4 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -
 ```
 
 ### Example2: Failure Aware Scheduling Performance
-When only one NIC remains on each node, the performance of different strategies is identical. Therefore, we recommend using machines with 8 NICs and 8 GPUs for testing. Below are the performance tests for R<sup>2</sup>CCL-Balance and R<sup>2</sup>CCL-AllReduce, respectively (NIC `mlx5_7` of server 0 assumed failed).
+When only one NIC remains on each node, the performance of different strategies is identical. Therefore, we recommend using machines with 8 NICs and 8 GPUs for testing, and at least three of them for R<sup>2</sup>CCL-AllReduce. Below are the performance tests for R<sup>2</sup>CCL-Balance and R<sup>2</sup>CCL-AllReduce, respectively (NIC `mlx5_7` of server 0 assumed failed).
 ```shell
-mpirun -x R2CC_MODE=2 -x R2CC_FAILED_NODE=0 -x R2CC_FAILED_HCA=mlx5_7 -np 16 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1 -c 1
+mpirun -x R2CC_MODE=2 -x R2CC_FAILED_NODE=0 -x R2CC_FAILED_HCA=mlx5_7 -np 24 -host A:8,B:8,C:8 ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1 -c 1
 
-mpirun -x R2CC_MODE=3 -x R2CC_FAILED_NODE=0 -x R2CC_FAILED_HCA=mlx5_7 -np 16 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1 -c 1
+mpirun -x R2CC_MODE=3 -x R2CC_FAILED_NODE=0 -x R2CC_FAILED_HCA=mlx5_7 -np 24 -host A:8,B:8,C:8 ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1 -c 1
 ```
 
 ## Citation
