@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Real NIC failure -> hot repair -> R2CC-Balance (the demo scenario).
 #
-#   hot_repair/test_hot_repair runs 10 x 4 GiB float AllReduce on the 4 GPUs. 4 s after start the SmartNIC
+#   hot_repair/test_hot_repair runs 10 x 4 GiB float AllReduce on all GPUs. 4 s after start the SmartNIC
 #   drops all traffic of node-1's mlx5_2 (nic/disconnect_nic1.sh). R2CC detects the failure mid-collective,
 #   live-migrates the in-flight transfers to the backup connection, and from the next AllReduce on
 #   (R2CC_AR_AFTER_REPAIR=2) re-balances all traffic over the remaining NICs. Every iteration is verified;

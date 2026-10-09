@@ -13,6 +13,7 @@ set -euo pipefail
 # which calls ./nic/disconnect_nic1.sh and ./nic/connect_nic1.sh relative to the working directory).
 EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${EXAMPLE_DIR}"
+source "${EXAMPLE_DIR}/nodes.sh"
 export OMPI_MCA_btl_tcp_if_include="${OMPI_MCA_btl_tcp_if_include:-eno33np0}"
 LOG_FLAG=0
 while [[ $# -gt 0 ]]; do
@@ -115,7 +116,12 @@ run_preflight_ping() {
   local ping_tries="${PREFLIGHT_PING_TRIES:-8}"
   local ping_count="${PREFLIGHT_PING_COUNT:-1}"
   local ping_wait="${PREFLIGHT_PING_WAIT_S:-1}"
-  local target_ips=("10.10.2.5" "10.10.3.6")
+  # BlueField ports (mlx5_2, mlx5_3) of every other node
+  local target_ips=() h ip1 ip2 ip3
+  for h in "${REMOTE_HOST_LIST[@]}"; do
+    read -r ip1 ip2 ip3 <<< "$(node_ips "${h}")"
+    target_ips+=("${ip2}" "${ip3}")
+  done
 
   echo "[preflight] start ping warmup targets=${target_ips[*]} tries=${ping_tries} count=${ping_count} wait_s=${ping_wait}"
   local ip
@@ -179,10 +185,11 @@ echo "[trace] log=${LOG_FLAG} channel=${R2CC_TRACE_CHANNEL} stall_iters=${R2CC_T
 
 run_preflight_connect
 run_preflight_ping
+echo "[testbed] $(hostname -s) mlx5_0 egress $(sudo -n mlnx_qos -i eno33np0 2>/dev/null | grep -m1 -oE 'ratelimit: [^,]+' || echo 'ratelimit: unknown') (nic/shape_nics.sh status shows all ports)"
 
 mpirun_cmd=(
-  mpirun -np 4
-  -host localhost:2,node-2:2
+  mpirun -np "${NRANKS}"
+  -host "${MPI_HOSTS}"
   -mca pml ob1 -mca btl tcp,self -mca btl_tcp_if_include eno33np0
   -x R2CC_TRACE_CHANNEL
   -x R2CC_TRACE_STALL_ITERS
@@ -202,7 +209,8 @@ mpirun_cmd=(
   -x "R2CC_AR_START_DISCONNECT_DELAY_MS=${R2CC_AR_START_DISCONNECT_DELAY_MS:-4000}"
 )
 for var in R2CC_MODE R2CC_FAILED_NODE R2CC_FAILED_HCA R2CC_FAILED_NIC_COUNT \
-           R2CC_AR_STAGE2_CHUNKS R2CC_AR_SCHEDULE R2CC_AR_MIN_BYTES R2CC_AR_AFTER_REPAIR; do
+           R2CC_AR_STAGE2_CHUNKS R2CC_AR_SCHEDULE R2CC_AR_MIN_BYTES R2CC_AR_AFTER_REPAIR \
+           R2CC_TEST_GRAPH R2CC_TEST_RECAPTURE_AT R2CC_TEST_EAGER_BEFORE_RECAPTURE R2CC_TEST_NEWBUF_AT R2CC_TEST_REGISTER; do
   if [[ -v "$var" ]]; then
     mpirun_cmd+=(-x "$var")
   fi
