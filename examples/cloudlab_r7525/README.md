@@ -1,11 +1,12 @@
 # R2CC experiments on CloudLab r7525
 
-This document describes the eight ready-to-run R2CC tests in this directory and the terminal output of one run of
+This document describes the nine ready-to-run R2CC tests in this directory and the terminal output of one run of
 each on three CloudLab `r7525` servers (`node-1`, `node-2`, `node-3`), kept in [`logs/`](logs/) for readers who
 cannot run them. With every NIC rate-limited to the same speed, the tests check both sides of the paper: that
 R2CC is correct (a real NIC failure is repaired in the middle of a collective, the results are checked element by
 element, each NIC carries the traffic the schedule assigns to it) and that R2CC-Balance and R2CC-AllReduce reach
-the bandwidth the model predicts. The document contains:
+the bandwidth the model predicts. Test 09 trains GPT-2 through a real NIC failure and compares the run with
+upstream NCCL. The document contains:
 
 1. [Testbed](#1-testbed) — the servers as CloudLab provides them, the rate-limited configuration used for the
    results, and what the model predicts.
@@ -13,7 +14,9 @@ the bandwidth the model predicts. The document contains:
 3. [Results and analysis](#3-results-and-analysis) — for every test, the key lines of the saved log, what
    happened, how the NIC traffic changed and how the result compares with the model.
 4. [CUDA graphs](#4-cuda-graphs) — the hot-repair test with its AllReduce captured in a CUDA graph (test 08).
-5. [Directory layout](#5-directory-layout).
+5. [Training through a NIC failure](#5-training-through-a-nic-failure) — GPT-2 trained with and without the
+   failure, against upstream NCCL (test 09).
+6. [Directory layout](#6-directory-layout).
 
 Bringing the machines up is described separately in [r7525_setup.md](r7525_setup.md).
 
@@ -27,13 +30,15 @@ Bringing the machines up is described separately in [r7525_setup.md](r7525_setup
 | `06.nccl_tests_r2cc_allreduce_unhealthy.sh` | declared failed | full sweep, R2CC-AllReduce | ~2 min | [logs/06.nccl_tests_r2cc_allreduce_unhealthy.log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
 | `07.nccl_tests_r2cc_allreduce_k_sweep.sh` | healthy, then declared failed | 4 GiB, R2CC-AllReduce with K = 1–16 pipeline chunks against the model | ~7 min | [logs/07.nccl_tests_r2cc_allreduce_k_sweep.log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log) |
 | `08.hot_repair_cuda_graph.sh` | cut during the run | time per iteration of the hot repair with the AllReduce replayed from a CUDA graph: across the failure, and after capturing it again as Balance or R2CC-AllReduce | ~1.5 min | [logs/08.hot_repair_cuda_graph.log](logs/08.hot_repair_cuda_graph.log) |
+| `09.training_with_nic_failure.sh` | healthy, or cut at update 400 | GPT-2 (124M) training, 1000 updates: upstream NCCL, R2CC, and R2CC with the failure (then Balance or R2CC-AllReduce), compared bit for bit and by test perplexity | ~50 min | [logs/09.training_with_nic_failure.log](logs/09.training_with_nic_failure.log) |
 
-Run times were measured on this testbed and include start-up and restoring the NIC; all eight tests together take
-about 17 minutes.
+Run times were measured on this testbed and include start-up and restoring the NIC; 01–08 together take about
+17 minutes.
 
 *Cut during the run*: the BlueField starts dropping all traffic of the port while an AllReduce is running, and
 R2CC has to detect and repair the failure. *Declared failed*: the port is never cut; `R2CC_FAILED_NODE` and
 `R2CC_FAILED_HCA` make every rank treat it as failed from the start, which is the steady state after a repair.
+*Cut at update 400*: the same cut, made by the training at update 400 and left in place until the run ends.
 
 ## 1. Testbed
 
@@ -124,7 +129,8 @@ AllReduce of all ranks (`R2CC_AR_SCHEDULE=2`).
 ## 2. Run the tests
 
 - Setup: [r7525_setup.md](r7525_setup.md) (CloudLab profile, SmartNIC firmware, network, `~/topo.xml`, NIC rate
-  limits). For 03–07 build nccl-tests once with `tools/build_nccl_tests.sh`.
+  limits). For 03–07 build nccl-tests once with `tools/build_nccl_tests.sh`. 09 uses the Python environment, the
+  data and the upstream NCCL build described in section 5.
 - Everything is run from `node-1` (`cd /mydata/R2CC/examples/cloudlab_r7525 && ./01.hot_repair_to_balance.sh`).
   The scripts use every server of the experiment: `nodes.sh` takes `node-2`, `node-3`, ... from `/etc/hosts`,
   and `REMOTE_HOSTS=node-2` restricts a run to two servers. `/mydata` is a per-node copy, so after any rebuild
@@ -135,13 +141,13 @@ AllReduce of all ranks (`R2CC_AR_SCHEDULE=2`).
   in `common.sh`) and **every script first restores `mlx5_2` on the SmartNIC** (removes the OVS drop rule),
   so a killed run cannot leave the cluster degraded. `tools/kill.sh` stops leftover processes on all nodes.
 - The scripts only print to the terminal; nothing is written to disk by default, so a local run can never
-  overwrite the eight reference logs in `logs/`. `SAVE_LOG=1 ./04.nccl_tests_baseline_healthy.sh` additionally
+  overwrite the nine reference logs in `logs/`. `SAVE_LOG=1 ./04.nccl_tests_baseline_healthy.sh` additionally
   saves the complete output to `logs/local/<NN>.<name>.log` (git-ignored; `LOG_DIR` changes the directory).
 - Every script returns a non-zero exit code when its run fails. For 01 and 02 this includes a wrong element and
   a cut that did not hit a running AllReduce (section 3.1); both end with a `[result]` line. 08 marks a failed
-  run in its table.
+  run in its table. 09 also fails when one of its checks does not hold (section 5).
 
-In every scenario the failed NIC is **node-1's `mlx5_2`**. Tests 01, 02 and 08 cut it during the run on the
+In every scenario the failed NIC is **node-1's `mlx5_2`**. Tests 01, 02, 08 and 09 cut it during the run on the
 BlueField (`nic/disconnect_nic1.sh` installs an OVS drop rule for the port, `nic/connect_nic1.sh` removes it);
 tests 03 and 05–07 only declare it failed (`R2CC_FAILED_NODE=0`, `R2CC_FAILED_HCA=mlx5_2`), which gives the
 degraded topology after a repair from the start of the run, without a disconnect.
@@ -374,7 +380,94 @@ Re-captured as R2CC-AllReduce            2.79 s   0.33 s
   before it falls back to Balance with a warning. Balance needs no such call: the AllReduce issued during the
   capture takes the repaired state.
 
-## 5. Directory layout
+## 5. Training through a NIC failure
+
+`09.training_with_nic_failure.sh` trains GPT-2 (124M parameters) on WikiText-103 with PyTorch DDP on the six GPUs
+through a real failure of node-1's `mlx5_2` and compares the training with failure-free training on upstream NCCL,
+as in the paper's appendix on training quality. Every run (`training/train.py`) is 1000 optimizer updates with a
+global batch of 48 sequences of 1024 tokens (AdamW, FP16 autocast with loss scaling). DDP puts the gradients of
+all parameters into one bucket, so every update performs one AllReduce of 124,475,904 floats (475 MiB). The data
+order, the initialization and the kernels are deterministic (fixed seed, `torch.use_deterministic_algorithms`, no
+TF32), so two runs whose AllReduces return the same results are identical bit for bit. The script makes four runs
+with the same seed (default 42):
+
+| Run | Library | node-1's `mlx5_2` | Schedule after the hot repair |
+|---|---|---|---|
+| VNF | upstream NCCL 2.23.4 | healthy | – |
+| NF | R2CC | healthy | – |
+| BALF | R2CC | cut at update 400, down until the run ends | R2CC-Balance |
+| ARF | R2CC | cut at update 400, down until the run ends | R2CC-AllReduce (`R2CC_AR_AFTER_REPAIR=3`) |
+
+In BALF and ARF, rank 0 runs `nic/disconnect_nic1.sh` when update 400 starts. The library is not told which NIC
+fails (no `R2CC_FAILED_*`); Balance and R2CC-AllReduce use the node and the NIC found by the hot repair. Every
+run records:
+
+- the training loss of every update (mean over the ranks), its duration and the MB that node-1's `mlx5_2`
+  received during it (`train_log.csv`);
+- for updates 400–408, the input and the output of the gradient AllReduce on every rank: the SHA-256 of the
+  output and, computed after training, its error against the sum of the inputs of all ranks in FP64,
+  E_rel = |output − FP64 sum| / |FP64 sum|;
+- the SHA-256 of the parameters on every rank after updates 399, 402–406 and 1000;
+- the test perplexity at the end (whole test split, windows of 1024 tokens with stride 512).
+
+`training/compare.py` then prints, for every seed, each run against VNF: the first update in which `mlx5_2`
+received less than a fifth of its usual traffic, up to which update the AllReduce outputs and the training loss
+are identical to VNF's, the largest loss difference, the largest E_rel and the test perplexity. It ends with the test perplexity table of the paper
+(mean over the seeds; Δ is the largest increase over VNF of the same seed) and these checks, all of which must
+hold:
+
+- NF is bit-identical to VNF: the loss of every update, the test loss, the AllReduce outputs and the parameters;
+- in BALF and ARF, `mlx5_2` went down during the run;
+- in BALF and ARF, the AllReduce that the failure hit returns the same output as in VNF, and the loss is
+  identical to VNF's up to the failure;
+- in every run, every captured AllReduce returns the same output on all ranks, with E_rel < 1e-6;
+- in every run, the parameters are identical on all ranks at every check point.
+
+The paper reports seeds 42, 43 and 44 (`SEEDS="42 43 44"`, about 2.5 hours). For those runs the script prints
+
+```
+Condition                  Test PPL   Max. paired Δ*
+NCCL 2.23.4, no failure      76.085   --
+R2CC, no failure             76.085   0.000%
+R2CC-Balance, failure        76.085   +0.008%
+R2CC-AllReduce, failure      76.086   +0.023%
+```
+
+and all checks hold. In detail:
+
+- **Without a failure, R2CC is identical to upstream NCCL bit for bit**: the same loss in all 1000 updates, the
+  same AllReduce outputs and parameters, the same test perplexity.
+- **The hot repair returns the same bits as upstream NCCL.** The cut takes effect between the AllReduces of
+  updates 400 and 401: `mlx5_2` received nothing during update 401, so its AllReduce starts on the dead port.
+  R2CC detects the stalled transfers, moves them to the backup connection and completes the AllReduce, whose
+  output equals VNF's; the loss is identical up to update 402 (the loss of an update is computed before its
+  AllReduce). Update 401 takes about 1.4 s instead of 0.5 s, and the training continues without a restart, at
+  0.62 s per update with Balance and 0.59 s with R2CC-AllReduce (0.89 s for update 402, whose AllReduce creates
+  the sub-communicators of R2CC-AllReduce).
+- **From update 402 on**, Balance and R2CC-AllReduce split every AllReduce differently over the remaining NICs,
+  so the gradients are summed in a different order. Floating-point addition is not associative, so the outputs
+  differ from VNF's in the last bits; all of them, VNF's included, are within E_rel 5.8e-8 of the FP64 sum, the
+  size of FP32 rounding. The trainings then drift apart by rounding: the loss differs from VNF's by at most
+  2.43e-3 nats per token (seed 44, R2CC-AllReduce), and the test perplexity of a seed by at most +0.023%, with
+  no consistent sign (for seed 44 both failure runs end below VNF, by 0.014% and 0.033%).
+
+The runs use an environment prepared once on the shared storage of the CloudLab project,
+`/proj/softmeasure-PG0/r2cc_ae` (`AE_ROOT`), which every server of the experiment mounts:
+
+- `venv/`: Python 3.8 with PyTorch 2.4.1 built from source (tag v2.4.1, CUDA 12.2, sm_70) with
+  `USE_SYSTEM_NCCL=1`. This PyTorch has no NCCL of its own and loads the `libnccl.so.2` found on
+  `LD_LIBRARY_PATH`: R2CC from `/mydata/R2CC/build/lib`, or upstream NCCL. `train.py` checks on every rank that
+  the library it loaded is the one the run asks for and that it reports version 2.23.4.
+- `data/`: WikiText-103 (`wikitext-103-raw-v1` from the Hugging Face hub, revision `b08601e`) tokenized with the
+  GPT-2 BPE; `manifest.json` lists the number of tokens and the SHA-256 of each split.
+- `nccl_vanilla/`: upstream NCCL 2.23.4-1, the commit R2CC is based on, built with plain `make`
+  (`PROVENANCE.txt`).
+
+The files of every run (`train_log.csv`, `summary.json`, `stdout.log`) are kept in `OUT` (default
+`/mydata/r2cc_training/<date and time>`, printed at the start); `training/compare.py <OUT> <seeds>` prints the
+tables again.
+
+## 6. Directory layout
 
 ```
 01.hot_repair_to_balance.sh                real disconnect -> hot repair -> R2CC-Balance
@@ -385,14 +478,16 @@ Re-captured as R2CC-AllReduce            2.79 s   0.33 s
 06.nccl_tests_r2cc_allreduce_unhealthy.sh  R2CC-AllReduce with mlx5_2 failed
 07.nccl_tests_r2cc_allreduce_k_sweep.sh    R2CC-AllReduce with K = 1-16 Stage-2 chunks vs. the model
 08.hot_repair_cuda_graph.sh                times of a real disconnect with the AllReduce in a CUDA graph (replay, re-capture)
+09.training_with_nic_failure.sh            GPT-2 training: upstream NCCL / R2CC, without and with a real disconnect
 common.sh                                  shared settings: mpirun line, failure model, check_idle, NIC restore, nccl-tests runner, table
 nodes.sh                                   the servers of the experiment (node-1 + REMOTE_HOSTS) and their addresses
 hot_repair/                                test_hot_repair.cc + run_hot_repair.sh (01/02), graph_timing.cc (08), Makefile, binaries
+training/                                  train.py (one training run of 09), compare.py (its table and checks)
 nic/                                       SmartNIC helpers: disconnect_nic1.sh / connect_nic1.sh (OVS drop rule),
                                            shape_nics.sh (NIC rate limits), check_ip.sh, setup and OVS checks
 xml/                                       NCCL topology dumper and the equal-speed topo.xml used via NCCL_TOPO_FILE
 setup/                                     02.setup_network_and_nic.sh, the Phase 2 script of r7525_setup.md
 tools/                                     kill.sh, sync.sh (rsync repo to the other nodes), stress_test.sh, build_nccl_tests.sh
-logs/                                      terminal output of one run of each test (01-08) on three servers
+logs/                                      terminal output of one run of each test (01-09) on three servers
 r7525_setup.md                             how to set up the r7525 servers
 ```
