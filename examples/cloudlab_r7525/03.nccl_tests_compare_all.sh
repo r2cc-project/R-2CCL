@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the three nccl-tests scenarios back to back with identical arguments and prints one comparison table:
-#   baseline_healthy           plain NCCL, all 3 NICs healthy      (04.nccl_tests_baseline_healthy.sh)
+#   baseline_healthy           R2CC off, all 3 NICs healthy        (04.nccl_tests_baseline_healthy.sh)
 #   balance_unhealthy          R2CC-Balance, mlx5_2 failed         (05.nccl_tests_balance_unhealthy.sh)
 #   r2cc_allreduce_unhealthy   R2CC-AllReduce, mlx5_2 failed       (06.nccl_tests_r2cc_allreduce_unhealthy.sh)
 #

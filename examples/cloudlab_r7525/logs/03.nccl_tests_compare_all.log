@@ -6,22 +6,22 @@
 # nThread 1 nGpus 1 minBytes 268435456 maxBytes 4294967296 step: 4(factor) warmup iters: 2 iters: 5 agg iters: 1 validation: 1 graph: 0 unalign: 0
 #
 # Using devices
-#  Rank  0 Group  0 Pid  45262 on     node-1 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
-#  Rank  1 Group  0 Pid  45263 on     node-1 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
-#  Rank  2 Group  0 Pid  32602 on     node-2 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
-#  Rank  3 Group  0 Pid  32603 on     node-2 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
-#  Rank  4 Group  0 Pid  30610 on     node-3 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
-#  Rank  5 Group  0 Pid  30611 on     node-3 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  0 Group  0 Pid  91994 on     node-1 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  1 Group  0 Pid  91995 on     node-1 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  2 Group  0 Pid  62421 on     node-2 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  3 Group  0 Pid  62422 on     node-2 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  4 Group  0 Pid  59246 on     node-3 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  5 Group  0 Pid  59247 on     node-3 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
 NCCL version 2.23.4+cuda12.2
 #
 #                                                              out-of-place                       in-place
 #       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong
 #        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)        
-   268435456      67108864     float     sum      -1   126877    2.12    3.53       0   127066    2.11    3.52       0
-  1073741824     268435456     float     sum      -1   507381    2.12    3.53       0   512545    2.09    3.49       0
-  4294967296    1073741824     float     sum      -1  2028525    2.12    3.53       0  2028113    2.12    3.53       0
+   268435456      67108864     float     sum      -1   128000    2.10    3.50       0   132593    2.02    3.37       0
+  1073741824     268435456     float     sum      -1   511654    2.10    3.50       0   507270    2.12    3.53       0
+  4294967296    1073741824     float     sum      -1  2043043    2.10    3.50       0  2028267    2.12    3.53       0
 # Out of bounds values : 0 OK
-# Avg bus bandwidth    : 3.52068 
+# Avg bus bandwidth    : 3.48798 
 #
 # Collective test concluded: all_reduce_perf
 #
@@ -35,22 +35,22 @@ NCCL version 2.23.4+cuda12.2
 # nThread 1 nGpus 1 minBytes 268435456 maxBytes 4294967296 step: 4(factor) warmup iters: 2 iters: 5 agg iters: 1 validation: 1 graph: 0 unalign: 0
 #
 # Using devices
-#  Rank  0 Group  0 Pid  45528 on     node-1 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
-#  Rank  1 Group  0 Pid  45529 on     node-1 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
-#  Rank  2 Group  0 Pid  32706 on     node-2 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
-#  Rank  3 Group  0 Pid  32707 on     node-2 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
-#  Rank  4 Group  0 Pid  30703 on     node-3 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
-#  Rank  5 Group  0 Pid  30704 on     node-3 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  0 Group  0 Pid  92142 on     node-1 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  1 Group  0 Pid  92143 on     node-1 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  2 Group  0 Pid  62518 on     node-2 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  3 Group  0 Pid  62519 on     node-2 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  4 Group  0 Pid  59338 on     node-3 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  5 Group  0 Pid  59339 on     node-3 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
 NCCL version 2.23.4+cuda12.2
 #
 #                                                              out-of-place                       in-place
 #       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong
 #        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)        
-   268435456      67108864     float     sum      -1   190458    1.41    2.35       0   190509    1.41    2.35       0
-  1073741824     268435456     float     sum      -1   759842    1.41    2.36       0   760092    1.41    2.35       0
-  4294967296    1073741824     float     sum      -1  3040729    1.41    2.35       0  3040792    1.41    2.35       0
+   268435456      67108864     float     sum      -1   200096    1.34    2.24       0   193381    1.39    2.31       0
+  1073741824     268435456     float     sum      -1   759930    1.41    2.35       0   762557    1.41    2.35       0
+  4294967296    1073741824     float     sum      -1  3040253    1.41    2.35       0  3040002    1.41    2.35       0
 # Out of bounds values : 0 OK
-# Avg bus bandwidth    : 2.35254 
+# Avg bus bandwidth    : 2.32672 
 #
 # Collective test concluded: all_reduce_perf
 #
@@ -64,22 +64,22 @@ NCCL version 2.23.4+cuda12.2
 # nThread 1 nGpus 1 minBytes 268435456 maxBytes 4294967296 step: 4(factor) warmup iters: 2 iters: 5 agg iters: 1 validation: 1 graph: 0 unalign: 0
 #
 # Using devices
-#  Rank  0 Group  0 Pid  45846 on     node-1 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
-#  Rank  1 Group  0 Pid  45847 on     node-1 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
-#  Rank  2 Group  0 Pid  32791 on     node-2 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
-#  Rank  3 Group  0 Pid  32792 on     node-2 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
-#  Rank  4 Group  0 Pid  30786 on     node-3 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
-#  Rank  5 Group  0 Pid  30787 on     node-3 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  0 Group  0 Pid  92231 on     node-1 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  1 Group  0 Pid  92232 on     node-1 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  2 Group  0 Pid  62624 on     node-2 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  3 Group  0 Pid  62625 on     node-2 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  4 Group  0 Pid  59437 on     node-3 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  5 Group  0 Pid  59438 on     node-3 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
 NCCL version 2.23.4+cuda12.2
 #
 #                                                              out-of-place                       in-place
 #       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong
 #        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)        
-   268435456      67108864     float     sum      -1   174847    1.54    2.56       0   174766    1.54    2.56       0
-  1073741824     268435456     float     sum      -1   727979    1.47    2.46       0   701112    1.53    2.55       0
-  4294967296    1073741824     float     sum      -1  2790858    1.54    2.56       0  2792505    1.54    2.56       0
+   268435456      67108864     float     sum      -1   178857    1.50    2.50       0   175463    1.53    2.55       0
+  1073741824     268435456     float     sum      -1   702381    1.53    2.55       0   699376    1.54    2.56       0
+  4294967296    1073741824     float     sum      -1  2791462    1.54    2.56       0  2792278    1.54    2.56       0
 # Out of bounds values : 0 OK
-# Avg bus bandwidth    : 2.54296 
+# Avg bus bandwidth    : 2.54763 
 #
 # Collective test concluded: all_reduce_perf
 #
@@ -88,7 +88,7 @@ NCCL version 2.23.4+cuda12.2
 
 ===== comparison (-b 256M -e 4G -f 4 -g 1 -c 1 -n 5 -w 2 -d float -o sum) =====
 bytes        | baseline_healthy                 | balance_unhealthy                | r2cc_allreduce_unhealthy        
-268435456    | 3.53/3.52 (wrong 0/0)            | 2.35/2.35 (wrong 0/0)            | 2.56/2.56 (wrong 0/0)           
-1073741824   | 3.53/3.49 (wrong 0/0)            | 2.36/2.35 (wrong 0/0)            | 2.46/2.55 (wrong 0/0)           
-4294967296   | 3.53/3.53 (wrong 0/0)            | 2.35/2.35 (wrong 0/0)            | 2.56/2.56 (wrong 0/0)           
+268435456    | 3.50/3.37 (wrong 0/0)            | 2.24/2.31 (wrong 0/0)            | 2.50/2.55 (wrong 0/0)           
+1073741824   | 3.50/3.53 (wrong 0/0)            | 2.35/2.35 (wrong 0/0)            | 2.55/2.56 (wrong 0/0)           
+4294967296   | 3.50/3.53 (wrong 0/0)            | 2.35/2.35 (wrong 0/0)            | 2.56/2.56 (wrong 0/0)           
 (cells: busbw out-of-place/in-place GB/s, then #wrong out-of-place/in-place)

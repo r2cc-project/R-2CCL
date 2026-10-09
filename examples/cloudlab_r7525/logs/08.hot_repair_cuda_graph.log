@@ -1,0 +1,12 @@
+[testbed] node-1 mlx5_0 egress ratelimit: 10.0 Gbps (nic/shape_nics.sh status shows all ports)
+[08] run 1/2: re-captured as R2CC-Balance after iteration 6
+[08] run 2/2: re-captured as R2CC-AllReduce after iteration 6
+
+===== CUDA Graphs: 4 GiB AllReduce on all GPUs, mlx5_2 of node-1 cut during the run =====
+Replayed graph (4 GiB AllReduce)    Time / iter   Re-capture overhead*
+Pre-failure graph, healthy               2.03 s   --
+Pre-failure graph, HotRepair             4.07 s   --
+Re-captured as R2CC-Balance              3.06 s   1.0 ms
+Re-captured as R2CC-AllReduce            2.79 s   0.33 s
+* the time of the iteration that performs the re-capture, including the eager collective that R2CC-AllReduce
+  needs to create its sub-communicators, minus the time of an iteration replayed from the new graph
