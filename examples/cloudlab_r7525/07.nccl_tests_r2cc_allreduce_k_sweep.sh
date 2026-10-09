@@ -8,7 +8,7 @@
 #   runs), next to the model:
 #     R2CC-Balance     T/T0 = 1/(1-X)
 #     R2CC-AllReduce   T/T0 = 1 + X/((1-X) * 2(P-1)/P) * (1 + 1/K)        P = number of ranks
-#   -c 1 checks every element of one extra AllReduce of each run, as in 03-06. About 9 minutes.
+#   -c 1 checks every element of one extra AllReduce of each run, as in 03-06. About 7 minutes.
 #
 # Usage: ./07.nccl_tests_r2cc_allreduce_k_sweep.sh [nccl-tests args...]
 #   default args: -b 4G -e 4G -f 2 -g 1 -c 1 -n 5 -w 2 -d float -o sum   (the table uses the largest size)

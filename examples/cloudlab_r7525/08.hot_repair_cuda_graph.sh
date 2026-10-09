@@ -11,7 +11,7 @@
 #   that performs the re-capture, including the eager collective that R2CC-AllReduce needs to create its
 #   sub-communicators, minus the time of an iteration replayed from the new graph. A run that fails, or does not
 #   finish within RUN_TIMEOUT seconds (default 120), is stopped, mlx5_2 is restored, and its complete output is
-#   kept (the path is printed). About 2 minutes.
+#   kept (the path is printed). About 1.5 minutes.
 #
 # Usage: ./08.hot_repair_cuda_graph.sh
 #   Nothing is written to disk by default; SAVE_LOG=1 also saves the terminal output to logs/local/.
