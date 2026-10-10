@@ -25,10 +25,10 @@ Bringing the machines up is described separately in [r7525_setup.md](r7525_setup
 | [01](01.hot_repair_to_balance.sh) | cut during the run | real NIC failure during a 4 GiB AllReduce → hot repair → **R2CC-Balance** | ~40 s | [log](logs/01.hot_repair_to_balance.log) |
 | [02](02.hot_repair_to_r2cc_allreduce.sh) | cut during the run | same failure → hot repair → **R2CC-AllReduce** | ~40 s | [log](logs/02.hot_repair_to_r2cc_allreduce.log) |
 | [03](03.nccl_tests_compare_all.sh) | healthy, then declared failed | nccl-tests, 256 MiB–4 GiB, healthy vs. Balance vs. R2CC-AllReduce, one table | ~3 min | [log](logs/03.nccl_tests_compare_all.log) |
-| [04](04.nccl_tests_baseline_healthy.sh) | healthy | nccl-tests, every message size from 8 B to 4 GiB, R2CC switched off | ~1.5 min | [log](logs/04.nccl_tests_baseline_healthy.log) |
-| [05](05.nccl_tests_balance_unhealthy.sh) | declared failed | nccl-tests, every message size from 8 B to 4 GiB, R2CC-Balance | ~2 min | [log](logs/05.nccl_tests_balance_unhealthy.log) |
-| [06](06.nccl_tests_r2cc_allreduce_unhealthy.sh) | declared failed | nccl-tests, every message size from 8 B to 4 GiB, R2CC-AllReduce | ~2 min | [log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
-| [07](07.nccl_tests_r2cc_allreduce_k_sweep.sh) | healthy, then declared failed | 4 GiB, R2CC-AllReduce with K = 1–16 pipeline chunks against the model | ~7 min | [log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log) |
+| [04](04.nccl_tests_baseline_healthy.sh) | healthy | nccl-tests (message sizes 8 B–4 GiB), R2CC switched off | ~1.5 min | [log](logs/04.nccl_tests_baseline_healthy.log) |
+| [05](05.nccl_tests_balance_unhealthy.sh) | declared failed | nccl-tests (message sizes 8 B–4 GiB), R2CC-Balance | ~2 min | [log](logs/05.nccl_tests_balance_unhealthy.log) |
+| [06](06.nccl_tests_r2cc_allreduce_unhealthy.sh) | declared failed | nccl-tests (message sizes 8 B–4 GiB), R2CC-AllReduce | ~2 min | [log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
+| [07](07.nccl_tests_r2cc_allreduce_k_sweep.sh) | healthy, then declared failed | 4 GiB, R2CC-AllReduce with K = 1–16 pipeline chunks against the paper's formula | ~7 min | [log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log) |
 | [08](08.hot_repair_cuda_graph.sh) | cut during the run | the hot repair with the AllReduce replayed from a CUDA graph: time per iteration across the failure and after capturing it again as Balance or R2CC-AllReduce; every element checked as in 01/02 | ~1.5 min | [log](logs/08.hot_repair_cuda_graph.log) |
 | [09](09.training_with_nic_failure.sh) | healthy, or cut at update 400 | GPT-2 (124M) training, 1000 updates: upstream NCCL, R2CC, and R2CC with the failure (then Balance or R2CC-AllReduce), compared bit for bit and by test perplexity | ~45 min | [log](logs/09.training_with_nic_failure.log) |
 
