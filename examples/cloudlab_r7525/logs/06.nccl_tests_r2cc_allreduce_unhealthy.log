@@ -6,61 +6,61 @@
 # nThread 1 nGpus 1 minBytes 8 maxBytes 4294967296 step: 2(factor) warmup iters: 2 iters: 5 agg iters: 1 validation: 1 graph: 0 unalign: 0
 #
 # Using devices
-#  Rank  0 Group  0 Pid  92527 on     node-1 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
-#  Rank  1 Group  0 Pid  92528 on     node-1 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
-#  Rank  2 Group  0 Pid  62983 on     node-2 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
-#  Rank  3 Group  0 Pid  62984 on     node-2 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
-#  Rank  4 Group  0 Pid  59813 on     node-3 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
-#  Rank  5 Group  0 Pid  59814 on     node-3 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  0 Group  0 Pid 131982 on     node-1 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  1 Group  0 Pid 131983 on     node-1 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  2 Group  0 Pid  77793 on     node-2 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  3 Group  0 Pid  77794 on     node-2 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
+#  Rank  4 Group  0 Pid  74411 on     node-3 device  0 [0000:21:00] Tesla V100S-PCIE-32GB
+#  Rank  5 Group  0 Pid  74412 on     node-3 device  1 [0000:e2:00] Tesla V100S-PCIE-32GB
 NCCL version 2.23.4+cuda12.2
 #
 #                                                              out-of-place                       in-place
 #       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong
 #        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)        
 
-node-1:92528:92528 [1] r2cc/allreduce/r2cc_allreduce.cc:213 NCCL WARN R2CC AllReduce falling back to Balance: message below minimum size
+node-1:131983:131983 [1] r2cc/allreduce/r2cc_allreduce.cc:213 NCCL WARN R2CC AllReduce falling back to Balance: message below minimum size
            8             2     float     sum      -1
-node-1:92527:92527 [0] r2cc/allreduce/r2cc_allreduce.cc:213 NCCL WARN R2CC AllReduce falling back to Balance: message below minimum size
+node-1:131982:131982 [0] r2cc/allreduce/r2cc_allreduce.cc:213 NCCL WARN R2CC AllReduce falling back to Balance: message below minimum size
 
-node-3:59813:59813 [0] r2cc/allreduce/r2cc_allreduce.cc:213 NCCL WARN R2CC AllReduce falling back to Balance: message below minimum size
+node-3:74411:74411 [0] r2cc/allreduce/r2cc_allreduce.cc:213 NCCL WARN R2CC AllReduce falling back to Balance: message below minimum size
 
-node-2:62983:62983 [0] r2cc/allreduce/r2cc_allreduce.cc:213 NCCL WARN R2CC AllReduce falling back to Balance: message below minimum size
+node-2:77793:77793 [0] r2cc/allreduce/r2cc_allreduce.cc:213 NCCL WARN R2CC AllReduce falling back to Balance: message below minimum size
 
-node-3:59814:59814 [1] r2cc/allreduce/r2cc_allreduce.cc:213 NCCL WARN R2CC AllReduce falling back to Balance: message below minimum size
+node-3:74412:74412 [1] r2cc/allreduce/r2cc_allreduce.cc:213 NCCL WARN R2CC AllReduce falling back to Balance: message below minimum size
 
-node-2:62984:62984 [1] r2cc/allreduce/r2cc_allreduce.cc:213 NCCL WARN R2CC AllReduce falling back to Balance: message below minimum size
-    43.06    0.00    0.00       0    38.68    0.00    0.00       0
-          16             4     float     sum      -1    38.52    0.00    0.00       0    37.73    0.00    0.00       0
-          32             8     float     sum      -1    39.38    0.00    0.00       0    37.36    0.00    0.00       0
-          64            16     float     sum      -1    43.62    0.00    0.00       0    42.82    0.00    0.00       0
-         128            32     float     sum      -1    43.69    0.00    0.00       0    43.88    0.00    0.00       0
-         256            64     float     sum      -1    46.20    0.01    0.01       0    45.12    0.01    0.01       0
-         512           128     float     sum      -1    47.21    0.01    0.02       0    45.74    0.01    0.02       0
-        1024           256     float     sum      -1    48.02    0.02    0.04       0    47.62    0.02    0.04       0
-        2048           512     float     sum      -1    48.19    0.04    0.07       0    49.26    0.04    0.07       0
-        4096          1024     float     sum      -1    50.95    0.08    0.13       0    51.05    0.08    0.13       0
-        8192          2048     float     sum      -1    54.87    0.15    0.25       0    53.85    0.15    0.25       0
-       16384          4096     float     sum      -1    60.01    0.27    0.46       0    61.21    0.27    0.45       0
-       32768          8192     float     sum      -1    71.78    0.46    0.76       0    75.31    0.44    0.73       0
-       65536         16384     float     sum      -1    87.01    0.75    1.26       0    86.75    0.76    1.26       0
-      131072         32768     float     sum      -1   112.15    1.17    1.95       0   126.15    1.04    1.73       0
-      262144         65536     float     sum      -1   192.21    1.36    2.27       0   190.70    1.37    2.29       0
-      524288        131072     float     sum      -1   322.83    1.62    2.71       0   320.28    1.64    2.73       0
-     1048576        262144     float     sum      -1   609.65    1.72    2.87       0   611.09    1.72    2.86       0
-     2097152        524288     float     sum      -1  1443.46    1.45    2.42       0  1455.49    1.44    2.40       0
-     4194304       1048576     float     sum      -1  2942.24    1.43    2.38       0  2946.43    1.42    2.37       0
-     8388608       2097152     float     sum      -1  5903.54    1.42    2.37       0  5901.13    1.42    2.37       0
-    16777216       4194304     float     sum      -1  10579.7    1.59    2.64       0  10516.1    1.60    2.66       0
-    33554432       8388608     float     sum      -1  21710.4    1.55    2.58       0  21777.4    1.54    2.57       0
-    67108864      16777216     float     sum      -1  45354.4    1.48    2.47       0  46522.4    1.44    2.40       0
-   134217728      33554432     float     sum      -1  87317.9    1.54    2.56       0  87323.0    1.54    2.56       0
-   268435456      67108864     float     sum      -1   175047    1.53    2.56       0   182413    1.47    2.45       0
-   536870912     134217728     float     sum      -1   349752    1.54    2.56       0   355345    1.51    2.52       0
-  1073741824     268435456     float     sum      -1   698739    1.54    2.56       0   713764    1.50    2.51       0
-  2147483648     536870912     float     sum      -1  1397599    1.54    2.56       0  1398121    1.54    2.56       0
-  4294967296    1073741824     float     sum      -1  2792600    1.54    2.56       0  2793480    1.54    2.56       0
+node-2:77794:77794 [1] r2cc/allreduce/r2cc_allreduce.cc:213 NCCL WARN R2CC AllReduce falling back to Balance: message below minimum size
+    43.41    0.00    0.00       0    38.39    0.00    0.00       0
+          16             4     float     sum      -1    38.31    0.00    0.00       0    38.23    0.00    0.00       0
+          32             8     float     sum      -1    47.53    0.00    0.00       0    39.50    0.00    0.00       0
+          64            16     float     sum      -1    46.54    0.00    0.00       0    46.45    0.00    0.00       0
+         128            32     float     sum      -1    46.90    0.00    0.00       0    44.09    0.00    0.00       0
+         256            64     float     sum      -1    48.47    0.01    0.01       0    49.04    0.01    0.01       0
+         512           128     float     sum      -1    47.19    0.01    0.02       0    49.59    0.01    0.02       0
+        1024           256     float     sum      -1    50.10    0.02    0.03       0    49.10    0.02    0.03       0
+        2048           512     float     sum      -1    50.33    0.04    0.07       0    50.60    0.04    0.07       0
+        4096          1024     float     sum      -1    54.18    0.08    0.13       0    54.33    0.08    0.13       0
+        8192          2048     float     sum      -1    57.28    0.14    0.24       0    65.28    0.13    0.21       0
+       16384          4096     float     sum      -1    63.22    0.26    0.43       0    60.21    0.27    0.45       0
+       32768          8192     float     sum      -1    73.06    0.45    0.75       0    73.30    0.45    0.75       0
+       65536         16384     float     sum      -1    87.54    0.75    1.25       0    83.48    0.79    1.31       0
+      131072         32768     float     sum      -1   115.32    1.14    1.89       0   133.24    0.98    1.64       0
+      262144         65536     float     sum      -1   197.19    1.33    2.22       0   197.22    1.33    2.22       0
+      524288        131072     float     sum      -1   314.19    1.67    2.78       0   321.74    1.63    2.72       0
+     1048576        262144     float     sum      -1   637.77    1.64    2.74       0   642.51    1.63    2.72       0
+     2097152        524288     float     sum      -1  1404.06    1.49    2.49       0  1403.71    1.49    2.49       0
+     4194304       1048576     float     sum      -1  2889.04    1.45    2.42       0  2925.55    1.43    2.39       0
+     8388608       2097152     float     sum      -1  5893.85    1.42    2.37       0  5837.97    1.44    2.39       0
+    16777216       4194304     float     sum      -1  10542.0    1.59    2.65       0  10682.1    1.57    2.62       0
+    33554432       8388608     float     sum      -1  27817.2    1.21    2.01       0  21687.6    1.55    2.58       0
+    67108864      16777216     float     sum      -1  44367.3    1.51    2.52       0  44027.5    1.52    2.54       0
+   134217728      33554432     float     sum      -1   111973    1.20    2.00       0  87773.9    1.53    2.55       0
+   268435456      67108864     float     sum      -1   188680    1.42    2.37       0   175105    1.53    2.55       0
+   536870912     134217728     float     sum      -1   349054    1.54    2.56       0   352601    1.52    2.54       0
+  1073741824     268435456     float     sum      -1   714674    1.50    2.50       0   716555    1.50    2.50       0
+  2147483648     536870912     float     sum      -1  1401227    1.53    2.55       0  1396095    1.54    2.56       0
+  4294967296    1073741824     float     sum      -1  2793387    1.54    2.56       0  2791104    1.54    2.56       0
 # Out of bounds values : 0 OK
-# Avg bus bandwidth    : 1.4252 
+# Avg bus bandwidth    : 1.40213 
 #
 # Collective test concluded: all_reduce_perf
 #

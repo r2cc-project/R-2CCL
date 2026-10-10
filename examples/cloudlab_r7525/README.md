@@ -117,11 +117,12 @@ Test 07 (section 3.5) measures K = 1 to 16.
 
 | 4 GiB AllReduce | time relative to healthy, model | measured (nccl-tests, test 03, in-place) | measured (hot repair, tests 01/02) |
 |---|---|---|---|
-| healthy | 1 | 2.03 s, busbw 3.53 GB/s | 2.03 s |
-| R2CC-Balance, `mlx5_2` failed | 1.5 | 1.50 (3.04 s, 2.35 GB/s) | 1.50 (3.04 s) |
+| healthy | 1 | 2.03 s, busbw 3.53 GB/s | 2.04 s (01), 2.03 s (02) |
+| R2CC-Balance, `mlx5_2` failed | 1.5 | 1.51 (3.05 s, 2.34 GB/s) | 1.49 (3.04 s) |
 | R2CC-AllReduce, `mlx5_2` failed, K = 4 | 1.375 | 1.38 (2.79 s, 2.56 GB/s) | 1.38 (2.80 s) |
 
-With K = 4, R2CC-AllReduce gives 9.1% more bandwidth than R2CC-Balance in the model and 8.9% in test 03. The model and all
+With K = 4, R2CC-AllReduce gives 9.1% more bandwidth than R2CC-Balance in the model and 8.9% (out-of-place) and
+9.4% (in-place) in test 03. The model and all
 results here are for three servers. The scripts also run on two (`REMOTE_HOSTS=node-2`, section 2); there the
 healthy side is a single server, the partial AllReduce runs inside it, and the default schedule runs it after the
 AllReduce of all ranks (`R2CC_AR_SCHEDULE=2`).
@@ -190,31 +191,31 @@ From [logs/01.hot_repair_to_balance.log](logs/01.hot_repair_to_balance.log):
 
 ```
 [testbed] node-1 mlx5_0 egress ratelimit: 10.0 Gbps (nic/shape_nics.sh status shows all ports)
-[Rank 0] Iter 2/10 END: OK (elapsed 2031 ms)
+[Rank 0] Iter 2/10 END: OK (elapsed 2040 ms)
 [Rank 0] Iter 3/10 START: allreduce 4.00 GiB
 [Rank 0] NIC disconnect command completed.        <- mlx5_2 is now black-holed, iteration 3 is in flight
-[Rank 0] Iter 3/10 END: OK (elapsed 3566 ms)      <- repaired mid-collective, every element correct
+[Rank 0] Iter 3/10 END: OK (elapsed 3539 ms)      <- repaired mid-collective, every element correct
 ...
 [Rank 0] IB RX per-iteration (MB, port_rcv_data *4B):
 Iter   Time(ms)   mlx5_0_RX    mlx5_2_RX    mlx5_3_RX
-1      2195       2407         2313         2312       <- iteration 1 includes connection setup
-2      2031       2406         2312         2312       <- healthy: ~7.0 GB received, 2(P-1)/P x 4 GiB for P = 6
+1      2162       2406         2312         2312       <- iteration 1 includes connection setup
+2      2040       2406         2312         2312       <- healthy: ~7.0 GB received, 2(P-1)/P x 4 GiB for P = 6
                                                           ranks plus headers, one third per NIC
-3      3566       4218         574          2313       <- failure: mlx5_2 stops after 574 MB; the rest of its
+3      3539       4188         601          2312       <- failure: mlx5_2 stops after 601 MB; the rest of its
                                                           share is migrated to the backup connection on mlx5_0
-4      3041       3609         0            3468       <- R2CC-Balance: mlx5_2 unused, the same ~7 GB split
-5      3044       3609         0            3468          over the two healthy NICs
+4      3040       3609         0            3468       <- R2CC-Balance: mlx5_2 unused, the same ~7 GB split
+5      3043       3609         0            3468          over the two healthy NICs
 ...
 10     3043       3609         0            3468
 [Rank 0] Verification: all 1073741824 elements of each of the 10 iterations checked on all 6 ranks: 0 wrong
-[Rank 0] Failure evidence: mlx5_2 cut during iteration 3 (574 of 2313 MB received before the cut; command ran
-         4.00-4.75 s, iteration 4.26-7.83 s), no traffic on it in iterations 4-10, all of them completed
+[Rank 0] Failure evidence: mlx5_2 cut during iteration 3 (601 of 2312 MB received before the cut; command ran
+         4.00-4.75 s, iteration 4.24-7.77 s), no traffic on it in iterations 4-10, all of them completed
 [Rank 0] TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one
          the NIC failure hit.
 [result] exit=0 PASS
 ```
 
-An iteration takes 2.03 s with three NICs and 3.04 s with two, 1.50 times as long, which is the model's
+An iteration takes 2.04 s with three NICs and 3.04 s with two, 1.49 times as long, against the model's
 1/(1−X) = 1.5: the degraded server bounds the ring, and it now sends and receives the same data over two NICs
 instead of three. The failover iteration costs about 1.5 s more than a healthy one. (NCCL without R2CC would hang in iteration 3 until `NCCL_IB_TIMEOUT`/retry expire
 and then abort.)
@@ -237,26 +238,26 @@ From [logs/02.hot_repair_to_r2cc_allreduce.log](logs/02.hot_repair_to_r2cc_allre
 
 ```
 Iter   Time(ms)   mlx5_0_RX    mlx5_2_RX    mlx5_3_RX
-2      2036       2406         2312         2312       <- healthy, as in test 01
-3      3448       4087         699          2312       <- failure hits during iteration 3, the remainder of
+2      2033       2406         2312         2312       <- healthy, as in test 01
+3      2974       3184         1566         2312       <- failure hits during iteration 3, the remainder of
                                                           mlx5_2's share is migrated to mlx5_0
-4      3146       3128         0            3005       <- first R2CC-AllReduce: includes ncclCommSplit of the
-                                                          two sub-communicators (one-off, ~0.35 s)
-5      2800       3129         0            3005       <- steady state: node-1, the degraded server, receives
-6      2799       3129         0            3005          ~6.1 GB per iteration instead of the ~7.1 GB of
+4      3162       3128         0            3005       <- first R2CC-AllReduce: includes ncclCommSplit of the
+                                                          two sub-communicators (one-off, ~0.36 s)
+5      2824       3129         0            3005       <- steady state: node-1, the degraded server, receives
+6      2796       3128         0            3005          ~6.1 GB per iteration instead of the ~7.1 GB of
 ...                                                       Balance: it takes part in the (1-X) AllReduce and
-10     2796       3128         0            3005          receives the broadcast tail, but not the tail's AllReduce
+10     2869       3128         0            3005          receives the broadcast tail, but not the tail's AllReduce
 [Rank 0] Verification: all 1073741824 elements of each of the 10 iterations checked on all 6 ranks: 0 wrong
-[Rank 0] Failure evidence: mlx5_2 cut during iteration 3 (699 of 2312 MB received before the cut; command ran
-         4.00-4.72 s, iteration 4.24-7.69 s), no traffic on it in iterations 4-10, all of them completed
+[Rank 0] Failure evidence: mlx5_2 cut during iteration 3 (1566 of 2312 MB received before the cut; command ran
+         4.00-5.65 s, iteration 4.32-7.30 s), no traffic on it in iterations 4-10, all of them completed
 [Rank 0] TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one
          the NIC failure hit.
 ```
 
-An iteration now takes 2.80 s, 1.38 times the healthy 2.04 s against 1.375 in the model for K = 4, and 8% less
-than with Balance (3.04 s). The traffic is the one the paper describes: node-1 receives 13% less than with
-Balance, which is exactly (2(P−1)/P·(1−X) + X) / (2(P−1)/P) = 0.867 for P = 6 ranks; node-2 and node-3 absorb
-the tail AllReduce on their otherwise idle `mlx5_2`.
+An iteration now takes 2.80 s (median of iterations 5–10), 1.38 times the healthy 2.03 s against 1.375 in the
+model for K = 4, and 8% less than with Balance (3.04 s). The traffic is the one the paper describes: node-1
+receives 13% less than with Balance, which is exactly (2(P−1)/P·(1−X) + X) / (2(P−1)/P) = 0.867 for P = 6 ranks;
+node-2 and node-3 absorb the tail AllReduce on their otherwise idle `mlx5_2`.
 
 ### 3.3 Test 03 — nccl-tests: correctness and a side-by-side table
 
@@ -274,17 +275,18 @@ iteration. R2CC-AllReduce is also exercised with every message size in test 06. 
 ```
 ===== comparison (-b 256M -e 4G -f 4 -g 1 -c 1 -n 5 -w 2 -d float -o sum) =====
 bytes        | baseline_healthy                 | balance_unhealthy                | r2cc_allreduce_unhealthy
-268435456    | 3.50/3.37 (wrong 0/0)            | 2.24/2.31 (wrong 0/0)            | 2.50/2.55 (wrong 0/0)
-1073741824   | 3.50/3.53 (wrong 0/0)            | 2.35/2.35 (wrong 0/0)            | 2.55/2.56 (wrong 0/0)
-4294967296   | 3.50/3.53 (wrong 0/0)            | 2.35/2.35 (wrong 0/0)            | 2.56/2.56 (wrong 0/0)
+268435456    | 3.36/2.76 (wrong 0/0)            | 2.24/2.31 (wrong 0/0)            | 2.37/2.50 (wrong 0/0)
+1073741824   | 3.52/3.30 (wrong 0/0)            | 2.35/2.36 (wrong 0/0)            | 2.56/2.56 (wrong 0/0)
+4294967296   | 3.53/3.53 (wrong 0/0)            | 2.35/2.34 (wrong 0/0)            | 2.56/2.56 (wrong 0/0)
 (cells: busbw out-of-place/in-place GB/s, then #wrong out-of-place/in-place)
 ```
 
 - All `#wrong` columns are 0: the checked AllReduce of every size and schedule matches the expected result.
-- Bandwidth at 1 GiB and 4 GiB: healthy 3.50–3.53 GB/s = three NICs at about 1.18 GB/s; R2CC-Balance 2.35 GB/s =
-  two NICs; R2CC-AllReduce 2.55–2.56 GB/s. Relative to healthy (in-place, 4 GiB), 1.50 and 1.38 times the time,
-  against 1.5 and 1.375 in the model (section 1.3). R2CC-AllReduce gives 8.5–8.9% more bandwidth than Balance at
-  these sizes; the model predicts 9.1%. At 256 MiB both passes vary more from run to run.
+- Bandwidth at 4 GiB: healthy 3.53 GB/s = three NICs at about 1.18 GB/s; R2CC-Balance 2.34–2.35 GB/s = two NICs;
+  R2CC-AllReduce 2.56 GB/s. Relative to healthy (in-place, 4 GiB), 1.51 and 1.38 times the time, against 1.5 and
+  1.375 in the model (section 1.3). R2CC-AllReduce gives 8.9% (out-of-place) and 9.4% (in-place) more bandwidth
+  than Balance at 4 GiB and 8.9% and 8.5% at 1 GiB; the model predicts 9.1%. Below 4 GiB single passes vary more
+  from run to run (in this run the healthy in-place pass at 1 GiB, 3.30 GB/s, and both healthy passes at 256 MiB).
 
 ### 3.4 Tests 04–06 — full nccl-tests sweeps
 
@@ -293,16 +295,17 @@ Each runs the standard `all_reduce_perf` sweep from 8 B to 4 GiB (`-b 8 -e 4G -f
 
 | Test | Scenario | busbw from 512 MiB to 4 GiB (out-of-place / in-place) | at 4 GiB |
 |---|---|---|---|
-| `04.nccl_tests_baseline_healthy.sh` | healthy, R2CC switched off (`R2CC_MODE=0`) | 3.53 / 3.52–3.53 GB/s | 3.53 / 3.53 GB/s |
-| `05.nccl_tests_balance_unhealthy.sh` | R2CC-Balance, `mlx5_2` failed (`R2CC_MODE=2`) | 2.36 / 2.35–2.36 GB/s | 2.36 / 2.35 GB/s |
-| `06.nccl_tests_r2cc_allreduce_unhealthy.sh` | R2CC-AllReduce, `mlx5_2` failed (`R2CC_MODE=3`) | 2.56 / 2.51–2.56 GB/s | 2.56 / 2.56 GB/s |
+| `04.nccl_tests_baseline_healthy.sh` | healthy, R2CC switched off (`R2CC_MODE=0`) | 3.49–3.53 / 3.44–3.53 GB/s | 3.53 / 3.53 GB/s |
+| `05.nccl_tests_balance_unhealthy.sh` | R2CC-Balance, `mlx5_2` failed (`R2CC_MODE=2`) | 2.35–2.36 / 2.35–2.36 GB/s | 2.35 / 2.35 GB/s |
+| `06.nccl_tests_r2cc_allreduce_unhealthy.sh` | R2CC-AllReduce, `mlx5_2` failed (`R2CC_MODE=3`) | 2.50–2.56 / 2.50–2.56 GB/s | 2.56 / 2.56 GB/s |
 
 Notes: messages below `R2CC_AR_MIN_BYTES` (16 MiB) fall back to Balance, with one `falling back to Balance:
 message below minimum size` warning per rank (printed into the first row of the table), so the small sizes in the
-log of 06 are Balance numbers (8 MiB: 2.37 GB/s in 06, 2.37/2.38 GB/s in 05); from 16 MiB on, R2CC-AllReduce is
-above Balance at every size. Single sizes up to 256 MiB are occasionally slower in one of the two passes (in this
-run 04 at 128 MiB in-place and at 256 MiB); from 512 MiB on the results vary by at most about 0.1 GB/s between
-runs. All three scripts take nccl-tests arguments and `NCCL_TEST_BIN` for other
+log of 06 are Balance numbers (8 MiB: 2.37/2.39 GB/s in 06, 2.42/2.39 GB/s in 05); from 16 MiB on, R2CC-AllReduce
+is above Balance at every size in at least one of the two passes, and from 256 MiB on in both. Single sizes up to
+256 MiB are occasionally slower in one of the two passes (in this run, for example, 04 at 64 MiB and 128 MiB, 05 at
+64 MiB out-of-place and 128 MiB in-place, and 06 at 32 MiB and 128 MiB out-of-place); from 512 MiB on the results
+vary by at most about 0.1 GB/s between runs. All three scripts take nccl-tests arguments and `NCCL_TEST_BIN` for other
 collectives:
 
 ```bash
@@ -327,24 +330,24 @@ model of section 1.3. From [logs/07.nccl_tests_r2cc_allreduce_k_sweep.log](logs/
 
 ```
 run                    K     time oop / ip (us)    T/T0 oop / ip   model   vs. model oop/ip  #wrong
-healthy_1              -     2029422 /  2028825    1.000 / 1.000  1.0000    +0.02% / +0.00%  0/0
-balance_1              -     3039711 /  3042326    1.498 / 1.500  1.5000    -0.12% / -0.03%  0/0
-r2cc_allreduce_K1      1     3254564 /  3268634    1.604 / 1.611  1.6000    +0.25% / +0.70%  0/0
-r2cc_allreduce_K2      2     2942850 /  2953458    1.450 / 1.456  1.4500    +0.03% / +0.40%  0/0
-r2cc_allreduce_K4      4     2810066 /  2792754    1.385 / 1.377  1.3750    +0.73% / +0.12%  0/0
-r2cc_allreduce_K8      8     2717198 /  2718995    1.339 / 1.340  1.3375    +0.13% / +0.20%  0/0
-r2cc_allreduce_K16    16     2686165 /  2687490    1.324 / 1.325  1.3187    +0.39% / +0.45%  0/0
-healthy_2              -     2028484 /  2028648    1.000 / 1.000  1.0000    -0.02% / -0.00%  0/0
-balance_2              -     3041309 /  3040126    1.499 / 1.499  1.5000    -0.07% / -0.10%  0/0
+healthy_1              -     2028245 /  2029138    1.000 / 1.000  1.0000    -0.03% / -0.00%  0/0
+balance_1              -     3039966 /  3039571    1.498 / 1.498  1.5000    -0.11% / -0.14%  0/0
+r2cc_allreduce_K1      1     3243624 /  3244620    1.599 / 1.599  1.6000    -0.08% / -0.06%  0/0
+r2cc_allreduce_K2      2     2958525 /  2947277    1.458 / 1.452  1.4500    +0.57% / +0.17%  0/0
+r2cc_allreduce_K4      4     2791287 /  2793662    1.376 / 1.377  1.3750    +0.06% / +0.13%  0/0
+r2cc_allreduce_K8      8     2720541 /  2716429    1.341 / 1.339  1.3375    +0.26% / +0.09%  0/0
+r2cc_allreduce_K16    16     2695495 /  2692850    1.329 / 1.327  1.3187    +0.74% / +0.63%  0/0
+healthy_2              -     2029505 /  2029159    1.000 / 1.000  1.0000    +0.03% / +0.00%  0/0
+balance_2              -     3040734 /  3041923    1.499 / 1.499  1.5000    -0.08% / -0.06%  0/0
 ```
 
-- Every configuration is within 0.73% of the model and every `-c 1` check is 0. The healthy runs before and
+- Every configuration is within 0.74% of the model and every `-c 1` check is 0. The healthy runs before and
   after the sweep differ by less than 0.1%, the Balance runs by at most 0.1%.
 - With K = 1 the Broadcast of the tail starts only after the whole Reduce, and R2CC-AllReduce is slower than
-  Balance (1.60–1.61 against 1.50). From K = 2 on it is faster. The time falls with K as the model predicts
-  towards the K → ∞ value 1.30; at K = 16 it is 0.4% above the model, the cost of the many small chunks that the
+  Balance (1.60 against 1.50). From K = 2 on it is faster. The time falls with K as the model predicts towards
+  the K → ∞ value 1.30; at K = 16 it is 0.6–0.7% above the model, the cost of the many small chunks that the
   model leaves out.
-- The default K = 4 gives 1.38 (1.377 and 1.385 in the two passes), the value used in sections 1.3, 3.2 and
+- The default K = 4 gives 1.38 (1.376 and 1.377 in the two passes), the value used in sections 1.3, 3.2 and
   3.3.
 
 ## 4. CUDA graphs

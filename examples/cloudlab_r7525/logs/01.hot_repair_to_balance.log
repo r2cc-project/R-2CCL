@@ -24,39 +24,39 @@ Warning: Permanently added '192.168.100.2' (ECDSA) to the list of known hosts.
 [Rank 0] NIC connect command completed.
 [Rank 0] Initializing NCCL Communicator...
 NCCL version 2.23.4+cuda12.2
-[Rank 2] Initializing NCCL Communicator...
-[Rank 4] Initializing NCCL Communicator...
-[Rank 1] Initializing NCCL Communicator...
 [Rank 3] Initializing NCCL Communicator...
+[Rank 1] Initializing NCCL Communicator...
+[Rank 4] Initializing NCCL Communicator...
+[Rank 2] Initializing NCCL Communicator...
 [Rank 5] Initializing NCCL Communicator...
 [Rank 0] NCCL Initialization Complete.
 [Rank 1] NCCL Initialization Complete.
-[Rank 2] NCCL Initialization Complete.
-[Rank 3] NCCL Initialization Complete.
 [Rank 4] NCCL Initialization Complete.
 [Rank 5] NCCL Initialization Complete.
+[Rank 3] NCCL Initialization Complete.
+[Rank 2] NCCL Initialization Complete.
 [Rank 0] Arming NIC disconnect at program start (delay 4000 ms) using: ./nic/disconnect_nic1.sh
 [Rank 0] Iter 1/10 START: allreduce 4.00 GiB
-[Rank 0] Iter 1/10 END: OK (elapsed 2195 ms)
+[Rank 0] Iter 1/10 END: OK (elapsed 2162 ms)
 [Rank 0] Iter 2/10 START: allreduce 4.00 GiB
 Warning: Permanently added '192.168.100.2' (ECDSA) to the list of known hosts.
-[Rank 0] Iter 2/10 END: OK (elapsed 2031 ms)
+[Rank 0] Iter 2/10 END: OK (elapsed 2040 ms)
 [Rank 0] Iter 3/10 START: allreduce 4.00 GiB
 Warning: Permanently added '192.168.100.2' (ECDSA) to the list of known hosts.
 [Rank 0] NIC disconnect command completed.
-[Rank 0] Iter 3/10 END: OK (elapsed 3566 ms)
+[Rank 0] Iter 3/10 END: OK (elapsed 3539 ms)
 [Rank 0] Iter 4/10 START: allreduce 4.00 GiB
-[Rank 0] Iter 4/10 END: OK (elapsed 3041 ms)
+[Rank 0] Iter 4/10 END: OK (elapsed 3040 ms)
 [Rank 0] Iter 5/10 START: allreduce 4.00 GiB
-[Rank 0] Iter 5/10 END: OK (elapsed 3044 ms)
+[Rank 0] Iter 5/10 END: OK (elapsed 3043 ms)
 [Rank 0] Iter 6/10 START: allreduce 4.00 GiB
 [Rank 0] Iter 6/10 END: OK (elapsed 3044 ms)
 [Rank 0] Iter 7/10 START: allreduce 4.00 GiB
-[Rank 0] Iter 7/10 END: OK (elapsed 3042 ms)
+[Rank 0] Iter 7/10 END: OK (elapsed 3043 ms)
 [Rank 0] Iter 8/10 START: allreduce 4.00 GiB
 [Rank 0] Iter 8/10 END: OK (elapsed 3043 ms)
 [Rank 0] Iter 9/10 START: allreduce 4.00 GiB
-[Rank 0] Iter 9/10 END: OK (elapsed 3043 ms)
+[Rank 0] Iter 9/10 END: OK (elapsed 3044 ms)
 [Rank 0] Iter 10/10 START: allreduce 4.00 GiB
 [Rank 0] Iter 10/10 END: OK (elapsed 3043 ms)
 [Rank 0] Reconnecting NIC using: ./nic/connect_nic1.sh
@@ -64,25 +64,25 @@ Warning: Permanently added '192.168.100.2' (ECDSA) to the list of known hosts.
 [Rank 0] NIC reconnect command completed.
 [Rank 0] IB RX per-iteration (MB, port_rcv_data *4B):
 Iter   Time(ms)   mlx5_0_RX    mlx5_2_RX    mlx5_3_RX   
-1      2195       2407         2313         2312        
-2      2031       2406         2312         2312        
-3      3566       4218         574          2313        
-4      3041       3609         0            3468        
-5      3044       3609         0            3468        
+1      2162       2406         2312         2312        
+2      2040       2406         2312         2312        
+3      3539       4188         601          2312        
+4      3040       3609         0            3468        
+5      3043       3609         0            3468        
 6      3044       3609         0            3468        
-7      3042       3609         0            3468        
+7      3043       3609         0            3468        
 8      3043       3609         0            3468        
-9      3043       3609         0            3468        
+9      3044       3609         0            3468        
 10     3043       3609         0            3468        
 [Rank 0] Verification: all 1073741824 elements of each of the 10 iterations checked on all 6 ranks: 0 wrong
-[Rank 0] Failure evidence: mlx5_2 cut during iteration 3 (574 of 2313 MB received before the cut; command ran 4.00-4.75 s, iteration 4.26-7.83 s), no traffic on it in iterations 4-10, all of them completed
+[Rank 0] Failure evidence: mlx5_2 cut during iteration 3 (601 of 2312 MB received before the cut; command ran 4.00-4.75 s, iteration 4.24-7.77 s), no traffic on it in iterations 4-10, all of them completed
 [Rank 0] TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one the NIC failure hit.
-[Rank 1] Exiting.
-[Rank 0] Exiting.
 [Rank 5] Exiting.
+[Rank 1] Exiting.
 [Rank 4] Exiting.
-[Rank 3] Exiting.
+[Rank 0] Exiting.
 [Rank 2] Exiting.
+[Rank 3] Exiting.
 [trace] view_lines=74 state_lines=0
 [trace] failover_iter=4 rule=first iteration where mlx5_2_RX < 20
 [result] exit=0 PASS
