@@ -234,14 +234,6 @@ Below 16 MiB (`R2CC_AR_MIN_BYTES`) R2CC-AllReduce falls back to Balance, with on
 is faster than Balance in at least one pass, and in both from 256 MiB on. Single sizes up to 256 MiB are sometimes
 slower in one pass; from 512 MiB on, runs differ by at most about 0.1 GB/s.
 
-The scripts take nccl-tests arguments and `NCCL_TEST_BIN` for other collectives:
-
-```bash
-./06.nccl_tests_r2cc_allreduce_unhealthy.sh -b 1G -e 4G -f 4 -d half -o prod
-NCCL_TEST_BIN=all_gather_perf ./05.nccl_tests_balance_unhealthy.sh -b 64M -e 1G -f 2 -d float
-R2CC_AR_STAGE2_CHUNKS=8 ./06.nccl_tests_r2cc_allreduce_unhealthy.sh -b 4G -e 4G     # K = 8 instead of 4
-```
-
 ### 3.5 Test 07 — the pipeline depth K of R2CC-AllReduce against the paper's formula
 
 **Experiment description:** `all_reduce_perf` at 4 GiB with `mlx5_2` under failure, in nine configurations, healthy,
