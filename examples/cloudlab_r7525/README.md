@@ -98,7 +98,11 @@ The `mlx5_*_RX` columns are the MB that node-1's ports received in each iteratio
 
 **Experiment description:** `hot_repair/test_hot_repair` runs ten 4 GiB AllReduces on the six GPUs. Four seconds
 after the start, during iteration 3, the SmartNIC drops all traffic of node-1's `mlx5_2`. R2CC moves the in-flight
-transfers to the backup connection, finishes the AllReduce and then runs R2CC-Balance.
+transfers to the backup connection, finishes the AllReduce and then runs R2CC-Balance. The inputs are integers
+small enough that every sum is exact, so a GPU kernel compares all 2^30 output elements of every iteration on every
+rank with the exact result, and the `Failure evidence` line checks that the cut hit a running AllReduce.
+`R2CC_TEST_CORRUPT=3` (or `3,nan`) corrupts one output element to test the check, and the run then fails with exit
+code 2 (also in 02 and 08).
 
 **Proves:**
 
@@ -110,17 +114,7 @@ transfers to the backup connection, finishes the AllReduce and then runs R2CC-Ba
   as the paper's failover microbenchmark (Evaluation, the figure of AllReduce bandwidth at 1 GB with the R2CC
   pipeline for failover), a dip in the iteration of the repair followed by a steady, lower bandwidth.
 
-**Evidence:**
-
-- **Every element of every iteration is checked on every rank.** The inputs are integers small enough that every
-  sum is exact, so a GPU kernel can compare all 2^30 output elements with the exact result.
-- **`Failure evidence`** shows that the cut hit a running AllReduce and that `mlx5_2` carried nothing afterwards.
-- `TEST PASS` needs both. Exit code 0 is a pass, 2 wrong results, 3 a cut that missed a running AllReduce (run
-  again).
-- `R2CC_TEST_CORRUPT=3` (or `3,nan`) corrupts one output element to test the check, and the run fails with exit
-  code 2. This works for 02 and 08 too (`hot_repair/test_common.h`).
-
-From [logs/01.hot_repair_to_balance.log](logs/01.hot_repair_to_balance.log):
+**Evidence:** from [logs/01.hot_repair_to_balance.log](logs/01.hot_repair_to_balance.log):
 
 ```
 [testbed] node-1 mlx5_0 egress ratelimit: 10.0 Gbps (nic/shape_nics.sh status shows all ports)
@@ -193,7 +187,8 @@ Steady iterations take 2.80 s against 2.03 s healthy. node-1 receives 6.1 GB ins
 
 **Experiment description:** `all_reduce_perf` runs three times with the same arguments, healthy with R2CC switched
 off (`R2CC_MODE=0`), then R2CC-Balance (`R2CC_MODE=2`) and R2CC-AllReduce (`R2CC_MODE=3`) with `mlx5_2` under
-failure.
+failure. With `-c 1`, nccl-tests checks one more AllReduce of every size element by element (`#wrong`); the timed
+iterations are not checked.
 
 **Proves:**
 
@@ -203,8 +198,7 @@ failure.
 - R2CC-AllReduce is faster than Balance for large messages, as in the paper's H100 AllReduce benchmark
   (Evaluation, Microbenchmarks).
 
-**Evidence:** with `-c 1`, nccl-tests checks one more AllReduce of every size element by element (`#wrong`); the
-timed iterations are not checked. From [logs/03.nccl_tests_compare_all.log](logs/03.nccl_tests_compare_all.log):
+**Evidence:** from [logs/03.nccl_tests_compare_all.log](logs/03.nccl_tests_compare_all.log):
 
 ```
 ===== comparison (-b 256M -e 4G -f 4 -g 1 -c 1 -n 5 -w 2 -d float -o sum) =====
@@ -251,7 +245,8 @@ R2CC_AR_STAGE2_CHUNKS=8 ./06.nccl_tests_r2cc_allreduce_unhealthy.sh -b 4G -e 4G 
 ### 3.5 Test 07 — the pipeline depth K of R2CC-AllReduce against the paper's formula
 
 **Experiment description:** `all_reduce_perf` at 4 GiB with `mlx5_2` under failure, in nine configurations, healthy,
-Balance, R2CC-AllReduce with K = 1, 2, 4, 8 and 16, then healthy and Balance again to show drift.
+Balance, R2CC-AllReduce with K = 1, 2, 4, 8 and 16, then healthy and Balance again to show drift. Every time is divided by the mean of the two healthy runs and
+printed next to the prediction of section 1.2.
 
 **Proves:**
 
@@ -259,8 +254,7 @@ Balance, R2CC-AllReduce with K = 1, 2, 4, 8 and 16, then healthy and Balance aga
   approaches the paper's formula (1.30) as K grows.
 - R2CC-AllReduce is faster than Balance from K = 2 on.
 
-**Evidence:** every time is divided by the mean of the two healthy runs and printed next to the prediction of
-section 1.2. From [logs/07.nccl_tests_r2cc_allreduce_k_sweep.log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log):
+**Evidence:** from [logs/07.nccl_tests_r2cc_allreduce_k_sweep.log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log):
 
 ```
 run                    K     time oop / ip (us)    T/T0 oop / ip   model   vs. model oop/ip  #wrong
