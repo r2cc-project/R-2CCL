@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GPT-2 (124M) training through a real NIC failure, against failure-free training (README.md, section 5). Four
+# GPT-2 (124M) training through a real NIC failure, against failure-free training (README.md, section 3.7). Four
 # runs of training/train.py with the same seed, each 1000 optimizer updates of data-parallel training on the six
 # GPUs (WikiText-103, global batch 48 x 1024 tokens, deterministic kernels):
 #   VNF    upstream NCCL 2.23.4, no failure
@@ -16,7 +16,7 @@
 # Usage: ./09.training_with_nic_failure.sh
 #   SEEDS="42 43 44" runs the three seeds of the paper (default 42; about 2.3 hours).
 #   Uses the Python environment, the tokenized WikiText-103 and the upstream NCCL build under AE_ROOT (default
-#   /proj/softmeasure-PG0/r2cc_ae, see README.md section 5). The files of every run (train_log.csv, summary.json,
+#   /proj/softmeasure-PG0/r2cc_ae, see README.md section 3.7). The files of every run (train_log.csv, summary.json,
 #   stdout.log) go to OUT (default /mydata/r2cc_training/<date and time>).
 #   Nothing is written to logs/ by default; SAVE_LOG=1 also saves the terminal output to logs/local/.
 set -euo pipefail
