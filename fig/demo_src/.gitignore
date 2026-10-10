@@ -1,0 +1,5 @@
+node_modules/
+package-lock.json
+frames/
+demo.html
+still_*.png

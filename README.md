@@ -20,7 +20,7 @@ and adapts AllReduce to the remaining bandwidth—all without restarting the job
 
 <p align="center">
   <img width="100%" src="./fig/r2cc-demo.gif"><br/>
-  Replay of measured runs of tests 01 and 02 (<a href="./fig/r2cc-demo.mp4">1080p MP4</a>)
+  Replay of measured runs of tests 01, 02 and 08 (<a href="./fig/r2cc-demo.mp4">1080p MP4</a>)
 </p>
 
 https://github.com/user-attachments/assets/8511cbf4-843a-4399-a742-d986eac55eb9

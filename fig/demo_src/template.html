@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>R2CC demo</title>
+<style>
+  html, body { margin: 0; background: #e9ecf1; }
+  #stage { width: 1920px; height: 1080px; position: relative; overflow: hidden; background: #f7f8fa; }
+  svg { display: block; font-family: Inter, -apple-system, "Helvetica Neue", Arial, sans-serif; }
+  .mono { font-family: "JetBrains Mono", Menlo, monospace; }
+  #controls { display: flex; gap: 12px; align-items: center; padding: 10px 16px; font: 14px Inter, sans-serif; }
+  #controls input { flex: 1; }
+  body.export #controls { display: none; }
+</style>
+</head>
+<body>
+<div id="stage"><svg id="svg" width="1920" height="1080" viewBox="0 0 1920 1080"></svg></div>
+<div id="controls"><button id="play">Pause</button><input id="scrub" type="range" min="0" step="0.01"><span id="vt"></span></div>
+<script>const DATA = /*DATA*/;</script>
+<script>
+"use strict";
+const NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("svg");
+const C = {
+  ink: "#1d2330", sub: "#5b6474", faint: "#9aa3b2", line: "#d9dee6", card: "#ffffff",
+  blue: "#2f6fdf", blueSoft: "#e3ecfb", green: "#1f9d55", greenSoft: "#e2f5ea",
+  red: "#d93b3b", redSoft: "#fbe6e6", orange: "#e8891b", orangeSoft: "#fdf0e0", teal: "#0f8f8a", gray: "#8b95a7",
+};
+function el(tag, attrs = {}, parent = svg, text) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  parent.appendChild(e);
+  return e;
+}
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const ease = x => { x = clamp(x, 0, 1); return x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2; };
+const fade = (t, a, b, d = 0.4) => clamp((t - a) / d, 0, 1) * clamp((b - t) / d, 0, 1);
+
+// ---------------- data ----------------
+const R = DATA.t02, B = DATA.t01;
+const G = R.grid, NODES = ["node-1", "node-2", "node-3"], PORTS = ["mlx5_0", "mlx5_2", "mlx5_3"];
+const CUT = R.cut, IT = R.iters, END = IT[IT.length - 1].end;
+function cum(node, port, et) {
+  const a = R.mib[node][port], x = (et - G.t0) / G.step;
+  const i = clamp(Math.floor(x), 0, G.n - 2), w = clamp(x - i, 0, 1);
+  return a[i] + w * (a[i + 1] - a[i]);
+}
+const gbps = (node, port, et, win = 0.1) =>
+  Math.max(0, (cum(node, port, et) - cum(node, port, et - win)) / win * 1.048576 * 8 / 1000);
+const recv = (node, it) => PORTS.reduce((s, _, p) => s + cum(node, p, it.end) - cum(node, p, it.start), 0) / 1024;
+function iterAt(et) {
+  for (const it of IT) if (et < it.end) return it;
+  return null;
+}
+const fmt = (x, d = 2) => x.toFixed(d);
+
+// ---------------- storyboard (video seconds -> experiment seconds) ----------------
+const S = [
+  { v0: 0.0,  v1: 6.0,  e0: 2.36, e1: 4.39 },                          // healthy AllReduce #2
+  { v0: 6.0,  v1: 9.5,  e0: 4.39, e1: CUT + 0.04 },                    // #3 starts, the port is cut
+  { v0: 9.5,  v1: 15.0, e0: CUT + 0.04, e1: CUT + 0.04 },              // hold on the cut
+  { v0: 15.0, v1: 20.5, e0: CUT + 0.04, e1: 6.30 },                    // the other connections finish
+  { v0: 20.5, v1: 26.5, e0: 6.30, e1: IT[2].end + 0.003 },             // the backup port carries the rest
+  { v0: 26.5, v1: 31.5, e0: IT[2].end + 0.003, e1: IT[2].end + 0.003 },  // hold on the completion of #3
+  { v0: 31.5, v1: 45.0, e0: IT[2].end + 0.003, e1: END + 0.05 },       // #4 to #10 with R2CC-AllReduce
+];
+const HOLD_CUT = S[2], HOLD_DONE = S[5];
+const RUN_END = 45.4, RES0 = 45.2, CONC = 52.0, RES1 = 64.5, TOTAL = 68.5;
+const SINGLE = DATA.single_backup_s, AR_S = R.steady_ms / 1000, BAL_S = B.steady_ms / 1000;
+const pct = (a, b) => `${Math.round(100 * (1 - a / b))}%`;
+function expTime(vt) {
+  for (const s of S) if (vt < s.v1) return s.e0 + (s.e1 - s.e0) * clamp((vt - s.v0) / (s.v1 - s.v0), 0, 1);
+  return END + 0.05;
+}
+function speedAt(vt) {
+  for (const s of S) if (vt < s.v1) return (s.e1 - s.e0) / (s.v1 - s.v0);
+  return 0;
+}
+const CAPTIONS = [
+  [0.0, 6.0, "A healthy 4 GiB AllReduce on three servers", "Every NIC port runs at its 10 Gb/s limit"],
+  [6.0, 9.5, "AllReduce #3 starts", "The run is real. This is a replay of its measurements"],
+  [9.5, 15.0, "Port mlx5_2 of node-1 fails in the middle of AllReduce #3", "The GPUs are fine. Only one network port is lost"],
+  [15.0, 20.5, "R2CC moves the failed connections to the backup port mlx5_0", "The other connections keep running"],
+  [20.5, 26.5, "Only the unfinished part is resent, over the backup port", "AllReduce #3 is not restarted"],
+  [26.5, 31.5, "AllReduce #3 completes, and every element is correct", "Same operation, finished over the surviving ports"],
+  [31.5, 38.5, "From AllReduce #4 on, R2CC-AllReduce takes over", "The traffic uses both surviving ports, and node-1 receives less"],
+  [38.5, 45.4, "Port mlx5_2 stays down, and the job keeps going", `${fmt(AR_S)} s per AllReduce after the failure, ${fmt(IT[1].ms / 1000)} s when healthy`],
+  [45.4, CONC, "R2CC-AllReduce takes load off the degraded server", "The healthy servers take on more communication instead"],
+  [CONC, RES1, `${pct(AR_S, SINGLE)} less time per AllReduce than a single backup port`,
+   `and ${pct(AR_S, BAL_S)} less than R2CC-Balance, with every element checked`],
+];
+
+// ---------------- static scene ----------------
+el("rect", { x: 0, y: 0, width: 1920, height: 1080, fill: "#f7f8fa" });
+const head = el("g");
+const title = el("text", { x: 60, y: 72, "font-size": 34, fill: C.sub }, head);
+el("tspan", { "font-size": 40, "font-weight": 700, fill: C.ink }, title, "R2CC");
+el("tspan", {}, title, "  repairs a NIC failure in the middle of an AllReduce");
+const subtitle = el("text", { x: 60, y: 112, "font-size": 21, fill: C.faint }, head);
+const SUB_RUN = "Replay of a measured run (test 02) · 3 CloudLab servers · 2 GPUs and 3 NIC ports at 10 Gb/s per server · 4 GiB AllReduce";
+const SUB_RES = "Measured results of tests 01, 02 and 08 · same servers, same failed port · 4 GiB AllReduce";
+const clock = el("text", { x: 1860, y: 72, "font-size": 30, "text-anchor": "end", fill: C.ink, class: "mono" }, head);
+const speed = el("text", { x: 1860, y: 110, "font-size": 20, "text-anchor": "end", fill: C.faint }, head);
+
+const run = el("g");
+const cards = NODES.map((name, n) => {
+  const x = 60 + n * 420, y = 150, w = 400, h = 560;
+  const g = el("g", {}, run);
+  const frame = el("rect", { x, y, width: w, height: h, rx: 18, fill: C.card, stroke: C.line, "stroke-width": 2 }, g);
+  el("text", { x: x + 28, y: y + 52, "font-size": 30, "font-weight": 700, fill: C.ink }, g, name);
+  const tag = el("g", { opacity: 0 }, g);
+  el("rect", { x: x + w - 168, y: y + 26, width: 140, height: 36, rx: 18, fill: C.redSoft }, tag);
+  el("text", { x: x + w - 98, y: y + 51, "font-size": 19, "font-weight": 600, "text-anchor": "middle", fill: C.red }, tag, "1 port lost");
+  for (let k = 0; k < 2; k++) {
+    const gx = x + 28 + k * 180;
+    el("rect", { x: gx, y: y + 82, width: 164, height: 58, rx: 10, fill: "#f2f4f8", stroke: C.line }, g);
+    el("text", { x: gx + 18, y: y + 119, "font-size": 21, fill: C.ink }, g, `GPU ${k}`);
+    el("circle", { cx: gx + 136, cy: y + 112, r: 8, fill: C.green }, g);
+  }
+  const ports = PORTS.map((pname, p) => {
+    const py = y + 186 + p * 96;
+    el("text", { x: x + 28, y: py, "font-size": 22, fill: C.ink, class: "mono" }, g, pname);
+    const val = el("text", { x: x + w - 28, y: py, "font-size": 22, "text-anchor": "end", fill: C.sub, class: "mono" }, g);
+    el("rect", { x: x + 28, y: py + 14, width: w - 56, height: 26, rx: 6, fill: "#eef1f5" }, g);
+    const bar = el("rect", { x: x + 28, y: py + 14, width: 0, height: 26, rx: 6, fill: C.blue }, g);
+    const down = el("g", { opacity: 0 }, g);
+    el("rect", { x: x + 28, y: py + 14, width: w - 56, height: 26, rx: 6, fill: "url(#hatch)" }, down);
+    return { val, bar, down, w: w - 56 };
+  });
+  el("line", { x1: x + 28, y1: y + 462, x2: x + w - 28, y2: y + 462, stroke: C.line, "stroke-width": 2 }, g);
+  el("text", { x: x + 28, y: y + 500, "font-size": 19, fill: C.sub }, g, "Received in the last AllReduce");
+  const rx = el("text", { x: x + 28, y: y + 540, "font-size": 30, "font-weight": 700, fill: C.ink, class: "mono" }, g);
+  return { frame, tag, ports, rx };
+});
+const defs = el("defs");
+const pat = el("pattern", { id: "hatch", width: 14, height: 14, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" }, defs);
+el("rect", { width: 14, height: 14, fill: C.redSoft }, pat);
+el("rect", { width: 6, height: 14, fill: "#f3b9b9" }, pat);
+
+// operation panel
+const op = el("g", {}, run);
+el("rect", { x: 1340, y: 150, width: 520, height: 560, rx: 18, fill: C.card, stroke: C.line, "stroke-width": 2 }, op);
+el("text", { x: 1372, y: 196, "font-size": 19, fill: C.sub, "letter-spacing": 1.5 }, op, "CURRENT OPERATION");
+const opName = el("text", { x: 1372, y: 258, "font-size": 52, "font-weight": 700, fill: C.ink }, op);
+const pill = el("rect", { x: 1372, y: 282, width: 250, height: 44, rx: 22, fill: C.blueSoft }, op);
+const pillTxt = el("text", { x: 1392, y: 312, "font-size": 21, "font-weight": 600, fill: C.blue }, op);
+el("text", { x: 1372, y: 370, "font-size": 19, fill: C.sub }, op, "Schedule");
+const sched = el("text", { x: 1372, y: 402, "font-size": 23, "font-weight": 600, fill: C.ink }, op);
+el("line", { x1: 1372, y1: 428, x2: 1828, y2: 428, stroke: C.line, "stroke-width": 2 }, op);
+const rows = IT.map((it, i) => {
+  const ry = 462 + i * 25;
+  const g = el("g", { opacity: 0 }, op);
+  el("text", { x: 1372, y: ry, "font-size": 19, fill: C.ink, class: "mono" }, g, `#${String(it.n).padEnd(2)}`);
+  el("text", { x: 1440, y: ry, "font-size": 19, fill: C.ink, class: "mono" }, g, `${fmt(it.ms / 1000)} s`);
+  el("text", { x: 1546, y: ry, "font-size": 19, fill: C.green, "font-weight": 700 }, g, "✓");
+  const note = it.n === 3 ? "hit by the failure" : it.n === 4 ? "sets up R2CC-AllReduce" : "";
+  el("text", { x: 1576, y: ry, "font-size": 17, fill: it.n === 3 ? C.red : C.sub }, g, note);
+  return g;
+});
+
+// timeline
+const tl = el("g", {}, run);
+const TX0 = 60, TX1 = 1860, TY = 790;
+const tx = et => TX0 + (TX1 - TX0) * clamp(et / END, 0, 1);
+el("text", { x: TX0, y: TY - 22, "font-size": 18, fill: C.sub }, tl, "The ten AllReduces of the run (experiment time)");
+const blocks = IT.map(it => el("rect", { x: tx(it.start) + 1.5, y: TY, width: tx(it.end) - tx(it.start) - 3, height: 30, rx: 5, fill: "#e4e8ee" }, tl));
+IT.forEach(it => el("text", { x: (tx(it.start) + tx(it.end)) / 2, y: TY + 21, "font-size": 15, "text-anchor": "middle", fill: C.sub, class: "mono" }, tl, `#${it.n}`));
+const cutMark = el("g", { opacity: 0 }, tl);
+el("line", { x1: tx(CUT), y1: TY - 8, x2: tx(CUT), y2: TY + 40, stroke: C.red, "stroke-width": 3 }, cutMark);
+el("line", { x1: tx(CUT), y1: TY + 40, x2: tx(CUT), y2: TY + 72, stroke: C.red, "stroke-width": 2 }, cutMark);
+el("text", { x: tx(CUT) + 8, y: TY + 90, "font-size": 16, fill: C.red, "font-weight": 600 }, cutMark, "mlx5_2 down");
+const head2 = el("path", { d: "M -9 -14 L 9 -14 L 0 -2 Z", fill: C.ink }, tl);
+[0, 5, 10, 15, 20, 25].forEach(s => el("text", { x: tx(s), y: TY + 62, "font-size": 15, "text-anchor": "middle", fill: C.faint, class: "mono" }, tl, `${s} s`));
+
+// captions
+const cap = el("g");
+const cap1 = el("text", { x: 960, y: 935, "font-size": 40, "font-weight": 700, "text-anchor": "middle", fill: C.ink }, cap);
+const cap2 = el("text", { x: 960, y: 985, "font-size": 26, "text-anchor": "middle", fill: C.sub }, cap);
+
+// ---------------- results scene ----------------
+const res = el("g", { opacity: 0 });
+el("rect", { x: 60, y: 150, width: 980, height: 600, rx: 18, fill: C.card, stroke: C.line, "stroke-width": 2 }, res);
+el("text", { x: 96, y: 202, "font-size": 28, "font-weight": 700, fill: C.ink }, res, "Data each server receives per AllReduce");
+el("text", { x: 96, y: 236, "font-size": 20, fill: C.sub }, res, "MiB, after the failure (rx_per_node.log)");
+const BY = 650, BH = 330, BMAX = 9000;
+const legend = [["R2CC-Balance (test 01)", C.gray], ["R2CC-AllReduce (test 02)", C.teal]];
+legend.forEach(([t, c], i) => {
+  el("rect", { x: 96 + i * 330, y: 262, width: 22, height: 22, rx: 4, fill: c }, res);
+  el("text", { x: 128 + i * 330, y: 280, "font-size": 19, fill: C.ink }, res, t);
+});
+el("line", { x1: 110, y1: BY, x2: 1000, y2: BY, stroke: C.line, "stroke-width": 2 }, res);
+const resBars = NODES.map((name, n) => {
+  const cx = 230 + n * 300;
+  el("text", { x: cx, y: BY + 40, "font-size": 24, "font-weight": 600, "text-anchor": "middle", fill: C.ink }, res, name);
+  const vals = [DATA.rx_table.balance[n], DATA.rx_table.allreduce[n]];
+  return vals.map((v, k) => {
+    const bx = cx - 92 + k * 96;
+    const r = el("rect", { x: bx, y: BY, width: 88, height: 0, rx: 6, fill: k ? C.teal : C.gray }, res);
+    const t = el("text", { x: bx + 44, y: BY - 10, "font-size": 21, "text-anchor": "middle", fill: C.ink, class: "mono" }, res, String(v));
+    return { r, t, v };
+  });
+});
+const minus = el("text", { x: 230 + 4, y: BY - 300, "font-size": 24, "font-weight": 700, "text-anchor": "middle", fill: C.teal, opacity: 0 }, res, "−13%");
+
+el("rect", { x: 1080, y: 150, width: 780, height: 600, rx: 18, fill: C.card, stroke: C.line, "stroke-width": 2 }, res);
+el("text", { x: 1116, y: 202, "font-size": 28, "font-weight": 700, fill: C.ink }, res, "Time per AllReduce");
+el("text", { x: 1116, y: 236, "font-size": 20, fill: C.sub }, res, "seconds, after the failure unless marked healthy");
+const times = [
+  ["Healthy", IT[1].ms / 1000, "#c4cbd6"],
+  ["Single backup port, HotRepair only (test 08)", SINGLE, C.orange],
+  ["R2CC-Balance (test 01)", BAL_S, C.gray],
+  ["R2CC-AllReduce (test 02)", AR_S, C.teal],
+];
+const TMAX = 4.6, TW = 560;
+const timeBars = times.map(([label, v, c], i) => {
+  const y = 290 + i * 104;
+  el("text", { x: 1116, y, "font-size": 22, fill: C.ink }, res, label);
+  const r = el("rect", { x: 1116, y: y + 16, width: 0, height: 44, rx: 6, fill: c }, res);
+  const t = el("text", { x: 1116, y: y + 48, "font-size": 24, "font-weight": 700, fill: C.ink, class: "mono" }, res, `${fmt(v)} s`);
+  return { r, t, v };
+});
+const gain = el("text", { x: 1116, y: 290 + 3 * 104 + 84, "font-size": 20, "font-weight": 600, fill: C.teal, opacity: 0 }, res,
+  `−${pct(AR_S, SINGLE)} vs single backup port · −${pct(AR_S, BAL_S)} vs R2CC-Balance`);
+const check = el("g", { opacity: 0 }, res);
+el("rect", { x: 60, y: 772, width: 1800, height: 64, rx: 14, fill: C.greenSoft }, check);
+el("text", { x: 960, y: 814, "font-size": 24, "text-anchor": "middle", fill: C.green, "font-weight": 600 }, check,
+   "✓  Tests 01, 02 and 08 · every element of every AllReduce checked on all 6 ranks · 0 mismatches");
+
+// end card
+const endc = el("g", { opacity: 0 });
+el("rect", { x: 0, y: 0, width: 1920, height: 1080, fill: "#f7f8fa" }, endc);
+el("text", { x: 960, y: 470, "font-size": 96, "font-weight": 800, "text-anchor": "middle", fill: C.ink }, endc, "R2CC");
+el("text", { x: 960, y: 548, "font-size": 40, "text-anchor": "middle", fill: C.sub }, endc, "Keep GPU jobs running through network failures.");
+el("text", { x: 960, y: 640, "font-size": 30, "text-anchor": "middle", fill: C.blue, class: "mono" }, endc, "github.com/r2cc-project/R-2CCL");
+el("text", { x: 960, y: 1010, "font-size": 20, "text-anchor": "middle", fill: C.faint }, endc,
+   "Measured data from tests 01, 02 and 08 in examples/cloudlab_r7525 (logs/rx_per_node.log, logs/08.hot_repair_cuda_graph.log)");
+
+// ---------------- per-frame update ----------------
+function renderAt(vt) {
+  const et = expTime(vt);
+  const runOp = 1 - clamp((vt - RUN_END + 0.4) / 0.4, 0, 1);
+  run.setAttribute("opacity", runOp);
+  clock.textContent = vt < RUN_END ? `t = ${fmt(et)} s` : "";
+  subtitle.textContent = vt < RES0 + 0.25 ? SUB_RUN : SUB_RES;
+  const sp = speedAt(vt);
+  speed.textContent = vt >= RUN_END ? "" : sp === 0 ? "paused" : `playback ${sp < 1 ? fmt(sp, 2) : fmt(sp, 1)}×`;
+
+  const down = et >= CUT;
+  const hold = vt >= HOLD_DONE.v0 && vt < HOLD_DONE.v1, win = hold ? 0.002 : 0.1;
+  cards.forEach((c, n) => {
+    const node = NODES[n];
+    c.ports.forEach((p, k) => {
+      const failed = n === 0 && k === 1 && down;
+      const r = failed ? 0 : gbps(node, k, et, win);
+      p.bar.setAttribute("width", clamp(r / 10, 0, 1) * p.w);
+      const repaired = n === 0 && k === 0 && et >= 6.25 && et <= IT[2].end + 0.006;
+      p.bar.setAttribute("fill", repaired ? C.orange : C.blue);
+      p.down.setAttribute("opacity", failed ? 1 : 0);
+      p.val.textContent = failed ? "PORT DOWN" : `${fmt(r, 1)} Gb/s`;
+      p.val.setAttribute("fill", failed ? C.red : C.sub);
+      p.val.setAttribute("font-weight", failed ? 700 : 400);
+    });
+    const last = [...IT].reverse().find(it => it.end <= et);
+    c.rx.textContent = last ? `${fmt(recv(node, last))} GiB` : "–";
+    if (n === 0) {
+      c.tag.setAttribute("opacity", down ? 1 : 0);
+      const pulse = vt >= HOLD_CUT.v0 - 0.3 && vt < HOLD_CUT.v1 ? 0.5 + 0.5 * Math.sin((vt - HOLD_CUT.v0) * 6) : 0;
+      c.frame.setAttribute("stroke", down ? C.red : C.line);
+      c.frame.setAttribute("stroke-width", down ? 2 + 2 * pulse : 2);
+    }
+  });
+
+  const justDone = vt >= HOLD_DONE.v0 && vt < HOLD_DONE.v1;
+  const cur = justDone ? IT[2] : iterAt(et) || IT[IT.length - 1];
+  const done = cur.end <= et;
+  opName.textContent = `AllReduce #${cur.n}`;
+  if (done || justDone) {
+    pill.setAttribute("fill", C.greenSoft); pillTxt.setAttribute("fill", C.green);
+    pillTxt.textContent = "completed ✓"; pill.setAttribute("width", 190);
+  } else {
+    pill.setAttribute("fill", C.blueSoft); pillTxt.setAttribute("fill", C.blue);
+    pillTxt.textContent = `running · ${fmt(et - cur.start)} s`; pill.setAttribute("width", 250);
+  }
+  const ar = et > IT[2].end + 0.006;
+  sched.textContent = et < CUT ? "Ring over all three ports"
+                    : !ar ? "HotRepair, failed connection on mlx5_0"
+                    : "R2CC-AllReduce over mlx5_0 and mlx5_3";
+  sched.setAttribute("fill", et < CUT ? C.ink : !ar ? C.orange : C.teal);
+  IT.forEach((it, i) => rows[i].setAttribute("opacity", it.end <= et ? 1 : 0));
+
+  blocks.forEach((b, i) => {
+    const it = IT[i];
+    b.setAttribute("fill", it.end <= et ? (it.n === 3 ? "#f6d3b0" : "#cfe8d9") : it === cur ? C.blueSoft : "#e4e8ee");
+  });
+  cutMark.setAttribute("opacity", down ? 1 : 0);
+  head2.setAttribute("transform", `translate(${tx(et)},${TY})`);
+
+  const c = CAPTIONS.find(([a, b]) => vt >= a && vt < b);
+  if (c) {
+    const o = fade(vt, c[0], c[1], 0.3);
+    cap1.textContent = c[2]; cap2.textContent = c[3];
+    cap.setAttribute("opacity", o);
+  } else cap.setAttribute("opacity", 0);
+
+  // results
+  const ro = fade(vt, RES0, RES1, 0.5);
+  res.setAttribute("opacity", ro);
+  const g1 = ease((vt - (RES0 + 0.6)) / 1.2);
+  resBars.forEach(pair => pair.forEach(b => {
+    const h = BH * b.v / BMAX * g1;
+    b.r.setAttribute("height", h); b.r.setAttribute("y", BY - h);
+    b.t.setAttribute("y", BY - h - 12); b.t.setAttribute("opacity", g1);
+  }));
+  minus.setAttribute("opacity", ease((vt - (RES0 + 2.0)) / 0.6));
+  minus.setAttribute("y", BY - BH * DATA.rx_table.balance[0] / BMAX - 56);
+  const g2 = ease((vt - CONC) / 1.2);
+  timeBars.forEach(b => {
+    const w = TW * b.v / TMAX * g2;
+    b.r.setAttribute("width", w); b.t.setAttribute("x", 1116 + w + 14); b.t.setAttribute("opacity", g2);
+  });
+  gain.setAttribute("opacity", ease((vt - (CONC + 1.4)) / 0.6));
+  check.setAttribute("opacity", ease((vt - (CONC + 1.8)) / 0.6));
+  endc.setAttribute("opacity", clamp((vt - RES1) / 0.5, 0, 1));
+}
+
+// ---------------- playback ----------------
+window.TOTAL = TOTAL;
+window.renderAt = renderAt;
+const scrub = document.getElementById("scrub"), playBtn = document.getElementById("play"), vtTxt = document.getElementById("vt");
+scrub.max = TOTAL;
+if (new URLSearchParams(location.search).has("export")) document.body.classList.add("export");
+let playing = !document.body.classList.contains("export"), t = 0, last = null;
+function tick(now) {
+  if (playing) {
+    if (last !== null) t = (t + (now - last) / 1000) % TOTAL;
+    last = now; scrub.value = t;
+  } else last = null;
+  renderAt(t); vtTxt.textContent = `${fmt(t, 1)} s`;
+  requestAnimationFrame(tick);
+}
+playBtn.onclick = () => { playing = !playing; playBtn.textContent = playing ? "Pause" : "Play"; };
+scrub.oninput = () => { t = +scrub.value; };
+renderAt(0);
+window.ready = true;
+if (!document.body.classList.contains("export")) requestAnimationFrame(tick);
+</script>
+</body>
+</html>
