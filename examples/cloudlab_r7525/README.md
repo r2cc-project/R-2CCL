@@ -90,9 +90,6 @@ R2CC-AllReduce gives 9.1% more bandwidth than Balance by the prediction and 8.9â
 - A failed run returns a non-zero exit code. 01, 02 and 08 end with a `[result]` line (0 pass, 2 wrong results,
   3 the cut did not hit a running AllReduce, run again).
 
-The failed NIC is always node-1's `mlx5_2`. Tests 01, 02, 08 and 09 cut it on the BlueField with an OVS drop rule
-(`nic/disconnect_nic1.sh`, removed by `nic/connect_nic1.sh`); tests 03 and 05â€“07 only declare it failed.
-
 ## 3. Results and analysis
 
 The `mlx5_*_RX` columns are the MB that node-1's ports received in each iteration (`port_rcv_data`).
