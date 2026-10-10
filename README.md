@@ -45,7 +45,9 @@ NIC failed, which removes 12.5% of that server's bandwidth.
 
 <p align="center">
   <img width="90%" src="./fig/megatron-throughput.png"><br/>
-  <b>Megatron training throughput under NIC failures</b>
+  <b>Megatron-LM training throughput with a failed NIC</b><br/>
+  With data parallelism over 32 GPUs, R2CC-AllReduce keeps 750,627 tokens/s against 752,405 without a failure (0.24%
+  overhead), while vanilla NCCL crashes.
 </p>
 
 ## How it works
@@ -53,47 +55,58 @@ NIC failed, which removes 12.5% of that server's bandwidth.
 R2CC handles a failure in three steps, each building on the previous one.
 
 1. **Finish the interrupted operation (HotRepair).** GPU buffers are registered with several NICs in advance. When
-   a path fails, the two endpoints agree on the last chunk that was safely delivered, and only the data after it is
-   resent over a backup connection, so the running collective completes with correct results instead of starting
-   over.
+   a path fails, the two endpoints agree on a protocol-aware replay boundary, which also holds for NCCL's
+   low-latency LL and LL128 protocols, and only the unfinished part is resent over a backup connection. The running
+   collective completes with correct results instead of starting over.
 2. **Rebalance the traffic (R2CC-Balance).** The backup NIC now carries extra traffic and becomes the bottleneck.
    R2CC spreads the failed NIC's share over all remaining NICs of the server.
 3. **Adapt AllReduce (R2CC-AllReduce).** In a ring AllReduce every server moves the same amount of data, so the
    server that lost bandwidth sets the pace. R2CC-AllReduce reduces the communication load on that server with a
    partial AllReduce among the healthy servers and a broadcast of its result.
 
-Collectives captured in CUDA Graphs keep replaying through a failure, and a re-capture picks up the optimized
-schedule.
-
+<details>
+<summary>The two stages of R2CC-AllReduce</summary>
 <p align="center">
   <img width="70%" src="./fig/r2cc-allreduce-stages.png"><br/>
   <b>R2CC-AllReduce reduces the degraded node's load from 2D to 7/4D</b>
 </p>
+</details>
+
+## Capabilities and validated integrations
+
+| | Validated by | Scope |
+|---|---|---|
+| nccl-tests | This repo, tests 03–07 | AllReduce from 8 B to 4 GiB, in place and out of place, results checked at every size |
+| CUDA Graphs | This repo, test 08 | A graph captured before the failure keeps replaying correctly. A re-capture switches to the optimized schedule, and R2CC-AllReduce needs one eager AllReduce before it |
+| PyTorch DDP | This repo, test 09 | GPT-2 training through a NIC cut. The AllReduce the cut hits gives the same gradient as NCCL, and the final test perplexity is within 0.03% |
+| Megatron-LM | Paper | Data-parallel (2.7B) and tensor plus pipeline parallel (13B) training |
+| vLLM | Paper | Serving with a NIC failure (TTFT and TPOT) |
+| AllGather, ReduceScatter, SendRecv | Paper | R2CC-Balance keeps 83–90% of the healthy throughput for large messages |
+
+Each row is validated in the setting it names, not for every framework version or deployment.
 
 ## Getting started
 
 ```shell
 git clone https://github.com/r2cc-project/R-2CCL.git
 cd R-2CCL
-make -j    # builds build/lib/libnccl.so
+make -j                                                  # builds build/lib/libnccl.so
+export LD_LIBRARY_PATH=$PWD/build/lib:$LD_LIBRARY_PATH   # programs that load NCCL dynamically now use R2CC
 ```
 
-Programs that load NCCL dynamically pick up R2CC through `LD_LIBRARY_PATH`. Failover needs no setting, and the
-collectives after a repair use R2CC-Balance, or R2CC-AllReduce with `R2CC_AR_AFTER_REPAIR=3`.
+Failover needs no setting, and the collectives after a repair use R2CC-Balance, or R2CC-AllReduce with
+`R2CC_AR_AFTER_REPAIR=3`. To run the tests, set up three CloudLab r7525 servers with
+[r7525_setup.md](./examples/cloudlab_r7525/r7525_setup.md) and run the scripts in
+[examples/cloudlab_r7525](./examples/cloudlab_r7525/README.md) from node-1, starting with
+`./01.hot_repair_to_balance.sh`.
 
 ## Experiments
 
 [examples/cloudlab_r7525](./examples/cloudlab_r7525/README.md) runs nine tests on three CloudLab r7525 servers, each
 with a reference log. Tests 01, 02, 08 and 09 cut a real NIC in the middle of the run by dropping its traffic on the
-BlueField SmartNIC, and tests 01–08 check every element of every collective result.
-
-- **In-flight recovery** (01–02). The AllReduce that the failure hits completes with correct results.
-- **Performance after a failure** (03–07). R2CC-Balance and R2CC-AllReduce bandwidth is within 1% of what the
-  paper's formulas predict.
-- **CUDA Graphs** (08). A graph captured before the failure keeps replaying correctly, and a re-captured graph uses
-  the optimized schedule.
-- **Training quality** (09). GPT-2 training through a NIC failure ends within 0.03% of the failure-free test
-  perplexity.
+BlueField SmartNIC. Tests 01, 02 and 08 check every element of every AllReduce, and tests 03–07 check the result at
+every message size with nccl-tests. At 4 GiB, the bandwidth of R2CC-Balance and R2CC-AllReduce is within 1% of what
+the paper's formulas predict for this testbed (tests 03 and 07).
 
 ## Citation
 ```
