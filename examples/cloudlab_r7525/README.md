@@ -96,6 +96,13 @@ The `mlx5_*_RX` columns are the MB that node-1's ports received in each iteratio
 
 ### 3.1 Test 01 — real NIC failure, hot repair, then R2CC-Balance
 
+**Conclusion.** R2CC repairs a NIC failure in the middle of an AllReduce without restarting the job or losing
+data (every element is correct), then runs R2CC-Balance at 1.49 times the healthy time, against the paper's
+prediction 1/(1−X) = 1.5. This is the lossless live migration of the paper's section "Failure Detection and
+Mitigation", and it follows the same trend as the paper's failover microbenchmark (Evaluation, figure "AllReduce
+bandwidth at message size 1GB with R2CC pipeline for failover and restore"), a dip in the iteration of the repair
+followed by a steady, lower bandwidth.
+
 `hot_repair/test_hot_repair` runs ten 4 GiB AllReduces on the six GPUs. Four seconds after the start, during
 iteration 3, the SmartNIC drops all traffic of node-1's `mlx5_2`. R2CC moves the in-flight transfers to the backup
 connection, finishes the AllReduce and then runs R2CC-Balance.
