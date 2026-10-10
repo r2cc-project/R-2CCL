@@ -34,7 +34,8 @@ node-K (K = 1, 2, 3)
 The three NIC ports of a CloudLab r7525 server have different speeds (25, 100 and 100 Gb/s), so
 `nic/shape_nics.sh 10` limits every port to 10 Gb/s (to be set again after every reboot) and `~/topo.xml` declares the same speed. The three NICs are
 then equal (1.18–1.23 GB/s each per direction) and bound every collective. The two GPUs sit on different NUMA nodes
-and have no NVLink.
+and have no NVLink. A failure is injected by installing an OVS drop rule for node-1's `mlx5_2` on its BlueField
+SmartNIC (`nic/disconnect_nic1.sh`, removed again by `nic/connect_nic1.sh`).
 
 ### 1.2 What the model in the paper predicts under this testbed
 
