@@ -3,7 +3,7 @@
 Run the scripts in this directory from `node-1`, one at a time. [r7525_setup.md](r7525_setup.md) describes how to
 set up the servers.
 
-| Test | node-1's `mlx5_2` | What it shows | Run time | Log |
+| Test | Failure injection on one NIC (node-1's `mlx5_2`) | What it shows | Run time | Log |
 |---|---|---|---|---|
 | [01](01.hot_repair_to_balance.sh) | cut during the run | real NIC failure during a 4 GiB AllReduce → hot repair → **R2CC-Balance** | ~40 s | [log](logs/01.hot_repair_to_balance.log) |
 | [02](02.hot_repair_to_r2cc_allreduce.sh) | cut during the run | same failure → hot repair → **R2CC-AllReduce** | ~40 s | [log](logs/02.hot_repair_to_r2cc_allreduce.log) |
@@ -18,7 +18,7 @@ set up the servers.
 The run times and the reference logs come from this testbed. The times include start-up and restoring the NIC;
 01–08 together take about 17 minutes.
 
-*Cut during the run* means that the BlueField drops all traffic of the port while an AllReduce is running, and R2CC
+Failure injection: *Cut during the run* means that the BlueField drops all traffic of the port while an AllReduce is running, and R2CC
 has to detect and repair the failure. *Declared failed* means that the port is never cut; `R2CC_FAILED_NODE` and
 `R2CC_FAILED_HCA` make every rank treat it as failed from the start, which is the state after a repair. *Cut at
 update 400* is the same cut, made by the training at update 400 and left in place.
