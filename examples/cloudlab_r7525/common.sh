@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Shared settings and helpers for the cloudlab_r7525 tests. Source this file; do not execute it.
 #
-# Testbed: node-1 (run everything from here) + node-2, 2x V100S each. NCCL HCAs: mlx5_0 (25G, also the
-# bootstrap interface eno33np0), mlx5_2 and mlx5_3 (100G). The "failed" NIC in every scenario is node-1's
-# mlx5_2 (NCCL netDev 1): the hot-repair tests really cut it on the SmartNIC (nic/disconnect_nic1.sh), the
-# nccl-tests scenarios only declare it failed (R2CC_FAILED_HCA).
+# Testbed: node-1 (run everything from here) + node-2 [+ node-3] (see nodes.sh), 2x V100S each. NCCL HCAs:
+# mlx5_0 (25G, also the bootstrap interface eno33np0), mlx5_2 and mlx5_3 (100G). The "failed" NIC in every
+# scenario is node-1's mlx5_2 (NCCL netDev 1): the hot-repair tests really cut it on the SmartNIC
+# (nic/disconnect_nic1.sh), the nccl-tests scenarios only declare it failed (R2CC_FAILED_HCA).
 #
 # Variables a script may export BEFORE sourcing this file:
 #   NCCL_IB_HCA_LIST   HCAs NCCL may use (default all three)
@@ -12,7 +12,7 @@
 
 EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${EXAMPLE_DIR}/../.." && pwd)"
-REMOTE_HOST="${REMOTE_HOST:-node-2}"
+source "${EXAMPLE_DIR}/nodes.sh"   # REMOTE_HOST_LIST, NRANKS, MPI_HOSTS
 LOG_DIR="${LOG_DIR:-${EXAMPLE_DIR}/logs/local}"   # only used when SAVE_LOG=1 (logs/ itself holds the reference logs)
 NCCL_TESTS_DIR="${NCCL_TESTS_DIR:-/mydata/nccl-tests}"
 NCCL_IB_HCA_LIST="${NCCL_IB_HCA_LIST:-mlx5_0,mlx5_2,mlx5_3}"
@@ -25,7 +25,7 @@ export R2CC_FAILED_HCA="${R2CC_FAILED_HCA:-mlx5_2}"   # HCA name(s) or netDev in
 export OMPI_MCA_btl_tcp_if_include="${OMPI_MCA_btl_tcp_if_include:-eno33np0}"
 
 MPIRUN_BASE=(
-  mpirun -np 4 -host "localhost:2,${REMOTE_HOST}:2"
+  mpirun -np "${NRANKS}" -host "${MPI_HOSTS}"
   -mca pml ob1 -mca btl tcp,self -mca btl_tcp_if_include eno33np0
   -x NCCL_NET_GDR_LEVEL=SYS -x NCCL_IB_GID_INDEX=3 -x "NCCL_TOPO_FILE=${HOME}/topo.xml"
   -x NCCL_SOCKET_IFNAME=eno33np0 -x "NCCL_IB_HCA=${NCCL_IB_HCA_LIST}" -x NCCL_IB_MERGE_NICS=0
@@ -46,8 +46,11 @@ check_idle() {
   local busy
   # Match the launched binaries / launchers themselves, not shells whose command line merely mentions them.
   local pat='hot_repair/test_hot_repair( |$)|nccl-tests/build/[a-z_]+_perf( |$)|^[0-9]+ mpirun -np|^[0-9]+ orted -mca'
+  local h
   busy="$( { pgrep -af "${pat}" ;
-             ssh -o BatchMode=yes -o ConnectTimeout=5 "${REMOTE_HOST}" "pgrep -af '${pat}'" ; } 2>/dev/null \
+             for h in "${REMOTE_HOST_LIST[@]}"; do
+               ssh -o BatchMode=yes -o ConnectTimeout=5 "${h}" "pgrep -af '${pat}'" ;
+             done ; } 2>/dev/null \
            | grep -v -e pgrep || true)"
   if [[ -n "${busy}" ]]; then
     echo "Another multi-node job is running; run tools/kill.sh first:" >&2
@@ -65,18 +68,24 @@ ensure_nic_connected() {
   fi
 }
 
-# Default nccl-tests arguments: full size sweep, results verified against a CPU reference (-c 1).
+# One line in the output of every test with the egress limit of this node's mlx5_0 (set by nic/shape_nics.sh).
+print_nic_limit() {
+  local r; r="$(sudo -n mlnx_qos -i eno33np0 2>/dev/null | grep -m1 -oE 'ratelimit: [^,]+' || true)"
+  echo "[testbed] $(hostname -s) mlx5_0 egress ${r:-ratelimit: unknown} (nic/shape_nics.sh status shows all ports)"
+}
+
+# Default nccl-tests arguments: full size sweep; -c 1 checks one extra AllReduce of every size element by element.
 NCCL_TESTS_DEFAULT_ARGS=(-b 8 -e 4G -f 2 -g 1 -c 1 -n 5 -w 2 -d float -o sum)
 
 # run_nccl_tests <R2CC_MODE> <log_tag> [nccl-tests args...]
-# Runs $NCCL_TEST_BIN (default all_reduce_perf) from $NCCL_TESTS_DIR/build on the 4 GPUs. The "#wrong"
-# columns and the final "Out of bounds values : 0 OK" line must be 0 when -c 1 is used.
+# Runs $NCCL_TEST_BIN (default all_reduce_perf) from $NCCL_TESTS_DIR/build on all GPUs of all nodes. The
+# "#wrong" columns and the final "Out of bounds values : 0 OK" line must be 0 when -c 1 is used.
 run_nccl_tests() {
   local mode="$1" tag="$2"; shift 2
   local bin="${NCCL_TESTS_DIR}/build/${NCCL_TEST_BIN:-all_reduce_perf}"
   if [[ ! -x "${bin}" ]]; then
     echo "nccl-tests binary not found: ${bin}" >&2
-    echo "Build it (and copy it to ${REMOTE_HOST}) with: ${EXAMPLE_DIR}/tools/build_nccl_tests.sh" >&2
+    echo "Build it (and copy it to ${REMOTE_HOST_LIST[*]}) with: ${EXAMPLE_DIR}/tools/build_nccl_tests.sh" >&2
     return 1
   fi
   local -a args=("$@")
@@ -87,8 +96,9 @@ run_nccl_tests() {
   # Output goes to stdout only; the calling test script captures its whole terminal output into logs/<NN>.<name>.log.
   # A copy of this scenario's output is kept in a temporary file for result parsing (busbw_table).
   local tmp; tmp="$(mktemp)"
-  echo "[nccl-tests] R2CC_MODE=${mode} NCCL_IB_HCA=${NCCL_IB_HCA_LIST} R2CC_FAILED_NODE=${R2CC_FAILED_NODE} R2CC_FAILED_HCA=${R2CC_FAILED_HCA}"
+  echo "[nccl-tests] nodes=${NNODES} ranks=${NRANKS} (${MPI_HOSTS}) R2CC_MODE=${mode} NCCL_IB_HCA=${NCCL_IB_HCA_LIST} R2CC_FAILED_NODE=${R2CC_FAILED_NODE} R2CC_FAILED_HCA=${R2CC_FAILED_HCA}"
   echo "[nccl-tests] ${bin##*/} ${args[*]}"
+  print_nic_limit
   set +e
   timeout "${NCCL_TESTS_TIMEOUT:-900}" "${MPIRUN_BASE[@]}" "${envargs[@]}" -x "NCCL_DEBUG=${NCCL_DEBUG:-WARN}" \
     "${bin}" "${args[@]}" 2>&1 | tee "${tmp}"
@@ -104,7 +114,7 @@ run_nccl_tests() {
   return "${rc}"
 }
 
-# run_logged <NN.name> <command...>: run the command. By default nothing is written to disk: the six files in
+# run_logged <NN.name> <command...>: run the command. By default nothing is written to disk: the files in
 # logs/ are the reference logs shipped with the repository and must not be overwritten by a local run. With
 # SAVE_LOG=1 the complete terminal output is also written to ${LOG_DIR}/<NN.name>.log (default logs/local/,
 # git-ignored). To regenerate the reference logs deliberately: SAVE_LOG=1 LOG_DIR=<repo>/examples/cloudlab_r7525/logs.

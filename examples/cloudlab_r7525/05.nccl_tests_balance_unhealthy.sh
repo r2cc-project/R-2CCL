@@ -3,7 +3,7 @@
 #
 #   No NIC is cut. node-1's mlx5_2 is declared failed (R2CC_FAILED_NODE / R2CC_FAILED_HCA from common.sh); the
 #   channels whose ring hop would use it are excluded on every rank and the collective runs over the
-#   remaining NICs, exactly as after a real hot repair. Results are checked against a CPU reference (-c 1).
+#   remaining NICs, exactly as after a real hot repair. Results are checked with -c 1 (see 04).
 #
 # Usage: ./05.nccl_tests_balance_unhealthy.sh [nccl-tests args...]
 #   default args: -b 8 -e 4G -f 2 -g 1 -c 1 -n 5 -w 2 -d float -o sum

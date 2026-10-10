@@ -1,0 +1,37 @@
+[testbed] node-1 mlx5_0 egress ratelimit: 10.0 Gbps (nic/shape_nics.sh status shows all ports)
+[09] seeds 42; the files of every run go to /mydata/r2cc_training/20261009_191904
+[09] VNF_42: upstream NCCL 2.23.4, no failure
+[09] VNF_42: done in 10 min, test PPL 75.56742342917366
+[09] NF_42: R2CC, no failure
+[09] NF_42: done in 10 min, test PPL 75.56742342917366
+[09] BALF_42: R2CC, mlx5_2 cut at update 400, then R2CC-Balance
+[09] BALF_42: done in 11 min, test PPL 75.57225077094003
+[09] ARF_42: R2CC, mlx5_2 cut at update 400, then R2CC-AllReduce
+[09] ARF_42: done in 11 min, test PPL 75.58452098091739
+
+===== seed 42: every run against VNF (NCCL 2.23.4, no failure) =====
+run   NIC down    identical to VNF:                         max      max  test PPL   vs VNF
+      from        reduced gradient  training loss    |loss-VNF|    E_rel
+VNF   -           -                 -                         -  5.8e-08   75.5674        -
+NF    -           updates 400-408   updates 1-1000            0  5.8e-08   75.5674  +0.000%
+BALF  update 401  updates 400-401   updates 1-402      1.31e-03  5.8e-08   75.5723  +0.006%
+ARF   update 401  updates 400-401   updates 1-402      1.76e-03  5.8e-08   75.5845  +0.023%
+reduced gradient: SHA-256 of the output of the gradient AllReduce, compared for updates 400-408
+E_rel: |AllReduce output - FP64 sum of the inputs| / |FP64 sum|, largest over updates 400-408
+
+===== Training quality: GPT-2 (124M), WikiText-103, mlx5_2 of node-1 cut at update 400 (seed 42) =====
+Condition                  Test PPL   Max. paired Δ*
+NCCL 2.23.4, no failure      75.567   --
+R2CC, no failure             75.567   0.000%
+R2CC-Balance, failure        75.572   +0.006%
+R2CC-AllReduce, failure      75.585   +0.023%
+* the increase of the test perplexity over the NCCL run with the same seed, largest over the seeds
+
+===== checks =====
+yes  seed 42: NF is bit-identical to VNF: training loss of every update, test loss, reduced gradients, parameters
+yes  seed 42: BALF and ARF lost mlx5_2 during the run
+yes  seed 42: BALF and ARF: the AllReduce that the failure hit gives the same reduced gradient as VNF
+yes  seed 42: BALF and ARF: the training loss is identical to VNF up to the failure
+yes  seed 42: all runs: every AllReduce of updates 400-408 is identical on all ranks and has E_rel < 1e-06
+yes  seed 42: all runs: the parameters are identical on all ranks at every check point
+RESULT: all checks passed

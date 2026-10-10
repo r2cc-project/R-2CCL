@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Test drivers, the hot-repair binary, nccl-tests binaries and the mpirun/orted that launched them.
 PATTERN='[0-9][0-9]\.[a-z_]*\.sh|[s]tress_test\.sh|[r]un_hot_repair\.sh|[h]ot_repair_to_[a-z_]*\.sh|[n]ccl_tests_[a-z_]*\.sh|/[t]est_hot_repair|[a-z_]*_perf( |$)|[m]pirun -np|[o]rted -mca'
-REMOTE_HOST="${REMOTE_HOST:-node-2}"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/nodes.sh"
 LOCAL_ONLY=0
 
 if [[ "${1:-}" == "--local-only" ]]; then
@@ -30,7 +30,9 @@ kill_target_on_host() {
 kill_target_on_host "local" "local"
 
 if [[ "${LOCAL_ONLY}" -eq 0 ]]; then
-  kill_target_on_host "${REMOTE_HOST}" "remote(${REMOTE_HOST})"
+  for h in "${REMOTE_HOST_LIST[@]}"; do
+    kill_target_on_host "${h}" "remote(${h})"
+  done
 fi
 
 echo "[kill] done"

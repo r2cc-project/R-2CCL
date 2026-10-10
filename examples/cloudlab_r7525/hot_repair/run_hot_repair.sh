@@ -13,6 +13,7 @@ set -euo pipefail
 # which calls ./nic/disconnect_nic1.sh and ./nic/connect_nic1.sh relative to the working directory).
 EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${EXAMPLE_DIR}"
+source "${EXAMPLE_DIR}/nodes.sh"
 export OMPI_MCA_btl_tcp_if_include="${OMPI_MCA_btl_tcp_if_include:-eno33np0}"
 LOG_FLAG=0
 while [[ $# -gt 0 ]]; do
@@ -55,7 +56,7 @@ if [[ "${LOG_FLAG}" == "1" ]]; then
 else
   TRACE_ONLY="${TRACE_ONLY:-0}"
 fi
-TRACE_GREP="${TRACE_GREP:-R2CC_PROXY_STATE|\\[trace\\]|\\[Rank [0-9]+\\] Running on|\\[Rank 0\\] Iter [0-9]+/[0-9]+|Config:|IB RX per-iteration|TEST PASS|TEST FAIL|NCCL WARN|NCCL ERROR|Failed}"
+TRACE_GREP="${TRACE_GREP:-R2CC_PROXY_STATE|\\[trace\\]|\\[Rank [0-9]+\\] Running on|\\[Rank 0\\] Iter [0-9]+/[0-9]+|Config:|IB RX per-iteration|\\[Rank [0-9]+\\] Iter [0-9]+: |Checker self-test|NIC disconnect command|Verification:|Failure evidence:|TEST PASS|TEST FAIL|NCCL WARN|NCCL ERROR|Failed}"
 SAVE_RAW_LOG="${SAVE_RAW_LOG:-0}"
 LOG_DIR="${LOG_DIR:-./logs}"
 LOG_TAG="${LOG_TAG:-$(date +%Y%m%d_%H%M%S)}"
@@ -115,7 +116,12 @@ run_preflight_ping() {
   local ping_tries="${PREFLIGHT_PING_TRIES:-8}"
   local ping_count="${PREFLIGHT_PING_COUNT:-1}"
   local ping_wait="${PREFLIGHT_PING_WAIT_S:-1}"
-  local target_ips=("10.10.2.5" "10.10.3.6")
+  # BlueField ports (mlx5_2, mlx5_3) of every other node
+  local target_ips=() h ip1 ip2 ip3
+  for h in "${REMOTE_HOST_LIST[@]}"; do
+    read -r ip1 ip2 ip3 <<< "$(node_ips "${h}")"
+    target_ips+=("${ip2}" "${ip3}")
+  done
 
   echo "[preflight] start ping warmup targets=${target_ips[*]} tries=${ping_tries} count=${ping_count} wait_s=${ping_wait}"
   local ip
@@ -179,10 +185,11 @@ echo "[trace] log=${LOG_FLAG} channel=${R2CC_TRACE_CHANNEL} stall_iters=${R2CC_T
 
 run_preflight_connect
 run_preflight_ping
+echo "[testbed] $(hostname -s) mlx5_0 egress $(sudo -n mlnx_qos -i eno33np0 2>/dev/null | grep -m1 -oE 'ratelimit: [^,]+' || echo 'ratelimit: unknown') (nic/shape_nics.sh status shows all ports)"
 
 mpirun_cmd=(
-  mpirun -np 4
-  -host localhost:2,node-2:2
+  mpirun -np "${NRANKS}"
+  -host "${MPI_HOSTS}"
   -mca pml ob1 -mca btl tcp,self -mca btl_tcp_if_include eno33np0
   -x R2CC_TRACE_CHANNEL
   -x R2CC_TRACE_STALL_ITERS
@@ -202,7 +209,7 @@ mpirun_cmd=(
   -x "R2CC_AR_START_DISCONNECT_DELAY_MS=${R2CC_AR_START_DISCONNECT_DELAY_MS:-4000}"
 )
 for var in R2CC_MODE R2CC_FAILED_NODE R2CC_FAILED_HCA R2CC_FAILED_NIC_COUNT \
-           R2CC_AR_STAGE2_CHUNKS R2CC_AR_SCHEDULE R2CC_AR_MIN_BYTES R2CC_AR_AFTER_REPAIR; do
+           R2CC_AR_STAGE2_CHUNKS R2CC_AR_SCHEDULE R2CC_AR_MIN_BYTES R2CC_AR_AFTER_REPAIR R2CC_TEST_CORRUPT; do
   if [[ -v "$var" ]]; then
     mpirun_cmd+=(-x "$var")
   fi
@@ -252,6 +259,14 @@ if [[ "${SAMPLE_LINES}" =~ ^[0-9]+$ ]] && (( SAMPLE_LINES > 0 )); then
 fi
 
 [[ "${TRACE_TMP}" == "1" ]] && rm -f "${TRACE_LOG}"
+# Exit codes of test_hot_repair (mpirun passes on the first non-zero one).
+case "${mpirun_rc}" in
+  0) result="PASS" ;;
+  2) result="FAIL: wrong results" ;;
+  3) result="FAIL: the NIC failure did not hit a running AllReduce (see 'Failure evidence'); run again" ;;
+  *) result="FAIL: aborted (CUDA/NCCL/MPI error, crash or kill)" ;;
+esac
+echo "[result] exit=${mpirun_rc} ${result}"
 exit "${mpirun_rc}"
 
 # NCCL_R2CC_FAILOVER_TIMEOUT_MS=500   Should set according your scale and NCCL native timeout and retry env.

@@ -1,213 +1,387 @@
 # R2CC experiments on CloudLab r7525
 
-This document describes the six ready-to-run R2CC tests in this directory for two CloudLab `r7525` servers
-(`node-1`, `node-2`) and the terminal output of one run of each, kept in [`logs/`](logs/) for readers who
-cannot run them. It contains:
+1. [Testbed](#1-testbed) — the testbed setting and what the paper's formulas predict under this testbed.
+2. [Run the tests](#2-run-the-tests) — the path and the commands.
+3. [Results and analysis](#3-results-and-analysis) — for each experiment, its description, its relation to the
+   paper, the results and their analysis.
 
-1. [Testbed](#1-testbed) — the two machines, why their topology is unusual and what that means for the numbers.
-2. [Run the tests](#2-run-the-tests) — prerequisites, how the scripts behave, where the output goes.
-3. [Example results and analysis](#3-example-results-and-analysis) — for every test, the key lines of the saved
-   log with annotations of what happened and how the NIC traffic changed.
-4. [Directory layout](#4-directory-layout).
+Run the scripts in this directory from `node-1`, one at a time. [r7525_setup.md](r7525_setup.md) describes how to
+set up the servers.
 
-Bringing the machines up is described separately in [r7525_setup.md](r7525_setup.md).
+| Test | Failure injection on one NIC (node-1's `mlx5_2`) | Supported claims | Run time | Log |
+|---|---|---|---|---|
+| [01](01.hot_repair_to_balance.sh) | cut during the run | Lossless in-flight repair, then traffic balanced over the remaining NICs | ~40 s | [log](logs/01.hot_repair_to_balance.log) |
+| [02](02.hot_repair_to_r2cc_allreduce.sh) | cut during the run | Lossless in-flight repair, then R2CC-AllReduce at 1.38× healthy (paper 1.375) | ~40 s | [log](logs/02.hot_repair_to_r2cc_allreduce.log) |
+| [03](03.nccl_tests_compare_all.sh) | healthy, then under failure | Healthy, Balance and R2CC-AllReduce side by side, all within 1% of the paper's formula | ~3 min | [log](logs/03.nccl_tests_compare_all.log) |
+| [04](04.nccl_tests_baseline_healthy.sh) | healthy | Healthy baseline, correct at every message size | ~1.5 min | [log](logs/04.nccl_tests_baseline_healthy.log) |
+| [05](05.nccl_tests_balance_unhealthy.sh) | under failure | Correct at every message size under failure with Balance | ~2 min | [log](logs/05.nccl_tests_balance_unhealthy.log) |
+| [06](06.nccl_tests_r2cc_allreduce_unhealthy.sh) | under failure | Correct at every message size under failure; R2CC-AllReduce faster than Balance for large messages | ~2 min | [log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
+| [07](07.nccl_tests_r2cc_allreduce_k_sweep.sh) | healthy, then under failure | Within 0.74% of the paper's formula for K = 1–16 | ~7 min | [log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log) |
+| [08](08.hot_repair_cuda_graph.sh) | cut during the run | CUDA Graphs keep working through the failure; times match the paper's table | ~1.5 min | [log](logs/08.hot_repair_cuda_graph.log) |
+| [09](09.training_with_nic_failure.sh) | healthy, or cut at update 400 | Training through a failure matches upstream NCCL up to FP32 rounding | ~45 min | [log](logs/09.training_with_nic_failure.log) |
 
-| Test | What it shows | Reference log (one run on our testbed) |
-|---|---|---|
-| `01.hot_repair_to_balance.sh` | real NIC failure during a 4 GiB AllReduce → hot repair → **R2CC-Balance** | [logs/01.hot_repair_to_balance.log](logs/01.hot_repair_to_balance.log) |
-| `02.hot_repair_to_r2cc_allreduce.sh` | same failure → hot repair → **R2CC-AllReduce** | [logs/02.hot_repair_to_r2cc_allreduce.log](logs/02.hot_repair_to_r2cc_allreduce.log) |
-| `03.nccl_tests_compare_all.sh` | nccl-tests, 256 MiB–4 GiB, NCCL healthy vs. Balance vs. R2CC-AllReduce, one table | [logs/03.nccl_tests_compare_all.log](logs/03.nccl_tests_compare_all.log) |
-| `04.nccl_tests_baseline_healthy.sh` | full nccl-tests sweep (8 B–4 GiB), plain NCCL, all NICs healthy | [logs/04.nccl_tests_baseline_healthy.log](logs/04.nccl_tests_baseline_healthy.log) |
-| `05.nccl_tests_balance_unhealthy.sh` | full sweep, R2CC-Balance, `mlx5_2` failed | [logs/05.nccl_tests_balance_unhealthy.log](logs/05.nccl_tests_balance_unhealthy.log) |
-| `06.nccl_tests_r2cc_allreduce_unhealthy.sh` | full sweep, R2CC-AllReduce, `mlx5_2` failed | [logs/06.nccl_tests_r2cc_allreduce_unhealthy.log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
+Failure injection: *Cut during the run* means that the BlueField drops all traffic of the port while an AllReduce is running, and R2CC
+has to detect and repair the failure. *Under failure* means that the port is never cut; `R2CC_FAILED_NODE` and
+`R2CC_FAILED_HCA` make every rank treat it as failed from the start, which is the state after a repair. *Cut at
+update 400* is the same cut, made by the training at update 400 and left in place.
 
 ## 1. Testbed
 
-The topology of these machines is unusual; read this before looking at any number.
+### 1.1 Configuration
 
 ```
-node-1 ──┬── GPU0 (V100S, NUMA 0)          node-2: identical
-         ├── GPU1 (V100S, NUMA 1)          no NVLink; GPU0 <-> GPU1 traffic crosses the CPU interconnect
-         ├── mlx5_0   25 Gb/s  (also carries the bootstrap / MPI interface eno33np0)
-         ├── mlx5_2  100 Gb/s  BlueField port  <- the NIC that "fails" in every scenario
-         └── mlx5_3  100 Gb/s  BlueField port
+node-K (K = 1, 2, 3)
+  NUMA 0:  GPU0  V100S     mlx5_0  10 Gb/s
+  NUMA 1:  GPU1  V100S     mlx5_2  10 Gb/s   <- the NIC that fails
+                           mlx5_3  10 Gb/s
 ```
 
-- The two GPUs of a node sit on **different NUMA nodes and have no NVLink**, so every intra-node hop of a ring
-  goes through PCIe and the CPU interconnect. The three usable ports are **one 25G and two 100G**.
-- On this machine a single 100G port is more than the GPUs can drive; **plain NCCL would simply pick one 100G
-  NIC** and there would be nothing to fail over between. `xml/cloudlab_dump_topo.sh` therefore writes a
-  topology file (`~/topo.xml`, passed with `NCCL_TOPO_FILE`) in which **every NIC is declared with the same
-  speed**. NCCL then builds one ring per NIC and splits the data equally over the three, i.e. every NIC is
-  effectively used as a 25G NIC and the aggregate is capped by the slowest one. This is what makes the
-  "one of three NICs fails" experiments of the paper possible on two servers.
-- Consequently these tests **validate correctness and behaviour** (failover, traffic re-distribution, the
-  two-stage R2CC-AllReduce). The absolute and relative bandwidth numbers are **not representative** of a
-  normal multi-NIC GPU server: they are bounded by the 25G port, by the CPU interconnect, by PCIe V100S
-  without NVLink, and they vary noticeably from run to run.
+The three NIC ports of a CloudLab r7525 server have different speeds (25, 100 and 100 Gb/s), so
+`nic/shape_nics.sh 10` limits every port to 10 Gb/s (to be set again after every reboot) and `~/topo.xml` declares the same speed. The three NICs are
+then equal (1.18–1.23 GB/s each per direction) and bound every collective. The two GPUs sit on different NUMA nodes
+and have no NVLink. A failure is injected by installing an OVS drop rule for node-1's `mlx5_2` on its BlueField
+SmartNIC (`nic/disconnect_nic1.sh`, removed again by `nic/connect_nic1.sh`).
+
+### 1.2 What the model in the paper predicts under this testbed
+
+The paper models R2CC-AllReduce in section "Failure-aware Schedule Optimization" (subsection "R2CC AllReduce").
+One node loses a fraction X of its bandwidth B; with per-node data D and n nodes, a global AllReduce on (1−Y)D runs
+concurrently with a partial AllReduce of the healthy nodes on YD, and Stage 2 broadcasts YD back, with Y = X.
+
+```
+T_1  = 2(n−1)/n   · (1−Y)D / ((1−X)B)        global AllReduce
+T_2  = 2(n−2)/(n−1) · YD / (XB)              partial AllReduce
+T_3  = YD / ((1−X)B)                         broadcast back
+T    = max(T_1, T_2) + T_3                   T_nf = 2(n−1)D / (nB)   (no failure)
+
+T_Balance / T_nf = 1/(1−X)                   T / T_nf = 1 + nX / (2(n−1)(1−X))
+```
+
+On this testbed the ring has n = 6 members (two GPUs per server), X = 1/3 (one of node-1's three NICs), and the
+partial AllReduce runs on the 4 ranks of the healthy servers (T_2 = 0.9 T_nf, hidden behind T_1). The implementation
+runs Stage 2 as K pipelined chunks of a Reduce and a Broadcast (`R2CC_AR_STAGE2_CHUNKS`, default 4), which adds one
+chunk to T_3, T_3 = (1 + 1/K) · XD / ((1−X)B). The prediction is therefore
+
+- R2CC-Balance, T/T_nf = 1/(1−X) = **1.5**;
+- R2CC-AllReduce, T/T_nf = 1 + 0.3 · (1 + 1/K) = **1.375** for K = 4, which approaches the paper's 1 + nX/(2(n−1)(1−X))
+  = 1.30 as K grows. Test 07 measures K = 1 to 16.
+
+| 4 GiB AllReduce | prediction | test 03 (in-place) | tests 01/02 |
+|---|---|---|---|
+| healthy | 1 | 2.03 s, busbw 3.53 GB/s | 2.04 s (01), 2.03 s (02) |
+| R2CC-Balance, `mlx5_2` failed | 1.5 | 1.51 (3.05 s, 2.34 GB/s) | 1.49 (3.04 s) |
+| R2CC-AllReduce, `mlx5_2` failed, K = 4 | 1.375 | 1.38 (2.79 s, 2.56 GB/s) | 1.38 (2.80 s) |
+
+R2CC-AllReduce gives 9.1% more bandwidth than Balance by the prediction and 8.9–9.4% in test 03.
 
 ## 2. Run the tests
 
-- Setup: [r7525_setup.md](r7525_setup.md) (CloudLab profile, SmartNIC firmware, network, `~/topo.xml`).
-  For 03–06 build nccl-tests once with `tools/build_nccl_tests.sh`.
-- Everything is run from `node-1` (`cd /mydata/R2CC/examples/cloudlab_r7525 && ./01.hot_repair_to_balance.sh`).
-  `/mydata` is a per-node copy, so after any rebuild run `tools/sync.sh`.
-- One multi-node job at a time. Every script refuses to start while another one is running (`check_idle`
-  in `common.sh`) and **every script first restores `mlx5_2` on the SmartNIC** (removes the OVS drop rule),
-  so a killed run cannot leave the cluster degraded. `tools/kill.sh` stops leftover processes on both nodes.
-- The scripts only print to the terminal; nothing is written to disk by default, so a local run can never
-  overwrite the six reference logs in `logs/`. `SAVE_LOG=1 ./04.nccl_tests_baseline_healthy.sh` additionally
-  saves the complete output to `logs/local/<NN>.<name>.log` (git-ignored; `LOG_DIR` changes the directory).
+- Run the scripts from `node-1`, in `/mydata/R2CC/examples/cloudlab_r7525`.
+  ```
+  ./01.hot_repair_to_balance.sh
+  ./02.hot_repair_to_r2cc_allreduce.sh
+  ./03.nccl_tests_compare_all.sh
+  ./04.nccl_tests_baseline_healthy.sh
+  ./05.nccl_tests_balance_unhealthy.sh
+  ./06.nccl_tests_r2cc_allreduce_unhealthy.sh
+  ./07.nccl_tests_r2cc_allreduce_k_sweep.sh
+  ./08.hot_repair_cuda_graph.sh
+  ./09.training_with_nic_failure.sh
+  ```
+- One job at a time. Every script refuses to start while another one runs and first restores `mlx5_2` on the
+  SmartNIC. `tools/kill.sh` stops leftover processes on all nodes.
+- The scripts print to the terminal and never overwrite the reference logs in `logs/`. `SAVE_LOG=1` also saves the
+  output to `logs/local/`; 09 always writes its run files to `OUT` (section 3.7).
+- A failed run returns a non-zero exit code. 01, 02 and 08 end with a `[result]` line (0 pass, 2 wrong results,
+  3 the cut did not hit a running AllReduce, run again).
 
-In every scenario the failed NIC is **node-1's `mlx5_2`**. Tests 01/02 really cut it on the BlueField
-(`nic/disconnect_nic1.sh` installs an OVS drop rule for the port, `nic/connect_nic1.sh` removes it); tests
-03–06 only declare it failed (`R2CC_FAILED_NODE=0`, `R2CC_FAILED_HCA=mlx5_2`), which gives the same degraded
-topology without a disconnect.
+## 3. Results and analysis
 
-## 3. Example results and analysis
-
-Each subsection quotes the key lines of the saved log of one run and explains what happened. In every
-scenario the failed NIC is node-1's `mlx5_2`; the `mlx5_*_RX` columns are the bytes received by each of
-node-1's ports during one iteration.
+The `mlx5_*_RX` columns are the MB that node-1's ports received in each iteration (`port_rcv_data`).
 
 ### 3.1 Test 01 — real NIC failure, hot repair, then R2CC-Balance
 
-`hot_repair/test_hot_repair` runs 10 AllReduces of 4 GiB (float, sum) on the 4 GPUs and verifies every
-result. Four seconds after the start, i.e. during iteration 5/6, the SmartNIC silently starts dropping all
-traffic of node-1's `mlx5_2`. The library detects the stalled connection, live-migrates the in-flight
-transfers to the backup connection and finishes the collective; from the next collective on it runs
-R2CC-Balance (`R2CC_AR_AFTER_REPAIR=2`). The per-iteration table at the end shows the bytes received by each
-of node-1's ports (`port_rcv_data`). From [logs/01.hot_repair_to_balance.log](logs/01.hot_repair_to_balance.log):
+**Experiment description:** `hot_repair/test_hot_repair` runs ten 4 GiB AllReduces on the six GPUs. Four seconds
+after the start, during iteration 3, the SmartNIC drops all traffic of node-1's `mlx5_2`. R2CC moves the in-flight
+transfers to the backup connection, finishes the AllReduce and then runs R2CC-Balance. The inputs are integers
+small enough that every sum is exact, so a GPU kernel compares all 2^30 output elements of every iteration on every
+rank with the exact result, and the `Failure evidence` line checks that the cut hit a running AllReduce.
+`R2CC_TEST_CORRUPT=3` (or `3,nan`) corrupts one output element to test the check, and the run then fails with exit
+code 2 (also in 02 and 08).
+
+**Supported claims:**
+
+- R2CC repairs a NIC failure in the middle of an AllReduce without restarting the job or losing data; every element
+  is correct.
+- After the repair, R2CC-Balance spreads the same ~7.0 GB per iteration evenly over the two remaining NICs
+  (3609 and 3468 MB), as the paper's Balance formula assumes, the same data over the remaining (1−X)B.
+- This is the lossless live migration of the paper's section "Failure Detection and Mitigation", with the same trend
+  as the paper's failover microbenchmark (Evaluation, the figure of AllReduce bandwidth at 1 GB with the R2CC
+  pipeline for failover), a dip in the iteration of the repair followed by a steady, lower bandwidth.
+
+**Evidence:** from [logs/01.hot_repair_to_balance.log](logs/01.hot_repair_to_balance.log):
 
 ```
-[Rank 0] Arming NIC disconnect at program start (delay 4000 ms) using: ./nic/disconnect_nic1.sh
-[Rank 0] Iter 5/10 END: OK (elapsed 843 ms)
-[Rank 0] Iter 6/10 START: allreduce 4.00 GiB
-[Rank 0] NIC disconnect command completed.        <- mlx5_2 is now black-holed, iteration 6 is in flight
-[Rank 0] Iter 6/10 END: OK (elapsed 1313 ms)      <- repaired mid-collective, result still verified
+[testbed] node-1 mlx5_0 egress ratelimit: 10.0 Gbps (nic/shape_nics.sh status shows all ports)
+[Rank 0] Iter 2/10 END: OK (elapsed 2040 ms)
+[Rank 0] Iter 3/10 START: allreduce 4.00 GiB
+[Rank 0] NIC disconnect command completed.        <- mlx5_2 is now black-holed, iteration 3 is in flight
+[Rank 0] Iter 3/10 END: OK (elapsed 3539 ms)      <- repaired mid-collective, every element correct
 ...
 [Rank 0] IB RX per-iteration (MB, port_rcv_data *4B):
 Iter   Time(ms)   mlx5_0_RX    mlx5_2_RX    mlx5_3_RX
-1      885        2165         2136         2166       <- healthy: ~6.4 GB received per iteration (2(n-1)/n x 4 GiB),
-2      816        2165         2239         2293          split ~1/3 per NIC because all three are declared equal
-3      842        2165         2319         2361
-4      841        2165         2338         2355
-5      843        2165         2348         2337
-6      1313       3203         1251         2279       <- failure: mlx5_2 stops after 1251 MB; the rest of its share
-                                                         is migrated to the backup connection on mlx5_0
-7      1136       3249         0            3174       <- R2CC-Balance: mlx5_2 unused, the same 6.4 GB now split
-8      1161       3249         0            3178          over the two healthy NICs (~3.2 GB each)
-9      1128       3249         0            3149
-10     1130       3249         0            3180
-[Rank 0] TEST PASS: All allreduces completed and verified.
+1      2162       2406         2312         2312       <- iteration 1 includes connection setup
+2      2040       2406         2312         2312       <- healthy: ~7.0 GB received, 2(P-1)/P x 4 GiB for P = 6
+                                                          ranks plus headers, one third per NIC
+3      3539       4188         601          2312       <- failure: mlx5_2 stops after 601 MB; the rest of its
+                                                          share is migrated to the backup connection on mlx5_0
+4      3040       3609         0            3468       <- R2CC-Balance: mlx5_2 unused, the same ~7 GB split
+5      3043       3609         0            3468          over the two healthy NICs
+...
+10     3043       3609         0            3468
+[Rank 0] Verification: all 1073741824 elements of each of the 10 iterations checked on all 6 ranks: 0 wrong
+[Rank 0] Failure evidence: mlx5_2 cut during iteration 3 (601 of 2312 MB received before the cut; command ran
+         4.00-4.75 s, iteration 4.24-7.77 s), no traffic on it in iterations 4-10, all of them completed
+[Rank 0] TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one
+         the NIC failure hit.
+[result] exit=0 PASS
 ```
 
-Per-iteration time goes from ~0.85 s (3 NICs) to ~1.15 s (2 NICs) instead of failing, and the failover
-iteration itself costs about half a second of extra time. (Plain NCCL would hang in iteration
-5 until `NCCL_IB_TIMEOUT`/retry expire and then abort.)
+An iteration takes 2.04 s with three NICs and 3.04 s with two, 1.49 times as long (formula 1.5). The failover
+iteration costs about 1.5 s more than a healthy one.
 
 ### 3.2 Test 02 — real NIC failure, hot repair, then R2CC-AllReduce
 
-Identical run, but after the repair the library switches to R2CC-AllReduce (`R2CC_AR_AFTER_REPAIR=3`).
-With X = failed NICs / NICs per node = 1/3, every AllReduce becomes:
+**Experiment description:** the same run as 01, but after the repair R2CC-AllReduce runs (`R2CC_AR_AFTER_REPAIR=3`).
+Its stages are NCCL collectives on two sub-communicators, created with `ncclCommSplit` in the first AllReduce after
+the repair.
 
-- **Stage 1** — AllReduce of the first (1−X) of the buffer on all 4 ranks (over the healthy NICs), and the
-  partial AllReduce of the last X on the healthy node's sub-communicator (node-2's two GPUs).
-- **Stage 2** — the tail X is cut into K = 4 chunks (`R2CC_AR_STAGE2_CHUNKS`); for each chunk a Reduce of the
-  degraded node's data onto a helper rank of the healthy node (whose input is the partial result of Stage 1)
-  is pipelined with a Broadcast of the finished chunk back to all ranks.
+**Supported claims:**
 
-The two sub-communicators are created lazily, on the first AllReduce that runs in this mode. From
-[logs/02.hot_repair_to_r2cc_allreduce.log](logs/02.hot_repair_to_r2cc_allreduce.log):
+- The failure is repaired in flight as in 01, and every element is correct.
+- R2CC-AllReduce takes 1.38 times the healthy time, as the paper's model predicts under this testbed (1.375 for
+  K = 4, section 1.2), and 8% less than Balance.
+- It lowers the load of the degraded server as the paper's R2CC-AllReduce figure shows (2D to 7/4D in its 4-node
+  example); here node-1 receives 13% less than with Balance.
+
+**Evidence:** from [logs/02.hot_repair_to_r2cc_allreduce.log](logs/02.hot_repair_to_r2cc_allreduce.log):
 
 ```
 Iter   Time(ms)   mlx5_0_RX    mlx5_2_RX    mlx5_3_RX
-1      1100       2166         2083         2094       <- healthy, as in test 01
-...
-5      1673       3527         796          2094       <- failure hits during iteration 5 (796 of ~2100 MB had
-                                                         arrived on mlx5_2), the remainder is migrated
-6      1897       2889         0            2795       <- first R2CC-AllReduce: includes ncclCommSplit of the two
-                                                         sub-communicators (one-off cost)
-7      1320       2889         0            2792       <- steady state: node-1 (the degraded server) now receives
-8      1404       2889         0            2794          ~5.7 GB per iteration instead of the 6.4 GB of Balance:
-9      1616       2889         0            2796          it takes part only in the (1-X) AllReduce and in the
-10     1308       2889         0            2791          Reduce/Broadcast of the tail, not in the tail's AllReduce
-[Rank 0] TEST PASS: All allreduces completed and verified.
+2      2033       2406         2312         2312       <- healthy, as in test 01
+3      2974       3184         1566         2312       <- failure hits during iteration 3, the remainder of
+                                                          mlx5_2's share is migrated to mlx5_0
+4      3162       3128         0            3005       <- first R2CC-AllReduce: includes ncclCommSplit of the
+                                                          two sub-communicators (one-off, ~0.36 s)
+5      2824       3129         0            3005       <- steady state: node-1, the degraded server, receives
+6      2796       3128         0            3005          ~6.1 GB per iteration instead of the ~7.1 GB of
+...                                                       Balance: it takes part in the (1-X) AllReduce and
+10     2869       3128         0            3005          receives the broadcast tail, but not the tail's AllReduce
+[Rank 0] Verification: all 1073741824 elements of each of the 10 iterations checked on all 6 ranks: 0 wrong
+[Rank 0] Failure evidence: mlx5_2 cut during iteration 3 (1566 of 2312 MB received before the cut; command ran
+         4.00-5.65 s, iteration 4.32-7.30 s), no traffic on it in iterations 4-10, all of them completed
+[Rank 0] TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one
+         the NIC failure hit.
 ```
 
-The traffic pattern is the one described in the paper: the degraded server moves less data over its two
-remaining NICs, the healthy server absorbs the tail AllReduce over all of its NICs. Per-iteration times are
-in the same range as Balance here — see the next section for why the two are expected to be equal on two
-servers and why the measured numbers should not be over-interpreted.
+Steady iterations take 2.80 s against 2.03 s healthy. node-1 receives 6.1 GB instead of Balance's 7.1 GB, exactly
+(2(P−1)/P·(1−X) + X) / (2(P−1)/P) = 0.867; node-2 and node-3 carry the partial AllReduce on their otherwise idle
+`mlx5_2`.
 
 ### 3.3 Test 03 — nccl-tests: correctness and a side-by-side table
 
-`03.nccl_tests_compare_all.sh` runs `all_reduce_perf` three times with identical arguments
-(`-b 256M -e 4G -f 4 -g 1 -c 1 -n 5 -w 2 -d float -o sum`): plain NCCL on the healthy cluster
-(`R2CC_MODE=0`), R2CC-Balance (`R2CC_MODE=2`) and R2CC-AllReduce (`R2CC_MODE=3`) with `mlx5_2` declared
-failed, and prints one table. `-c 1` checks every result against the CPU reference, so **the point of this
-test is the `#wrong` columns being 0** for both R2CC strategies (R2CC-AllReduce is also exercised with every
-data type / reduction op and message size in test 06). From [logs/03.nccl_tests_compare_all.log](logs/03.nccl_tests_compare_all.log):
+**Experiment description:** `all_reduce_perf` runs three times with the same arguments, healthy with R2CC switched
+off (`R2CC_MODE=0`), then R2CC-Balance (`R2CC_MODE=2`) and R2CC-AllReduce (`R2CC_MODE=3`) with `mlx5_2` under
+failure. With `-c 1`, nccl-tests checks one more AllReduce of every size element by element (`#wrong`); the timed
+iterations are not checked.
+
+**Supported claims:**
+
+- Both schedules return correct results under failure.
+- At 4 GiB, Balance and R2CC-AllReduce take 1.51 and 1.38 times the healthy time, against 1.5 and 1.375 from the
+  paper's model under this testbed.
+- R2CC-AllReduce is faster than Balance for large messages, as in the paper's H100 AllReduce benchmark
+  (Evaluation, Microbenchmarks).
+
+**Evidence:** from [logs/03.nccl_tests_compare_all.log](logs/03.nccl_tests_compare_all.log):
 
 ```
 ===== comparison (-b 256M -e 4G -f 4 -g 1 -c 1 -n 5 -w 2 -d float -o sum) =====
-bytes        | baseline_healthy                 | balance_unhealthy                | r2cc_allreduce_unhealthy        
-268435456    | 4.93/7.67 (wrong 0/0)            | 5.04/4.55 (wrong 0/0)            | 3.51/4.56 (wrong 0/0)           
-1073741824   | 7.74/7.67 (wrong 0/0)            | 4.83/4.99 (wrong 0/0)            | 3.96/4.47 (wrong 0/0)           
-4294967296   | 7.68/7.69 (wrong 0/0)            | 5.18/5.18 (wrong 0/0)            | 4.25/4.38 (wrong 0/0)           
+bytes        | baseline_healthy                 | balance_unhealthy                | r2cc_allreduce_unhealthy
+268435456    | 3.36/2.76 (wrong 0/0)            | 2.24/2.31 (wrong 0/0)            | 2.37/2.50 (wrong 0/0)
+1073741824   | 3.52/3.30 (wrong 0/0)            | 2.35/2.36 (wrong 0/0)            | 2.56/2.56 (wrong 0/0)
+4294967296   | 3.53/3.53 (wrong 0/0)            | 2.35/2.34 (wrong 0/0)            | 2.56/2.56 (wrong 0/0)
 (cells: busbw out-of-place/in-place GB/s, then #wrong out-of-place/in-place)
 ```
 
-How to read the bandwidth columns:
-
-- **R2CC-AllReduce is, in theory, exactly as fast as Balance on two servers.** The paper's gain over Balance
-  comes from the *healthy* servers doing the tail AllReduce among themselves while the degraded server only
-  handles (1−X) of the data; with n = 2 servers the "healthy servers" are a single machine, the tail
-  AllReduce is intra-node, and what is left on the wire is the same amount of data Balance moves over the
-  same two NICs. Any gain needs ≥ 3 servers (the degraded server's NICs stop being the bottleneck for the
-  other n−1).
-- **What the numbers on this machine do show** is the cost of the machine itself: no NVLink, the tail
-  AllReduce and every intra-node hop crossing the CPU interconnect, the 25G port bounding every NIC, plus the
-  extra kernel launches of a two-stage algorithm on a 4 GPU job. In the saved run R2CC-AllReduce reaches about
-  80 % of Balance at 1–4 GiB; in other runs on the same machines the two were within noise of each other, and
-  plain NCCL on the healthy cluster varied between 4.5 and 7.7 GB/s at 4 GiB. Treat the table as a correctness
-  result with an indicative ordering, not as a performance claim.
+All `#wrong` are 0. At 4 GiB, healthy runs at 3.53 GB/s (three NICs), Balance at 2.34–2.35 GB/s (two NICs) and
+R2CC-AllReduce at 2.56 GB/s. Smaller sizes vary more between runs.
 
 ### 3.4 Tests 04–06 — full nccl-tests sweeps
 
-Each runs the standard `all_reduce_perf` sweep from 8 B to 4 GiB (`-b 8 -e 4G -f 2 -g 1 -c 1 -n 5 -w 2
--d float -o sum`, results verified) for one scenario and saves the complete output:
+**Experiment description:** each test runs `all_reduce_perf` over every message size from 8 B to 4 GiB
+(`-b 8 -e 4G -f 2 -g 1 -c 1 -n 5 -w 2 -d float -o sum`) in one scenario, checked with `-c 1` as in 03.
 
-| Test | Scenario | 4 GiB busbw in the saved run (out-of-place / in-place) |
-|---|---|---|
-| `04.nccl_tests_baseline_healthy.sh` | plain NCCL, all three NICs (`R2CC_MODE=0`) | 5.48 / 5.35 GB/s |
-| `05.nccl_tests_balance_unhealthy.sh` | R2CC-Balance, `mlx5_2` failed (`R2CC_MODE=2`) | 5.68 / 5.64 GB/s |
-| `06.nccl_tests_r2cc_allreduce_unhealthy.sh` | R2CC-AllReduce, `mlx5_2` failed (`R2CC_MODE=3`) | 4.82 / 4.81 GB/s |
+**Supported claims:**
 
-Notes on 06: messages below `R2CC_AR_MIN_BYTES` (16 MiB) fall back to Balance, so the small sizes in its log
-are Balance numbers; the first eligible size pays the one-off sub-communicator creation inside its warm-up.
-All three scripts take nccl-tests arguments and `NCCL_TEST_BIN` for other collectives:
+- Results are correct at every message size, healthy and under failure.
+- As in the paper's H100 benchmark, Balance is used for small messages and R2CC-AllReduce is faster for large ones.
 
-```bash
-./06.nccl_tests_r2cc_allreduce_unhealthy.sh -b 1G -e 4G -f 4 -d half -o prod
-NCCL_TEST_BIN=all_gather_perf ./05.nccl_tests_balance_unhealthy.sh -b 64M -e 1G -f 2 -d float
-R2CC_AR_STAGE2_CHUNKS=8 R2CC_AR_SCHEDULE=1 ./06.nccl_tests_r2cc_allreduce_unhealthy.sh -b 4G -e 4G
+**Evidence:**
+
+| Test | Scenario | busbw from 512 MiB to 4 GiB (out-of-place / in-place) | at 4 GiB |
+|---|---|---|---|
+| 04 | healthy, R2CC switched off (`R2CC_MODE=0`) | 3.49–3.53 / 3.44–3.53 GB/s | 3.53 / 3.53 GB/s |
+| 05 | R2CC-Balance, `mlx5_2` failed (`R2CC_MODE=2`) | 2.35–2.36 / 2.35–2.36 GB/s | 2.35 / 2.35 GB/s |
+| 06 | R2CC-AllReduce, `mlx5_2` failed (`R2CC_MODE=3`) | 2.50–2.56 / 2.50–2.56 GB/s | 2.56 / 2.56 GB/s |
+
+Below 16 MiB (`R2CC_AR_MIN_BYTES`) R2CC-AllReduce falls back to Balance, with one warning per rank in the 06 log.
+From 256 MiB on it is faster than Balance in both passes.
+
+### 3.5 Test 07 — the pipeline depth K of R2CC-AllReduce against the paper's formula
+
+**Experiment description:** `all_reduce_perf` at 4 GiB with `mlx5_2` under failure, in nine configurations, healthy,
+Balance, R2CC-AllReduce with K = 1, 2, 4, 8 and 16, then healthy and Balance again to show drift. Every time is divided by the mean of the two healthy runs and
+printed next to the prediction of section 1.2.
+
+**Supported claims:**
+
+- Every configuration is within 0.74% of the paper's model under this testbed (section 1.2), and R2CC-AllReduce
+  approaches the paper's formula (1.30) as K grows.
+- R2CC-AllReduce is faster than Balance from K = 2 on.
+
+**Evidence:** from [logs/07.nccl_tests_r2cc_allreduce_k_sweep.log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log):
+
+```
+run                    K     time oop / ip (us)    T/T0 oop / ip   model   vs. model oop/ip  #wrong
+healthy_1              -     2028245 /  2029138    1.000 / 1.000  1.0000    -0.03% / -0.00%  0/0
+balance_1              -     3039966 /  3039571    1.498 / 1.498  1.5000    -0.11% / -0.14%  0/0
+r2cc_allreduce_K1      1     3243624 /  3244620    1.599 / 1.599  1.6000    -0.08% / -0.06%  0/0
+r2cc_allreduce_K2      2     2958525 /  2947277    1.458 / 1.452  1.4500    +0.57% / +0.17%  0/0
+r2cc_allreduce_K4      4     2791287 /  2793662    1.376 / 1.377  1.3750    +0.06% / +0.13%  0/0
+r2cc_allreduce_K8      8     2720541 /  2716429    1.341 / 1.339  1.3375    +0.26% / +0.09%  0/0
+r2cc_allreduce_K16    16     2695495 /  2692850    1.329 / 1.327  1.3187    +0.74% / +0.63%  0/0
+healthy_2              -     2029505 /  2029159    1.000 / 1.000  1.0000    +0.03% / +0.00%  0/0
+balance_2              -     3040734 /  3041923    1.499 / 1.499  1.5000    -0.08% / -0.06%  0/0
 ```
 
-## 4. Directory layout
+Every check is 0, and the runs before and after the sweep differ by at most 0.1%. With K = 1 R2CC-AllReduce is
+slower than Balance (1.60).
+
+### 3.6 Test 08 — CUDA graphs
+
+**Experiment description:** `08.hot_repair_cuda_graph.sh` runs `hot_repair/test_hot_repair_graph` twice with the
+failure of 01/02 in iteration 3. The graph captured at the start is replayed in every iteration; after iteration 6
+the AllReduce is captured again, as R2CC-Balance in run 1 and as R2CC-AllReduce in run 2, which first needs one
+AllReduce outside the capture (`--eager`). Every element of every AllReduce is checked as in 01, outside the timed
+part.
+
+**Supported claims:**
+
+- R2CC works with CUDA Graphs, the compatibility experiment added to the appendix during shepherding (Discussion,
+  CUDA Graphs paragraph and table), and the times match that table.
+- A graph captured before the failure keeps replaying correctly after the repair, over the backup connection.
+- Capturing the AllReduce again applies R2CC-Balance or R2CC-AllReduce, at 1.7 ms for Balance and 0.33 s for
+  R2CC-AllReduce.
+
+**Evidence:** from [logs/08.hot_repair_cuda_graph.log](logs/08.hot_repair_cuda_graph.log):
 
 ```
-01.hot_repair_to_balance.sh                real disconnect -> hot repair -> R2CC-Balance
-02.hot_repair_to_r2cc_allreduce.sh         real disconnect -> hot repair -> R2CC-AllReduce
-03.nccl_tests_compare_all.sh               the three nccl-tests scenarios (04-06) + comparison table
-04.nccl_tests_baseline_healthy.sh          plain NCCL, all NICs
-05.nccl_tests_balance_unhealthy.sh         R2CC-Balance with mlx5_2 failed
-06.nccl_tests_r2cc_allreduce_unhealthy.sh  R2CC-AllReduce with mlx5_2 failed
-common.sh                                  shared settings: mpirun line, failure model, check_idle, NIC restore, nccl-tests runner, table
-hot_repair/                                test_hot_repair.cc (+ Makefile, binary), run_hot_repair.sh (driver of 01/02)
-nic/                                       SmartNIC helpers: disconnect_nic1.sh / connect_nic1.sh (OVS drop rule), setup, checks
-xml/                                       NCCL topology dumper and the equal-speed topo.xml used via NCCL_TOPO_FILE
-tools/                                     kill.sh, sync.sh (rsync repo to node-2), stress_test.sh, build_nccl_tests.sh
-logs/                                      terminal output of one run of each test (01-06)
-r7525_setup.md                             how to set up the two r7525 nodes
+===== CUDA Graphs: 4 GiB AllReduce on all GPUs, mlx5_2 of node-1 cut during the run =====
+Replayed graph (4 GiB AllReduce)    Time / iter   Re-capture overhead*
+Pre-failure graph, healthy               2.03 s   --
+Pre-failure graph, HotRepair             4.07 s   --
+Re-captured as R2CC-Balance              3.04 s   1.7 ms
+Re-captured as R2CC-AllReduce            2.79 s   0.33 s
+* the time of the iteration that performs the re-capture, including the eager collective that R2CC-AllReduce
+  needs to create its sub-communicators, minus the time of an iteration replayed from the new graph
+
+run 1/2, re-captured as R2CC-Balance:
+  Verification: all 1073741824 elements of each of the 10 iterations checked on all 6 ranks: 0 wrong
+  Failure evidence: mlx5_2 cut during iteration 3 (847 of 2312 MB received before the cut; command ran 4.00-4.83 s, iteration 4.11-7.43 s), no traffic on it in iterations 4-10, all of them completed
+  TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one the NIC failure hit.
+run 2/2, re-captured as R2CC-AllReduce:
+  Verification: all 1073741824 elements of each of the 10 iterations and of the AllReduce before re-capture checked on all 6 ranks: 0 wrong
+  Failure evidence: mlx5_2 cut during iteration 3 (674 of 2312 MB received before the cut; command ran 4.00-4.68 s, iteration 4.11-7.58 s), no traffic on it in iterations 4-10, all of them completed
+  TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one the NIC failure hit.
+[result] exit=0 PASS
+```
+
+Every element of every AllReduce is correct in both runs. The pre-failure graph keeps the healthy channel layout, so
+the backup connection on `mlx5_0` carries the whole share of `mlx5_2` (4.07 s). Balance and R2CC-AllReduce are
+chosen when a collective is enqueued, so they take effect in the re-captured graph.
+
+### 3.7 Test 09 — training through a NIC failure
+
+**Experiment description:** `09.training_with_nic_failure.sh` trains GPT-2 (124M) on WikiText-103 with PyTorch DDP
+on the six GPUs for 1000 updates (`training/train.py`), with a fixed seed and deterministic kernels. Every update
+runs one 475 MiB gradient AllReduce. Four runs use the same seed (default 42):
+
+| Run | Library | node-1's `mlx5_2` | Schedule after the hot repair |
+|---|---|---|---|
+| VNF | upstream NCCL 2.23.4 | healthy | – |
+| NF | R2CC | healthy | – |
+| BALF | R2CC | cut at update 400 | R2CC-Balance |
+| ARF | R2CC | cut at update 400 | R2CC-AllReduce |
+
+The library is not told which NIC fails. `training/compare.py` compares every run with VNF by the training loss of
+every update, the SHA-256 of the AllReduce outputs of updates 400–408 and of the parameters, the error of those
+AllReduces against an FP64 sum of the inputs (E_rel, Euclidean norm over all elements), and the test perplexity.
+The runs use PyTorch 2.4.1 built against the system NCCL, so each run loads R2CC or upstream NCCL 2.23.4 from
+`LD_LIBRARY_PATH`, and WikiText-103 tokenized with the GPT-2 BPE (SHA-256 in `manifest.json`), all under
+`/proj/softmeasure-PG0/r2cc_ae`. The files of every run go to `OUT`, printed at the start.
+
+**Supported claims:**
+
+- Without a failure, R2CC is identical to upstream NCCL bit for bit.
+- The AllReduce that the failure hits returns the same bits as upstream NCCL, and training continues without a
+  restart.
+- After the repair, the schedules only change the order in which gradients are summed, so the results differ by
+  FP32 rounding, the loss by at most 1.76e-3 and the test perplexity by at most +0.023%.
+- This is the training-quality experiment added during shepherding (summarized in the evaluation section, details in
+  the appendix "Training Quality Under a NIC Failure"), and these runs are bit-identical to its seed-42 runs.
+
+**Evidence:** from [logs/09.training_with_nic_failure.log](logs/09.training_with_nic_failure.log):
+
+```
+[09] VNF_42: done in 10 min, test PPL 75.56742342917366
+[09] NF_42: done in 10 min, test PPL 75.56742342917366
+[09] BALF_42: done in 11 min, test PPL 75.57225077094003
+[09] ARF_42: done in 11 min, test PPL 75.58452098091739
+
+===== seed 42: every run against VNF (NCCL 2.23.4, no failure) =====
+run   NIC down    identical to VNF:                         max      max  test PPL   vs VNF
+      from        reduced gradient  training loss    |loss-VNF|    E_rel
+VNF   -           -                 -                         -  5.8e-08   75.5674        -
+NF    -           updates 400-408   updates 1-1000            0  5.8e-08   75.5674  +0.000%
+BALF  update 401  updates 400-401   updates 1-402      1.31e-03  5.8e-08   75.5723  +0.006%
+ARF   update 401  updates 400-401   updates 1-402      1.76e-03  5.8e-08   75.5845  +0.023%
+...
+===== Training quality: GPT-2 (124M), WikiText-103, mlx5_2 of node-1 cut at update 400 (seed 42) =====
+Condition                  Test PPL   Max. paired Δ*
+NCCL 2.23.4, no failure      75.567   --
+R2CC, no failure             75.567   0.000%
+R2CC-Balance, failure        75.572   +0.006%
+R2CC-AllReduce, failure      75.585   +0.023%
+...
+===== checks =====
+yes  seed 42: NF is bit-identical to VNF: training loss of every update, test loss, reduced gradients, parameters
+yes  seed 42: BALF and ARF lost mlx5_2 during the run
+yes  seed 42: BALF and ARF: the AllReduce that the failure hit gives the same reduced gradient as VNF
+yes  seed 42: BALF and ARF: the training loss is identical to VNF up to the failure
+yes  seed 42: all runs: every AllReduce of updates 400-408 is identical on all ranks and has E_rel < 1e-06
+yes  seed 42: all runs: the parameters are identical on all ranks at every check point
+RESULT: all checks passed
+```
+
+The cut takes effect before the AllReduce of update 401, which R2CC repairs; its output equals VNF's, so the loss is
+identical up to update 402. Update 401 takes about 1.4 s instead of 0.5 s. From update 402 on, E_rel stays at
+5.8e-8, as for NCCL. The paper reports seeds 42, 43 and 44, for which `training/compare.py` prints
+
+```
+Condition                  Test PPL   Max. paired Δ*
+NCCL 2.23.4, no failure      76.085   --
+R2CC, no failure             76.085   0.000%
+R2CC-Balance, failure        76.085   +0.008%
+R2CC-AllReduce, failure      76.086   +0.023%
 ```
