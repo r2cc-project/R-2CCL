@@ -11,10 +11,10 @@
 #   VNF: the training loss of every update, the output of the gradient AllReduce of updates 400-408 (bit for bit,
 #   and against an FP64 sum of its inputs), the parameters and the test perplexity, and prints the test perplexity
 #   table of the paper. A run that fails, or whose train_log.csv does not grow for STALL_S seconds (default 300),
-#   is stopped and mlx5_2 is restored. About 50 minutes per seed.
+#   is stopped and mlx5_2 is restored. About 45 minutes per seed.
 #
 # Usage: ./09.training_with_nic_failure.sh
-#   SEEDS="42 43 44" runs the three seeds of the paper (default 42; about 2.5 hours).
+#   SEEDS="42 43 44" runs the three seeds of the paper (default 42; about 2.3 hours).
 #   Uses the Python environment, the tokenized WikiText-103 and the upstream NCCL build under AE_ROOT (default
 #   /proj/softmeasure-PG0/r2cc_ae, see README.md section 5). The files of every run (train_log.csv, summary.json,
 #   stdout.log) go to OUT (default /mydata/r2cc_training/<date and time>).

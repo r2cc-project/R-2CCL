@@ -30,7 +30,7 @@ Bringing the machines up is described separately in [r7525_setup.md](r7525_setup
 | `06.nccl_tests_r2cc_allreduce_unhealthy.sh` | declared failed | full sweep, R2CC-AllReduce | ~2 min | [logs/06.nccl_tests_r2cc_allreduce_unhealthy.log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
 | `07.nccl_tests_r2cc_allreduce_k_sweep.sh` | healthy, then declared failed | 4 GiB, R2CC-AllReduce with K = 1–16 pipeline chunks against the model | ~7 min | [logs/07.nccl_tests_r2cc_allreduce_k_sweep.log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log) |
 | `08.hot_repair_cuda_graph.sh` | cut during the run | time per iteration of the hot repair with the AllReduce replayed from a CUDA graph: across the failure, and after capturing it again as Balance or R2CC-AllReduce | ~1.5 min | [logs/08.hot_repair_cuda_graph.log](logs/08.hot_repair_cuda_graph.log) |
-| `09.training_with_nic_failure.sh` | healthy, or cut at update 400 | GPT-2 (124M) training, 1000 updates: upstream NCCL, R2CC, and R2CC with the failure (then Balance or R2CC-AllReduce), compared bit for bit and by test perplexity | ~50 min | [logs/09.training_with_nic_failure.log](logs/09.training_with_nic_failure.log) |
+| `09.training_with_nic_failure.sh` | healthy, or cut at update 400 | GPT-2 (124M) training, 1000 updates: upstream NCCL, R2CC, and R2CC with the failure (then Balance or R2CC-AllReduce), compared bit for bit and by test perplexity | ~45 min | [logs/09.training_with_nic_failure.log](logs/09.training_with_nic_failure.log) |
 
 Run times were measured on this testbed and include start-up and restoring the NIC; 01–08 together take about
 17 minutes.
@@ -423,7 +423,57 @@ hold:
 - in every run, every captured AllReduce returns the same output on all ranks, with E_rel < 1e-6;
 - in every run, the parameters are identical on all ranks at every check point.
 
-The paper reports seeds 42, 43 and 44 (`SEEDS="42 43 44"`, about 2.5 hours). For those runs the script prints
+From [logs/09.training_with_nic_failure.log](logs/09.training_with_nic_failure.log) (seed 42):
+
+```
+[09] VNF_42: done in 10 min, test PPL 75.56742342917366
+[09] NF_42: done in 10 min, test PPL 75.56742342917366
+[09] BALF_42: done in 11 min, test PPL 75.57225077094003
+[09] ARF_42: done in 11 min, test PPL 75.58452098091739
+
+===== seed 42: every run against VNF (NCCL 2.23.4, no failure) =====
+run   NIC down    identical to VNF:                         max      max  test PPL   vs VNF
+      from        reduced gradient  training loss    |loss-VNF|    E_rel
+VNF   -           -                 -                         -  5.8e-08   75.5674        -
+NF    -           updates 400-408   updates 1-1000            0  5.8e-08   75.5674  +0.000%
+BALF  update 401  updates 400-401   updates 1-402      1.31e-03  5.8e-08   75.5723  +0.006%
+ARF   update 401  updates 400-401   updates 1-402      1.76e-03  5.8e-08   75.5845  +0.023%
+...
+===== Training quality: GPT-2 (124M), WikiText-103, mlx5_2 of node-1 cut at update 400 (seed 42) =====
+Condition                  Test PPL   Max. paired Δ*
+NCCL 2.23.4, no failure      75.567   --
+R2CC, no failure             75.567   0.000%
+R2CC-Balance, failure        75.572   +0.006%
+R2CC-AllReduce, failure      75.585   +0.023%
+...
+===== checks =====
+yes  seed 42: NF is bit-identical to VNF: training loss of every update, test loss, reduced gradients, parameters
+yes  seed 42: BALF and ARF lost mlx5_2 during the run
+yes  seed 42: BALF and ARF: the AllReduce that the failure hit gives the same reduced gradient as VNF
+yes  seed 42: BALF and ARF: the training loss is identical to VNF up to the failure
+yes  seed 42: all runs: every AllReduce of updates 400-408 is identical on all ranks and has E_rel < 1e-06
+yes  seed 42: all runs: the parameters are identical on all ranks at every check point
+RESULT: all checks passed
+```
+
+- **Without a failure, R2CC is identical to upstream NCCL bit for bit**: the same loss in all 1000 updates, the
+  same AllReduce outputs and parameters, the same test perplexity to the last digit.
+- **The hot repair returns the same bits as upstream NCCL.** The cut takes effect between the AllReduces of
+  updates 400 and 401: `mlx5_2` received nothing during update 401, so its AllReduce starts on the dead port.
+  R2CC detects the stalled transfers, moves them to the backup connection and completes the AllReduce, whose
+  output equals VNF's; the loss is identical up to update 402 (the loss of an update is computed before its
+  AllReduce). In `train_log.csv`, update 401 takes about 1.4 s instead of 0.5 s, and the training continues
+  without a restart, at 0.62 s per update with Balance and 0.59 s with R2CC-AllReduce (about 0.9 s for update
+  402, whose AllReduce creates the sub-communicators of R2CC-AllReduce).
+- **From update 402 on**, Balance and R2CC-AllReduce split every AllReduce differently over the remaining NICs,
+  so the gradients are summed in a different order. Floating-point addition is not associative, so the outputs
+  differ from VNF's in the last bits; all of them, VNF's included, are within E_rel 5.8e-8 of the FP64 sum, the
+  size of FP32 rounding. The trainings then drift apart by rounding: the loss differs from VNF's by at most
+  1.31e-3 (Balance) and 1.76e-3 (R2CC-AllReduce) nats per token, and the test perplexity by +0.006% and +0.023%.
+
+The runs are deterministic: the four runs of this log are bit-identical to the seed-42 runs reported in the paper
+(every loss, AllReduce output and parameter hash). The paper reports seeds 42, 43 and 44 (`SEEDS="42 43 44"`,
+about 2.3 hours); for its runs `training/compare.py` prints the table of the paper, and all checks hold:
 
 ```
 Condition                  Test PPL   Max. paired Δ*
@@ -433,23 +483,9 @@ R2CC-Balance, failure        76.085   +0.008%
 R2CC-AllReduce, failure      76.086   +0.023%
 ```
 
-and all checks hold. In detail:
-
-- **Without a failure, R2CC is identical to upstream NCCL bit for bit**: the same loss in all 1000 updates, the
-  same AllReduce outputs and parameters, the same test perplexity.
-- **The hot repair returns the same bits as upstream NCCL.** The cut takes effect between the AllReduces of
-  updates 400 and 401: `mlx5_2` received nothing during update 401, so its AllReduce starts on the dead port.
-  R2CC detects the stalled transfers, moves them to the backup connection and completes the AllReduce, whose
-  output equals VNF's; the loss is identical up to update 402 (the loss of an update is computed before its
-  AllReduce). Update 401 takes about 1.4 s instead of 0.5 s, and the training continues without a restart, at
-  0.62 s per update with Balance and 0.59 s with R2CC-AllReduce (0.89 s for update 402, whose AllReduce creates
-  the sub-communicators of R2CC-AllReduce).
-- **From update 402 on**, Balance and R2CC-AllReduce split every AllReduce differently over the remaining NICs,
-  so the gradients are summed in a different order. Floating-point addition is not associative, so the outputs
-  differ from VNF's in the last bits; all of them, VNF's included, are within E_rel 5.8e-8 of the FP64 sum, the
-  size of FP32 rounding. The trainings then drift apart by rounding: the loss differs from VNF's by at most
-  2.43e-3 nats per token (seed 44, R2CC-AllReduce), and the test perplexity of a seed by at most +0.023%, with
-  no consistent sign (for seed 44 both failure runs end below VNF, by 0.014% and 0.033%).
+Over the three seeds, the loss differs from VNF's by at most 2.43e-3 nats per token (seed 44, R2CC-AllReduce),
+and the change of the test perplexity has no consistent sign: seed 44 ends 0.014% (Balance) and 0.033%
+(R2CC-AllReduce) below VNF.
 
 The runs use an environment prepared once on the shared storage of the CloudLab project,
 `/proj/softmeasure-PG0/r2cc_ae` (`AE_ROOT`), which every server of the experiment mounts:
