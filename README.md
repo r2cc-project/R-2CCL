@@ -114,8 +114,8 @@ make -j
 export LD_LIBRARY_PATH="$PWD/build/lib:${LD_LIBRARY_PATH:-}"
 ```
 
-HotRepair requires no additional enable flag in a configured multi-NIC environment. After recovery, R2CC uses
-R2CC-Balance by default. Set `R2CC_AR_AFTER_REPAIR=3` to use R2CC-AllReduce.
+HotRepair is enabled by default. After recovery, R2CC uses R2CC-Balance. Set `R2CC_AR_AFTER_REPAIR=3` to use
+R2CC-AllReduce.
 
 **Library selection.** Configure the application to load R2CC's `libnccl.so`. Frameworks that bundle NCCL may need
 additional configuration; verify the loaded library in `/proc/<pid>/maps`, as test 09 does.
@@ -132,9 +132,9 @@ Tests 01, 02, 08, and 09 inject a NIC-port failure by blocking traffic on the Bl
 Tests 01, 02, and 08 verify every element of every AllReduce output; tests 03–07 use nccl-tests correctness checks
 at each tested message size.
 
-In test 07's reference 4 GiB K sweep, normalized completion times match the predictions of the paper's formulas
-within 1%. The [experiment guide](./examples/cloudlab_r7525/README.md) derives these predictions from the paper's
-formulas using the six-rank topology and finite pipeline depth.
+In test 07's reference 4 GiB K sweep, normalized completion times agree within 1% with the predictions of the
+paper's formulas. The [experiment guide](./examples/cloudlab_r7525/README.md) explains how they are adapted to the
+six-rank topology and finite pipeline depth.
 
 ## Citation
 ```
