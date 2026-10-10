@@ -2,7 +2,7 @@
 
 How to bring up the r7525 testbed used by the experiments in [README.md](README.md): two or three servers
 (`node-1`, `node-2`[, `node-3`]). The reference logs were produced on three servers; R2CC-AllReduce can only be
-faster than R2CC-Balance with three or more (README.md, section 1.3).
+faster than R2CC-Balance with three or more (README.md, section 1.2).
 
 ## Prerequisites
 
@@ -28,7 +28,7 @@ SSH keepalive or `tmux`/`screen` to avoid disconnection.
 # Once, on node-1:
 cd /mydata/R2CC/examples/cloudlab_r7525
 ./nic/check_ip.sh                         # every address of the other nodes must be reachable
-./nic/shape_nics.sh 10                    # all NIC ports to 10 Gb/s (README.md, section 1.2)
+./nic/shape_nics.sh 10                    # all NIC ports to 10 Gb/s (README.md, section 1.1)
 
 # Then run the experiments (from node-1), see README.md:
 ./01.hot_repair_to_balance.sh
@@ -91,7 +91,7 @@ cd /mydata/R2CC/examples/cloudlab_r7525
 ./nic/shape_nics.sh off       # removes the limits
 ```
 
-The limits make the declared speed of `topo.xml` the real one (README.md, section 1.2). Every test prints the
+The limits make the declared speed of `topo.xml` the real one (README.md, section 1.1). Every test prints the
 limit of node-1's `mlx5_0` in a `[testbed]` line.
 
 ## Directory structure

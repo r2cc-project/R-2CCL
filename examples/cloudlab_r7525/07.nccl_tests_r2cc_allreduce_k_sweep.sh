@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# R2CC-AllReduce with K = 1, 2, 4, 8, 16 Stage-2 chunks, against the model of README.md section 1.3.
+# R2CC-AllReduce with K = 1, 2, 4, 8, 16 Stage-2 chunks, against the paper's formula (README.md, section 1.2).
 #
 #   nccl-tests at 4 GiB on the degraded cluster of 05/06 (node-1's mlx5_2 declared failed, X = 1/3): healthy and
 #   R2CC-Balance, then R2CC-AllReduce for every K (R2CC_AR_STAGE2_CHUNKS) with Stage 1 concurrent
