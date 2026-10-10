@@ -1,100 +1,48 @@
 # R2CC: Reliable and Resilient Collective Communication
 
-## Overview
-R<sup>2</sup>CCL is a fault tolerant communication library that provides lossless, low overhead failover by exploiting multi-NIC hardware. It is designed as a drop in replacement for NCCL to minimize full job terminations from network failures.
-
-📢 **Update 02/23/2026:** Added a CloudLab image and public profile for quick reproduction — see [Demo](#demo).
+R<sup>2</sup>CCL is a fault-tolerant communication library that provides lossless, low-overhead failover by
+exploiting multi-NIC hardware, so a network failure no longer terminates the whole training or inference job. The
+design and evaluation are in our NSDI paper ([arXiv](https://arxiv.org/abs/2512.25059)).
 
 <p align="center">
-  <img width="80%" src="./fig/R2CC-Megatron.png"><br/>
-  <b>Megatron Training Performance Evaluation</b>
+  <img width="80%" src="./fig/r2cc-timeline.png"><br/>
+  <b>R2CC (with failure) vs. Ideal (failure-free)</b>
 </p>
 
+Under a NIC failure, R2CC adds less than 1.1% overhead to training and less than 3% to inference, up to 92% and 98%
+less than existing fault-tolerant systems.
+
 ## Features
-🔥 **Zero-Downtime Hot Repair**: Automatically detects and mitigates network failures mid-collective. By utilizing multi-NIC GPU buffer registration and DMA-buffer rollback, R2CC live-migrates failed connections to backup links without losing in-flight data.
 
-⚖️ **Topology-Aware Load Balancing (R2CC-Balance)**: After a failure, R2CC dynamically redistributes traffic across the remaining healthy NICs. It is fully aware of PCIe, NUMA, and NVLink (PXN) topology to maximize remaining bandwidth.
+- **Lossless in-flight failover.** When a NIC or link fails during a collective, R2CC moves the transfer to a backup
+  NIC and resumes from the last confirmed step, so no data is lost and the job keeps running.
+- **Balanced traffic (R2CC-Balance).** The failed NIC's traffic is spread over all remaining NICs instead of piling
+  onto one.
+- **Asymmetric AllReduce (R2CC-AllReduce).** The degraded server takes a smaller share of the AllReduce, so it no
+  longer slows the whole ring.
+- **CUDA Graphs.** Captured graphs keep replaying through a failure, and a re-capture picks up the optimized
+  schedule.
 
-🚀 **Failure-Optimized AllReduce (R2CC-AllReduce)**: Introduces a novel schedule that prevents degraded servers from bottlenecking the cluster by intelligently combining global and partial AllReduce operations. The current implementation builds the schedule from NCCL collectives on sub-communicators: an AllReduce of the first (1−X) of the data on all ranks, a partial AllReduce of the remaining X on the healthy servers, and a pipelined Reduce-to-helper + Broadcast of that tail back to the degraded server (X = lost bandwidth fraction).
+<p align="center">
+  <img width="70%" src="./fig/r2cc-allreduce-stages.png"><br/>
+  <b>R2CC-AllReduce reduces the degraded node's load from 2D to 7/4D</b>
+</p>
 
-<p align="center"><img width="100%" src="./fig/overview.png"></p><br/>
+## Performance
+
+<p align="center">
+  <img width="90%" src="./fig/megatron-throughput.png"><br/>
+  <b>Megatron training throughput under NIC failures</b>
+</p>
 
 ## Demo
+
 https://github.com/user-attachments/assets/8511cbf4-843a-4399-a742-d986eac55eb9
 
-We provide a pre-built CloudLab image, the test scripts and the logs of running them, so the demo and the other experiments can be reproduced on two r7525 servers:
-- [Setup guide](./examples/cloudlab_r7525/r7525_setup.md) — instantiate the profile with the pre-built image, flash the SmartNICs, dump the topology.
-- [Experiments](./examples/cloudlab_r7525/README.md) — six ready-to-run tests.
-- [Logs](./examples/cloudlab_r7525/logs) — the terminal output of running these experiments on CloudLab, one run per test.
+## Reproduce
 
-## Todo List
-1. Live Migration: Seamless failover via multi-NIC registration and DMA rollback. ✔️
-2. R<sup>2</sup>CCL-Balance: Load-balancing for remaining healthy interfaces. ✔️
-3. R<sup>2</sup>CCL-AllReduce: Correct implementation on top of NCCL sub-communicators (partial AllReduce on the healthy servers + pipelined Reduce/Broadcast of the tail), verified with nccl-tests `-c 1` and real NIC disconnects. ✔️
-4. CloudLab r7525 examples and test scripts. ✔️
-5. Native implementation of R<sup>2</sup>CCL-AllReduce with a customized kernel (single-pass Stage 2).
-
-## Test scripts and results
-We provide a complete set of test scripts and the results of running them in [examples/cloudlab_r7525](./examples/cloudlab_r7525): hot repair of a real NIC failure (injected at runtime with an OVS drop rule on the BlueField SmartNIC) followed by R<sup>2</sup>CCL-Balance or R<sup>2</sup>CCL-AllReduce, and nccl-tests correctness/bandwidth runs of plain NCCL, Balance and R<sup>2</sup>CCL-AllReduce. Each script saves its terminal output; the saved run of every test is in [examples/cloudlab_r7525/logs](./examples/cloudlab_r7525/logs). See [examples/cloudlab_r7525/README.md](./examples/cloudlab_r7525/README.md) for the scripts, the annotated results and the testbed caveats, and [r7525_setup.md](./examples/cloudlab_r7525/r7525_setup.md) for setting up the two CloudLab servers.
-
-## How to use R<sup>2</sup>CCL
-### Build
-```shell
-git clone https://github.com/r2cc-project/R-2CCL.git
-cd R-2CCL
-make -j
-```
-
-### Test
-Similar to NCCL, R<sup>2</sup>CCL can be benchmarked using nccl-tests. Below we provide compilation commands for nccl-tests and an example of performance testing using allreduce.
-
-### Build nccl-tests
-```shell
-git clone https://github.com/NVIDIA/nccl-tests.git
-cd nccl-tests
-make MPI=1 MPI_HOME=<openmpi> NCCL_HOME=<R-2CCL>/build
-mpirun -np 4 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1 -c 1
-```
-
-### Testing with Environment Variables
-To simplify testing the performance and reduce the complexity of triggering failures (e.g., using SmartNICs to disable specific routing at runtime), we provide environment variables to directly simulate specific scenarios and measure performance. All variables must be identical on every rank (pass them with `mpirun -x`); the library cross-checks them and warns on mismatches.
-
-**R2CC_MODE**:
-- `0`: NCCL baseline
-- `1`: Live Migration (static backup connection)
-- `2`: R<sup>2</sup>CCL-Balance
-- `3`: R<sup>2</sup>CCL-AllReduce
-
-**Failure model for modes 2/3** (no real failure is injected):
-- `R2CC_FAILED_HCA=<name|index>[,…]`: NIC(s) considered failed (default: the last `R2CC_FAILED_NIC_COUNT` NICs).
-- `R2CC_FAILED_NODE=<n>`: server whose NICs failed (default 0).
-
-**R2CC-AllReduce knobs** (mode 3): `R2CC_AR_STAGE2_CHUNKS` (pipeline depth, default 4), `R2CC_AR_SCHEDULE` (0 all stages concurrent, 1 Stage 2 after Stage 1, 2 also serialize the partial AllReduce — default, 3 also serialize Reduce/Broadcast chunks), `R2CC_AR_MIN_BYTES` (below this AllReduce falls back to Balance, default 16 MiB).
-
-**After a real hot repair**: `R2CC_AR_AFTER_REPAIR=2|3` selects Balance (default) or R2CC-AllReduce for the collectives that follow the repair.
-
-**Failover trigger**: `NCCL_R2CC_FAILOVER_TIMEOUT_MS` (default 5000). A connection whose posted sends show no completion for this long is failed over to its backup path even if the NIC reports no error (a black-holed RoCE path); `<= 0` disables the timer and failover then relies on the IB retry timeout alone (`NCCL_IB_TIMEOUT` x `NCCL_IB_RETRY_CNT`).
-
-### Example1: Live Migration
-Test Migration Performance.
-Requirements: 2 nodes, >=2 NICs per node.
-```shell
-# no failure
-mpirun -np 4 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1
-
-# 1 failure (static backup connection)
-mpirun -x R2CC_MODE=1 -np 4 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1
-
-# or run the first command and disable the routing on the SmartNIC (see the CloudLab example)
-```
-
-### Example2: Failure Aware Scheduling Performance
-When only one NIC remains on each node, the performance of different strategies is identical. Therefore, we recommend using machines with 8 NICs and 8 GPUs for testing. Below are the performance tests for R<sup>2</sup>CCL-Balance and R<sup>2</sup>CCL-AllReduce, respectively (NIC `mlx5_7` of server 0 assumed failed).
-```shell
-mpirun -x R2CC_MODE=2 -x R2CC_FAILED_NODE=0 -x R2CC_FAILED_HCA=mlx5_7 -np 16 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1 -c 1
-
-mpirun -x R2CC_MODE=3 -x R2CC_FAILED_NODE=0 -x R2CC_FAILED_HCA=mlx5_7 -np 16 -host A,B ./build/all_reduce_perf -b 8K -e 8G -f 2 -t 1 -g 1 -c 1
-```
+[examples/cloudlab_r7525](./examples/cloudlab_r7525/README.md) runs R2CC through real NIC failures on three CloudLab
+r7525 servers, with the scripts, the expected results and the reference logs of each test.
 
 ## Citation
 ```
