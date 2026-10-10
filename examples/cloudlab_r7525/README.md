@@ -8,17 +8,17 @@
 Run the scripts in this directory from `node-1`, one at a time. [r7525_setup.md](r7525_setup.md) describes how to
 set up the servers.
 
-| Test | Failure injection on one NIC (node-1's `mlx5_2`) | What it shows | Run time | Log |
+| Test | Failure injection on one NIC (node-1's `mlx5_2`) | Supported claims | Run time | Log |
 |---|---|---|---|---|
-| [01](01.hot_repair_to_balance.sh) | cut during the run | real NIC failure during a 4 GiB AllReduce → hot repair → **R2CC-Balance** | ~40 s | [log](logs/01.hot_repair_to_balance.log) |
-| [02](02.hot_repair_to_r2cc_allreduce.sh) | cut during the run | same failure → hot repair → **R2CC-AllReduce** | ~40 s | [log](logs/02.hot_repair_to_r2cc_allreduce.log) |
-| [03](03.nccl_tests_compare_all.sh) | healthy, then under failure | nccl-tests, 256 MiB–4 GiB, healthy vs. Balance vs. R2CC-AllReduce, one table | ~3 min | [log](logs/03.nccl_tests_compare_all.log) |
-| [04](04.nccl_tests_baseline_healthy.sh) | healthy | nccl-tests (message sizes 8 B–4 GiB), R2CC switched off | ~1.5 min | [log](logs/04.nccl_tests_baseline_healthy.log) |
-| [05](05.nccl_tests_balance_unhealthy.sh) | under failure | nccl-tests (message sizes 8 B–4 GiB), R2CC-Balance | ~2 min | [log](logs/05.nccl_tests_balance_unhealthy.log) |
-| [06](06.nccl_tests_r2cc_allreduce_unhealthy.sh) | under failure | nccl-tests (message sizes 8 B–4 GiB), R2CC-AllReduce | ~2 min | [log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
-| [07](07.nccl_tests_r2cc_allreduce_k_sweep.sh) | healthy, then under failure | 4 GiB, R2CC-AllReduce with K = 1–16 pipeline chunks against the paper's formula | ~7 min | [log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log) |
-| [08](08.hot_repair_cuda_graph.sh) | cut during the run | the hot repair with the AllReduce replayed from a CUDA graph: time per iteration across the failure and after capturing it again as Balance or R2CC-AllReduce; every element checked as in 01/02 | ~1.5 min | [log](logs/08.hot_repair_cuda_graph.log) |
-| [09](09.training_with_nic_failure.sh) | healthy, or cut at update 400 | GPT-2 (124M) training, 1000 updates: upstream NCCL, R2CC, and R2CC with the failure (then Balance or R2CC-AllReduce), compared bit for bit and by test perplexity | ~45 min | [log](logs/09.training_with_nic_failure.log) |
+| [01](01.hot_repair_to_balance.sh) | cut during the run | Lossless in-flight repair, then traffic balanced over the remaining NICs | ~40 s | [log](logs/01.hot_repair_to_balance.log) |
+| [02](02.hot_repair_to_r2cc_allreduce.sh) | cut during the run | Lossless in-flight repair, then R2CC-AllReduce at 1.38× healthy (paper 1.375) | ~40 s | [log](logs/02.hot_repair_to_r2cc_allreduce.log) |
+| [03](03.nccl_tests_compare_all.sh) | healthy, then under failure | Healthy, Balance and R2CC-AllReduce side by side, all within 1% of the paper's formula | ~3 min | [log](logs/03.nccl_tests_compare_all.log) |
+| [04](04.nccl_tests_baseline_healthy.sh) | healthy | Healthy baseline, correct at every message size | ~1.5 min | [log](logs/04.nccl_tests_baseline_healthy.log) |
+| [05](05.nccl_tests_balance_unhealthy.sh) | under failure | Correct at every message size under failure with Balance | ~2 min | [log](logs/05.nccl_tests_balance_unhealthy.log) |
+| [06](06.nccl_tests_r2cc_allreduce_unhealthy.sh) | under failure | Correct at every message size under failure; R2CC-AllReduce faster than Balance for large messages | ~2 min | [log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
+| [07](07.nccl_tests_r2cc_allreduce_k_sweep.sh) | healthy, then under failure | Within 0.74% of the paper's formula for K = 1–16 | ~7 min | [log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log) |
+| [08](08.hot_repair_cuda_graph.sh) | cut during the run | CUDA Graphs keep working through the failure; times match the paper's table | ~1.5 min | [log](logs/08.hot_repair_cuda_graph.log) |
+| [09](09.training_with_nic_failure.sh) | healthy, or cut at update 400 | Training through a failure matches upstream NCCL up to FP32 rounding | ~45 min | [log](logs/09.training_with_nic_failure.log) |
 
 Failure injection: *Cut during the run* means that the BlueField drops all traffic of the port while an AllReduce is running, and R2CC
 has to detect and repair the failure. *Under failure* means that the port is never cut; `R2CC_FAILED_NODE` and
@@ -109,7 +109,7 @@ rank with the exact result, and the `Failure evidence` line checks that the cut 
 `R2CC_TEST_CORRUPT=3` (or `3,nan`) corrupts one output element to test the check, and the run then fails with exit
 code 2 (also in 02 and 08).
 
-**Proves:**
+**Supported claims:**
 
 - R2CC repairs a NIC failure in the middle of an AllReduce without restarting the job or losing data; every element
   is correct.
@@ -156,7 +156,7 @@ iteration costs about 1.5 s more than a healthy one.
 Its stages are NCCL collectives on two sub-communicators, created with `ncclCommSplit` in the first AllReduce after
 the repair.
 
-**Proves:**
+**Supported claims:**
 
 - The failure is repaired in flight as in 01, and every element is correct.
 - R2CC-AllReduce takes 1.38 times the healthy time, as the paper's model predicts under this testbed (1.375 for
@@ -195,7 +195,7 @@ off (`R2CC_MODE=0`), then R2CC-Balance (`R2CC_MODE=2`) and R2CC-AllReduce (`R2CC
 failure. With `-c 1`, nccl-tests checks one more AllReduce of every size element by element (`#wrong`); the timed
 iterations are not checked.
 
-**Proves:**
+**Supported claims:**
 
 - Both schedules return correct results under failure.
 - At 4 GiB, Balance and R2CC-AllReduce take 1.51 and 1.38 times the healthy time, against 1.5 and 1.375 from the
@@ -222,7 +222,7 @@ R2CC-AllReduce at 2.56 GB/s. Smaller sizes vary more between runs.
 **Experiment description:** each test runs `all_reduce_perf` over every message size from 8 B to 4 GiB
 (`-b 8 -e 4G -f 2 -g 1 -c 1 -n 5 -w 2 -d float -o sum`) in one scenario, checked with `-c 1` as in 03.
 
-**Proves:**
+**Supported claims:**
 
 - Results are correct at every message size, healthy and under failure.
 - As in the paper's H100 benchmark, Balance is used for small messages and R2CC-AllReduce is faster for large ones.
@@ -244,7 +244,7 @@ From 256 MiB on it is faster than Balance in both passes.
 Balance, R2CC-AllReduce with K = 1, 2, 4, 8 and 16, then healthy and Balance again to show drift. Every time is divided by the mean of the two healthy runs and
 printed next to the prediction of section 1.2.
 
-**Proves:**
+**Supported claims:**
 
 - Every configuration is within 0.74% of the paper's model under this testbed (section 1.2), and R2CC-AllReduce
   approaches the paper's formula (1.30) as K grows.
@@ -276,7 +276,7 @@ the AllReduce is captured again, as R2CC-Balance in run 1 and as R2CC-AllReduce 
 AllReduce outside the capture (`--eager`). Every element of every AllReduce is checked as in 01, outside the timed
 part.
 
-**Proves:**
+**Supported claims:**
 
 - R2CC works with CUDA Graphs, the compatibility experiment added to the appendix during shepherding (Discussion,
   CUDA Graphs paragraph and table), and the times match that table.
@@ -331,7 +331,7 @@ The runs use PyTorch 2.4.1 built against the system NCCL, so each run loads R2CC
 `LD_LIBRARY_PATH`, and WikiText-103 tokenized with the GPT-2 BPE (SHA-256 in `manifest.json`), all under
 `/proj/softmeasure-PG0/r2cc_ae`. The files of every run go to `OUT`, printed at the start.
 
-**Proves:**
+**Supported claims:**
 
 - Without a failure, R2CC is identical to upstream NCCL bit for bit.
 - The AllReduce that the failure hits returns the same bits as upstream NCCL, and training continues without a
