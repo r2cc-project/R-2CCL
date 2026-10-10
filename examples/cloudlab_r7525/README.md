@@ -15,9 +15,6 @@ set up the servers.
 | [08](08.hot_repair_cuda_graph.sh) | cut during the run | the hot repair with the AllReduce replayed from a CUDA graph: time per iteration across the failure and after capturing it again as Balance or R2CC-AllReduce; every element checked as in 01/02 | ~1.5 min | [log](logs/08.hot_repair_cuda_graph.log) |
 | [09](09.training_with_nic_failure.sh) | healthy, or cut at update 400 | GPT-2 (124M) training, 1000 updates: upstream NCCL, R2CC, and R2CC with the failure (then Balance or R2CC-AllReduce), compared bit for bit and by test perplexity | ~45 min | [log](logs/09.training_with_nic_failure.log) |
 
-The run times and the reference logs come from this testbed. The times include start-up and restoring the NIC;
-01–08 together take about 17 minutes.
-
 Failure injection: *Cut during the run* means that the BlueField drops all traffic of the port while an AllReduce is running, and R2CC
 has to detect and repair the failure. *Declared failed* means that the port is never cut; `R2CC_FAILED_NODE` and
 `R2CC_FAILED_HCA` make every rank treat it as failed from the start, which is the state after a repair. *Cut at
