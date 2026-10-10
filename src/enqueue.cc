@@ -1943,16 +1943,11 @@ static ncclResult_t uploadProxyOps(struct ncclComm* comm, struct ncclKernelPlan*
          op, op->opCount, oldId);
     op->opCount = oldId; // Restore for next uploadProxyOps()
 
-    struct ncclProxyOp* opNext = op->enqNext;
-    if (!plan->persistent) {
-      // Non-persistent kernels upload ops only once so can be free'd here.
-      ncclMemoryPoolFree(&comm->memPool_ncclProxyOp, op);
-    }
-    op = opNext;
+    // The ops stay in the plan until reclaimPlan() returns them to the pool. This function runs in a CUDA host
+    // callback while the communicator holds graph plans, and the pool has no lock: freeing here raced with the
+    // allocations of the next plan on the user's thread.
+    op = op->enqNext;
   }
-
-  // Erase proxyOpQueue since all ops were free'd back to mempool.
-  if (!plan->persistent) ncclIntruQueueConstruct(&plan->proxyOpQueue);
 
   for (int c=0; c < MAXCHANNELS; c++) {
     // Advance channel's p2pOpCount by number of p2p's in this plan channel.
@@ -1986,6 +1981,13 @@ static void CUDART_CB hostStreamPlanCallback(void *plan_) {
 
 static ncclResult_t reclaimPlan(struct ncclComm* comm, struct ncclCommCallback* me) {
   struct ncclKernelPlan* plan = (struct ncclKernelPlan*)me; // cast from first member `reclaim`
+  // Runs on the user's thread (callbackQueue), so the proxy ops of every plan are returned to the pool here.
+  struct ncclProxyOp* q = ncclIntruQueueHead(&plan->proxyOpQueue);
+  while (q != nullptr) {
+    struct ncclProxyOp* q1 = q->enqNext;
+    ncclMemoryPoolFree(&comm->memPool_ncclProxyOp, q);
+    q = q1;
+  }
   if (plan->persistent) {
     comm->persistentRefs -= 1;
     if (plan->workStorageType == ncclDevWorkStorageTypePersistent) {
@@ -1993,12 +1995,6 @@ static ncclResult_t reclaimPlan(struct ncclComm* comm, struct ncclCommCallback* 
       CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
       CUDACHECK(cudaFree(plan->workBufPersistent));
       CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
-    }
-    struct ncclProxyOp* q = ncclIntruQueueHead(&plan->proxyOpQueue);
-    while (q != nullptr) {
-      struct ncclProxyOp* q1 = q->enqNext;
-      ncclMemoryPoolFree(&comm->memPool_ncclProxyOp, q);
-      q = q1;
     }
     struct ncclTaskColl* ct = ncclIntruQueueHead(&plan->collTaskQueue);
     while (ct != nullptr) {
