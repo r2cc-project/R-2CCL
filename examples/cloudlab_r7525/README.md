@@ -20,20 +20,20 @@ upstream NCCL. The document contains:
 
 Bringing the machines up is described separately in [r7525_setup.md](r7525_setup.md).
 
-| Test | node-1's `mlx5_2` | What it shows | Run time | Reference log (three servers, NICs at 10 Gb/s) |
+| Test | node-1's `mlx5_2` | What it shows | Run time | Log |
 |---|---|---|---|---|
-| `01.hot_repair_to_balance.sh` | cut during the run | real NIC failure during a 4 GiB AllReduce → hot repair → **R2CC-Balance** | ~40 s | [logs/01.hot_repair_to_balance.log](logs/01.hot_repair_to_balance.log) |
-| `02.hot_repair_to_r2cc_allreduce.sh` | cut during the run | same failure → hot repair → **R2CC-AllReduce** | ~40 s | [logs/02.hot_repair_to_r2cc_allreduce.log](logs/02.hot_repair_to_r2cc_allreduce.log) |
-| `03.nccl_tests_compare_all.sh` | healthy, then declared failed | nccl-tests, 256 MiB–4 GiB, healthy vs. Balance vs. R2CC-AllReduce, one table | ~3 min | [logs/03.nccl_tests_compare_all.log](logs/03.nccl_tests_compare_all.log) |
-| `04.nccl_tests_baseline_healthy.sh` | healthy | full nccl-tests sweep (8 B–4 GiB), R2CC switched off | ~1.5 min | [logs/04.nccl_tests_baseline_healthy.log](logs/04.nccl_tests_baseline_healthy.log) |
-| `05.nccl_tests_balance_unhealthy.sh` | declared failed | full sweep, R2CC-Balance | ~2 min | [logs/05.nccl_tests_balance_unhealthy.log](logs/05.nccl_tests_balance_unhealthy.log) |
-| `06.nccl_tests_r2cc_allreduce_unhealthy.sh` | declared failed | full sweep, R2CC-AllReduce | ~2 min | [logs/06.nccl_tests_r2cc_allreduce_unhealthy.log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
-| `07.nccl_tests_r2cc_allreduce_k_sweep.sh` | healthy, then declared failed | 4 GiB, R2CC-AllReduce with K = 1–16 pipeline chunks against the model | ~7 min | [logs/07.nccl_tests_r2cc_allreduce_k_sweep.log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log) |
-| `08.hot_repair_cuda_graph.sh` | cut during the run | the hot repair with the AllReduce replayed from a CUDA graph: time per iteration across the failure and after capturing it again as Balance or R2CC-AllReduce; every element checked as in 01/02 | ~1.5 min | [logs/08.hot_repair_cuda_graph.log](logs/08.hot_repair_cuda_graph.log) |
-| `09.training_with_nic_failure.sh` | healthy, or cut at update 400 | GPT-2 (124M) training, 1000 updates: upstream NCCL, R2CC, and R2CC with the failure (then Balance or R2CC-AllReduce), compared bit for bit and by test perplexity | ~45 min | [logs/09.training_with_nic_failure.log](logs/09.training_with_nic_failure.log) |
+| [01](01.hot_repair_to_balance.sh) | cut during the run | real NIC failure during a 4 GiB AllReduce → hot repair → **R2CC-Balance** | ~40 s | [log](logs/01.hot_repair_to_balance.log) |
+| [02](02.hot_repair_to_r2cc_allreduce.sh) | cut during the run | same failure → hot repair → **R2CC-AllReduce** | ~40 s | [log](logs/02.hot_repair_to_r2cc_allreduce.log) |
+| [03](03.nccl_tests_compare_all.sh) | healthy, then declared failed | nccl-tests, 256 MiB–4 GiB, healthy vs. Balance vs. R2CC-AllReduce, one table | ~3 min | [log](logs/03.nccl_tests_compare_all.log) |
+| [04](04.nccl_tests_baseline_healthy.sh) | healthy | full nccl-tests sweep (8 B–4 GiB), R2CC switched off | ~1.5 min | [log](logs/04.nccl_tests_baseline_healthy.log) |
+| [05](05.nccl_tests_balance_unhealthy.sh) | declared failed | full sweep, R2CC-Balance | ~2 min | [log](logs/05.nccl_tests_balance_unhealthy.log) |
+| [06](06.nccl_tests_r2cc_allreduce_unhealthy.sh) | declared failed | full sweep, R2CC-AllReduce | ~2 min | [log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
+| [07](07.nccl_tests_r2cc_allreduce_k_sweep.sh) | healthy, then declared failed | 4 GiB, R2CC-AllReduce with K = 1–16 pipeline chunks against the model | ~7 min | [log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log) |
+| [08](08.hot_repair_cuda_graph.sh) | cut during the run | the hot repair with the AllReduce replayed from a CUDA graph: time per iteration across the failure and after capturing it again as Balance or R2CC-AllReduce; every element checked as in 01/02 | ~1.5 min | [log](logs/08.hot_repair_cuda_graph.log) |
+| [09](09.training_with_nic_failure.sh) | healthy, or cut at update 400 | GPT-2 (124M) training, 1000 updates: upstream NCCL, R2CC, and R2CC with the failure (then Balance or R2CC-AllReduce), compared bit for bit and by test perplexity | ~45 min | [log](logs/09.training_with_nic_failure.log) |
 
-Run times were measured on this testbed and include start-up and restoring the NIC; 01–08 together take about
-17 minutes.
+The run times and the reference logs come from this testbed, three servers with every NIC at 10 Gb/s. The times
+include start-up and restoring the NIC; 01–08 together take about 17 minutes.
 
 *Cut during the run*: the BlueField starts dropping all traffic of the port while an AllReduce is running, and
 R2CC has to detect and repair the failure. *Declared failed*: the port is never cut; `R2CC_FAILED_NODE` and
