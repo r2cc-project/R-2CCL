@@ -107,8 +107,8 @@ transfers to the backup connection, finishes the AllReduce and then runs R2CC-Ba
 - After the repair, R2CC-Balance runs at 1.49 times the healthy time, against the paper's prediction
   1/(1−X) = 1.5.
 - This is the lossless live migration of the paper's section "Failure Detection and Mitigation", with the same trend
-  as the paper's failover microbenchmark (Evaluation, figure "AllReduce bandwidth at message size 1GB with R2CC
-  pipeline for failover and restore"), a dip in the iteration of the repair followed by a steady, lower bandwidth.
+  as the paper's failover microbenchmark (Evaluation, the figure of AllReduce bandwidth at 1 GB with the R2CC
+  pipeline for failover), a dip in the iteration of the repair followed by a steady, lower bandwidth.
 
 **Evidence:**
 
