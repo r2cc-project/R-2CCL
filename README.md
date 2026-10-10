@@ -91,9 +91,9 @@ contribution is then combined with the second partition's partial result and bro
 
 | Capability / integration | Evidence | Tested configuration |
 |---|---|---|
-| nccl-tests | [Tests 03–07](./examples/cloudlab_r7525/README.md#33-test-03--nccl-tests-correctness-and-a-side-by-side-table) | AllReduce correctness and performance, 8 B–4 GiB, in-place and out-of-place |
-| CUDA Graphs | [Test 08](./examples/cloudlab_r7525/README.md#36-test-08--cuda-graphs) | Correct replay through failure; re-capture enables optimized scheduling\* |
-| PyTorch DDP | [Test 09](./examples/cloudlab_r7525/README.md#37-test-09--training-through-a-nic-failure) | GPT-2 training through a persistent NIC failure, with gradient, parameter, loss, and perplexity comparisons |
+| nccl-tests | [Tests&nbsp;03&#8288;–&#8288;07](./examples/cloudlab_r7525/README.md#33-test-03--nccl-tests-correctness-and-a-side-by-side-table) | AllReduce correctness and performance, 8 B–4 GiB, in-place and out-of-place |
+| CUDA Graphs | [Test&nbsp;08](./examples/cloudlab_r7525/README.md#36-test-08--cuda-graphs) | Correct replay through failure; re-capture enables optimized scheduling\* |
+| PyTorch DDP | [Test&nbsp;09](./examples/cloudlab_r7525/README.md#37-test-09--training-through-a-nic-failure) | GPT-2 training through a persistent NIC failure, with gradient, parameter, loss, and perplexity comparisons |
 | Megatron-LM | [Paper](https://arxiv.org/abs/2512.25059) | Data-parallel training (2.7B) and tensor-plus-pipeline-parallel training (13B) |
 | vLLM | [Paper](https://arxiv.org/abs/2512.25059) | Inference under NIC failure, evaluated using TTFT and TPOT |
 | AllGather, ReduceScatter, SendRecv | [Paper](https://arxiv.org/abs/2512.25059) | R2CC-Balance retains 83–90% of failure-free throughput for large messages |
