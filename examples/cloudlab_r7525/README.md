@@ -7,16 +7,16 @@ set up the servers.
 |---|---|---|---|---|
 | [01](01.hot_repair_to_balance.sh) | cut during the run | real NIC failure during a 4 GiB AllReduce → hot repair → **R2CC-Balance** | ~40 s | [log](logs/01.hot_repair_to_balance.log) |
 | [02](02.hot_repair_to_r2cc_allreduce.sh) | cut during the run | same failure → hot repair → **R2CC-AllReduce** | ~40 s | [log](logs/02.hot_repair_to_r2cc_allreduce.log) |
-| [03](03.nccl_tests_compare_all.sh) | healthy, then declared failed | nccl-tests, 256 MiB–4 GiB, healthy vs. Balance vs. R2CC-AllReduce, one table | ~3 min | [log](logs/03.nccl_tests_compare_all.log) |
+| [03](03.nccl_tests_compare_all.sh) | healthy, then under failure | nccl-tests, 256 MiB–4 GiB, healthy vs. Balance vs. R2CC-AllReduce, one table | ~3 min | [log](logs/03.nccl_tests_compare_all.log) |
 | [04](04.nccl_tests_baseline_healthy.sh) | healthy | nccl-tests (message sizes 8 B–4 GiB), R2CC switched off | ~1.5 min | [log](logs/04.nccl_tests_baseline_healthy.log) |
-| [05](05.nccl_tests_balance_unhealthy.sh) | declared failed | nccl-tests (message sizes 8 B–4 GiB), R2CC-Balance | ~2 min | [log](logs/05.nccl_tests_balance_unhealthy.log) |
-| [06](06.nccl_tests_r2cc_allreduce_unhealthy.sh) | declared failed | nccl-tests (message sizes 8 B–4 GiB), R2CC-AllReduce | ~2 min | [log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
-| [07](07.nccl_tests_r2cc_allreduce_k_sweep.sh) | healthy, then declared failed | 4 GiB, R2CC-AllReduce with K = 1–16 pipeline chunks against the paper's formula | ~7 min | [log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log) |
+| [05](05.nccl_tests_balance_unhealthy.sh) | under failure | nccl-tests (message sizes 8 B–4 GiB), R2CC-Balance | ~2 min | [log](logs/05.nccl_tests_balance_unhealthy.log) |
+| [06](06.nccl_tests_r2cc_allreduce_unhealthy.sh) | under failure | nccl-tests (message sizes 8 B–4 GiB), R2CC-AllReduce | ~2 min | [log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
+| [07](07.nccl_tests_r2cc_allreduce_k_sweep.sh) | healthy, then under failure | 4 GiB, R2CC-AllReduce with K = 1–16 pipeline chunks against the paper's formula | ~7 min | [log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log) |
 | [08](08.hot_repair_cuda_graph.sh) | cut during the run | the hot repair with the AllReduce replayed from a CUDA graph: time per iteration across the failure and after capturing it again as Balance or R2CC-AllReduce; every element checked as in 01/02 | ~1.5 min | [log](logs/08.hot_repair_cuda_graph.log) |
 | [09](09.training_with_nic_failure.sh) | healthy, or cut at update 400 | GPT-2 (124M) training, 1000 updates: upstream NCCL, R2CC, and R2CC with the failure (then Balance or R2CC-AllReduce), compared bit for bit and by test perplexity | ~45 min | [log](logs/09.training_with_nic_failure.log) |
 
 Failure injection: *Cut during the run* means that the BlueField drops all traffic of the port while an AllReduce is running, and R2CC
-has to detect and repair the failure. *Declared failed* means that the port is never cut; `R2CC_FAILED_NODE` and
+has to detect and repair the failure. *Under failure* means that the port is never cut; `R2CC_FAILED_NODE` and
 `R2CC_FAILED_HCA` make every rank treat it as failed from the start, which is the state after a repair. *Cut at
 update 400* is the same cut, made by the training at update 400 and left in place.
 
@@ -165,7 +165,7 @@ carry the tail AllReduce on their otherwise idle `mlx5_2`.
 ### 3.3 Test 03 — nccl-tests: correctness and a side-by-side table
 
 `all_reduce_perf` runs three times with the same arguments, healthy with R2CC switched off (`R2CC_MODE=0`), then
-R2CC-Balance (`R2CC_MODE=2`) and R2CC-AllReduce (`R2CC_MODE=3`) with `mlx5_2` declared failed. With `-c 1`,
+R2CC-Balance (`R2CC_MODE=2`) and R2CC-AllReduce (`R2CC_MODE=3`) with `mlx5_2` under failure. With `-c 1`,
 nccl-tests checks one more AllReduce of every size element by element (`#wrong`); the timed iterations are not
 checked. From [logs/03.nccl_tests_compare_all.log](logs/03.nccl_tests_compare_all.log):
 
@@ -205,7 +205,7 @@ R2CC_AR_STAGE2_CHUNKS=8 ./06.nccl_tests_r2cc_allreduce_unhealthy.sh -b 4G -e 4G 
 
 ### 3.5 Test 07 — the pipeline depth K of R2CC-AllReduce against the paper's formula
 
-`all_reduce_perf` at 4 GiB with `mlx5_2` declared failed, in nine configurations, healthy, Balance, R2CC-AllReduce
+`all_reduce_perf` at 4 GiB with `mlx5_2` under failure, in nine configurations, healthy, Balance, R2CC-AllReduce
 with K = 1, 2, 4, 8 and 16, then healthy and Balance again to show drift. Every time is divided by the mean of the
 two healthy runs and printed next to the formula of section 1.2.
 From [logs/07.nccl_tests_r2cc_allreduce_k_sweep.log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log):
