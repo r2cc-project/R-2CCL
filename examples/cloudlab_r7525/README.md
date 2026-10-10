@@ -1,5 +1,10 @@
 # R2CC experiments on CloudLab r7525
 
+1. [Testbed](#1-testbed) — the testbed setting and what the paper's formulas predict under this testbed.
+2. [Run the tests](#2-run-the-tests) — the path and the commands.
+3. [Results and analysis](#3-results-and-analysis) — for each experiment, its description, its relation to the
+   paper, the results and their analysis.
+
 Run the scripts in this directory from `node-1`, one at a time. [r7525_setup.md](r7525_setup.md) describes how to
 set up the servers.
 
@@ -379,20 +384,4 @@ NCCL 2.23.4, no failure      76.085   --
 R2CC, no failure             76.085   0.000%
 R2CC-Balance, failure        76.085   +0.008%
 R2CC-AllReduce, failure      76.086   +0.023%
-```
-
-## 4. Directory layout
-
-```
-0[1-9].*.sh     the nine tests
-common.sh       shared settings: mpirun line, failure model, check_idle, NIC restore, nccl-tests runner, table
-nodes.sh        the servers of the experiment (node-1 + REMOTE_HOSTS) and their addresses
-hot_repair/     test_hot_repair.cc + run_hot_repair.sh (01/02), test_hot_repair_graph.cc (08), test_common.h, binaries
-training/       train.py (one training run of 09), compare.py (its table and checks)
-nic/            disconnect_nic1.sh / connect_nic1.sh (OVS drop rule), shape_nics.sh (NIC rate limits), setup checks
-xml/            NCCL topology dumper and the equal-speed topo.xml
-setup/          02.setup_network_and_nic.sh, the Phase 2 script of r7525_setup.md
-tools/          kill.sh, sync.sh, stress_test.sh, build_nccl_tests.sh
-logs/           terminal output of one run of each test
-r7525_setup.md  how to set up the r7525 servers
 ```
