@@ -6,7 +6,17 @@
 Replayed graph (4 GiB AllReduce)    Time / iter   Re-capture overhead*
 Pre-failure graph, healthy               2.03 s   --
 Pre-failure graph, HotRepair             4.07 s   --
-Re-captured as R2CC-Balance              3.06 s   1.0 ms
+Re-captured as R2CC-Balance              3.04 s   1.7 ms
 Re-captured as R2CC-AllReduce            2.79 s   0.33 s
 * the time of the iteration that performs the re-capture, including the eager collective that R2CC-AllReduce
   needs to create its sub-communicators, minus the time of an iteration replayed from the new graph
+
+run 1/2, re-captured as R2CC-Balance:
+  Verification: all 1073741824 elements of each of the 10 iterations checked on all 6 ranks: 0 wrong
+  Failure evidence: mlx5_2 cut during iteration 3 (847 of 2312 MB received before the cut; command ran 4.00-4.83 s, iteration 4.11-7.43 s), no traffic on it in iterations 4-10, all of them completed
+  TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one the NIC failure hit.
+run 2/2, re-captured as R2CC-AllReduce:
+  Verification: all 1073741824 elements of each of the 10 iterations and of the AllReduce before re-capture checked on all 6 ranks: 0 wrong
+  Failure evidence: mlx5_2 cut during iteration 3 (674 of 2312 MB received before the cut; command ran 4.00-4.68 s, iteration 4.11-7.58 s), no traffic on it in iterations 4-10, all of them completed
+  TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one the NIC failure hit.
+[result] exit=0 PASS

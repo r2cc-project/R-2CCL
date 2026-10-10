@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# Time per iteration of the hot repair with the AllReduce captured in a CUDA graph (README.md, section 4). Two runs
-# of hot_repair/graph_timing, each 10 x 4 GiB with node-1's mlx5_2 cut 4 s after the start, i.e. during iteration 3.
-# The graph captured at the start is replayed in every iteration, so the hot repair happens while it is replayed;
-# after iteration 6 the AllReduce is captured again:
+# The hot repair of 01/02 with the AllReduce captured in a CUDA graph (README.md, section 4). Two runs of
+# hot_repair/test_hot_repair_graph, each 10 x 4 GiB with node-1's mlx5_2 cut 4 s after the start, i.e. during
+# iteration 3. The graph captured at the start is replayed in every iteration, so the hot repair happens while it is
+# replayed; after iteration 6 the AllReduce is captured again:
 #   run 1   as R2CC-Balance (R2CC_AR_AFTER_REPAIR=2)
 #   run 2   as R2CC-AllReduce (R2CC_AR_AFTER_REPAIR=3); one AllReduce outside the capture first creates its
 #           sub-communicators
-#   The script prints one table: the time per iteration of the graph captured before the failure (healthy, then
-#   after the hot repair) and of the graph captured again, and the re-capture overhead: the time of the iteration
-#   that performs the re-capture, including the eager collective that R2CC-AllReduce needs to create its
-#   sub-communicators, minus the time of an iteration replayed from the new graph. A run that fails, or does not
-#   finish within RUN_TIMEOUT seconds (default 120), is stopped, mlx5_2 is restored, and its complete output is
-#   kept (the path is printed). About 1.5 minutes.
+#   Every iteration gets new inputs, and every element of every AllReduce output is checked on every rank, as in
+#   01/02. The script prints one table: the time per iteration of the graph captured before the failure (healthy,
+#   then after the hot repair) and of the graph captured again, and the re-capture overhead: the time of the
+#   iteration that performs the re-capture, including the eager collective that R2CC-AllReduce needs to create its
+#   sub-communicators, minus the time of an iteration replayed from the new graph. Below it, the result of the check
+#   and the evidence that the cut hit a running AllReduce, for each run. The exit code is that of 01/02 (section 2):
+#   0 when both runs pass. A run that fails, or does not finish within RUN_TIMEOUT seconds (default 120), is
+#   stopped, mlx5_2 is restored, and its complete output is kept (the path is printed). About 1.5 minutes.
 #
 # Usage: ./08.hot_repair_cuda_graph.sh
+#   R2CC_TEST_CORRUPT=<n>[,nan] tests the check, as in 01/02 (README.md, section 3.1).
 #   Nothing is written to disk by default; SAVE_LOG=1 also saves the terminal output to logs/local/.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
@@ -23,7 +26,7 @@ ensure_nic_connected
 
 # Stops what a timed-out run left behind on every node and restores mlx5_2.
 stop_run() {
-  local pat='/[g]raph_timing|[m]pirun -np|[o]rted -mca' h
+  local pat='/[t]est_hot_repair_graph|[m]pirun -np|[o]rted -mca' h
   pkill -9 -f "${pat}" || true
   for h in "${REMOTE_HOST_LIST[@]}"; do ssh -o BatchMode=yes "${h}" "pkill -9 -f '${pat}' || true" || true; done
   ./nic/connect_nic1.sh > /dev/null 2>&1 || true
@@ -39,20 +42,25 @@ main() {
     ping -c 1 -W 1 "${ip3}" > /dev/null 2>&1 || true
   done
 
-  run() {  # run <label> <R2CC_AR_AFTER_REPAIR> [graph_timing args]; the complete output goes to ${out}/<run number>
+  run() {  # run <label> <R2CC_AR_AFTER_REPAIR> [test_hot_repair_graph args]; the output goes to ${out}/<run number>
     local label="$1" after="$2" r; shift 2
+    local -a test=()
+    [[ -v R2CC_TEST_CORRUPT ]] && test=(-x R2CC_TEST_CORRUPT)
     nrun=$((nrun + 1))
     echo "[08] ${label}"
     set +e
     timeout -k 10 "${RUN_TIMEOUT:-120}" "${MPIRUN_BASE[@]}" -x "NCCL_DEBUG=${NCCL_DEBUG:-WARN}" \
       -x NCCL_R2CC_FAILOVER_TIMEOUT_MS=5000 -x NCCL_IB_TIMEOUT=16 -x NCCL_IB_RETRY_CNT=1 \
-      -x R2CC_FAILED_NODE -x R2CC_FAILED_HCA -x "R2CC_AR_AFTER_REPAIR=${after}" \
-      ./hot_repair/graph_timing "$@" > "${out}/${nrun}" 2>&1
+      -x R2CC_FAILED_NODE -x R2CC_FAILED_HCA -x "R2CC_AR_AFTER_REPAIR=${after}" "${test[@]}" \
+      ./hot_repair/test_hot_repair_graph "$@" > "${out}/${nrun}" 2>&1
     r=$?
     set -e
-    if [[ ${r} -eq 124 || ${r} -eq 137 ]]; then stop_run; fi
+    if [[ ${r} -ne 0 && ${r} -ne 2 && ${r} -ne 3 ]]; then stop_run; fi
     rcs+="${rcs:+,}${r}"
-    [[ ${r} -eq 0 ]] || rc=1
+    # 2 (wrong results) outranks an abort, which outranks 3 (the cut did not hit a running AllReduce)
+    if [[ ${r} -eq 2 ]]; then rc=2
+    elif [[ ${r} -ne 0 && ${r} -ne 3 && ${rc} -ne 2 ]]; then rc=1
+    elif [[ ${r} -eq 3 && ${rc} -eq 0 ]]; then rc=3; fi
   }
   run "run 1/2: re-captured as R2CC-Balance after iteration 6" 2 --recapture-at 6
   run "run 2/2: re-captured as R2CC-AllReduce after iteration 6" 3 --recapture-at 6 --eager
@@ -73,6 +81,8 @@ main() {
     }
     function failed(f) {
       return RC[f] == 124 || RC[f] == 137 ? "not finished within " limit " s; stopped, mlx5_2 restored" : \
+             RC[f] == 2 ? "wrong results (exit 2)" : \
+             RC[f] == 3 ? "the cut did not hit a running AllReduce (exit 3); run again" : \
              RC[f] != 0 ? "failed (exit " RC[f] ")" : "mlx5_2 was not cut during the run"
     }
     function overhead(f,   o) {   # re-capture iteration (eager collective or first replay, plus capture) minus a replay
@@ -87,6 +97,7 @@ main() {
       if (match($0, /instantiate [0-9.]+ ms/)) instms[f] = substr($0, RSTART + 12, RLENGTH - 15) + 0
     }
     /^\[Rank 0\] Eager AllReduce/ { if (match($0, /took [0-9]+ ms/)) eagerms[f] = substr($0, RSTART + 5, RLENGTH - 8) + 0 }
+    /^\[Rank 0\] (Verification|Failure evidence|TEST PASS|TEST FAIL)/ { sub(/^\[Rank 0\] /, ""); check[f] = check[f] "  " $0 "\n" }
     /^Iter +Time\(ms\)/ { tab[f] = 1; next }
     tab[f] && /^[0-9]+ +[0-9]+ / { i = $1 + 0; t[f, i] = $2; r2[f, i] = $4; n[f] = i; next }
     { tab[f] = 0 }
@@ -109,7 +120,16 @@ main() {
       else printf "%-34s %s\n", "Re-captured as R2CC-AllReduce", failed(2)
       print "* the time of the iteration that performs the re-capture, including the eager collective that R2CC-AllReduce"
       print "  needs to create its sub-communicators, minus the time of an iteration replayed from the new graph"
+      print ""
+      label[1] = "run 1/2, re-captured as R2CC-Balance:"; label[2] = "run 2/2, re-captured as R2CC-AllReduce:"
+      for (f = 1; f <= 2; f++) printf "%s\n%s", label[f], (check[f] != "" ? check[f] : "  no result (exit " RC[f] ")\n")
     }' "${out}/1" "${out}/2"
+  case "${rc}" in
+    0) echo "[result] exit=0 PASS" ;;
+    2) echo "[result] exit=2 FAIL: wrong results" ;;
+    3) echo "[result] exit=3 FAIL: the NIC failure did not hit a running AllReduce (see 'Failure evidence'); run again" ;;
+    *) echo "[result] exit=${rc} FAIL: aborted (CUDA/NCCL/MPI error, crash, kill or timeout)" ;;
+  esac
   if [[ ${rc} -eq 0 ]]; then rm -rf "${out}"; else echo "complete output of the runs: ${out}"; fi
   return "${rc}"
 }

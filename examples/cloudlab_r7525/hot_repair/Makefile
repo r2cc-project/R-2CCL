@@ -1,7 +1,7 @@
 # Builds the hot-repair test programs against this repository's NCCL build:
-# test_hot_repair (01/02) and graph_timing (08).
+# test_hot_repair (01/02) and test_hot_repair_graph (08), both with the checks of test_common.h.
 NVCC      := nvcc
-TARGETS   := test_hot_repair graph_timing
+TARGETS   := test_hot_repair test_hot_repair_graph
 
 NCCL_HOME ?= $(abspath ../../../build)
 MPI_HOME  ?= /mydata/openMpi
@@ -13,10 +13,10 @@ LIBS       := -L$(NCCL_HOME)/lib -L$(MPI_HOME)/lib -L$(CUDA_HOME)/lib64 -lnccl -
 
 all: $(TARGETS)
 
-test_hot_repair: test_hot_repair.cc
+test_hot_repair: test_hot_repair.cc test_common.h
 	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) -o $@ $< $(LIBS)
 
-graph_timing: graph_timing.cc
+test_hot_repair_graph: test_hot_repair_graph.cc test_common.h
 	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) -o $@ $< $(LIBS)
 
 clean:

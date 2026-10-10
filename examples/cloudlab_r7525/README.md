@@ -29,7 +29,7 @@ Bringing the machines up is described separately in [r7525_setup.md](r7525_setup
 | `05.nccl_tests_balance_unhealthy.sh` | declared failed | full sweep, R2CC-Balance | ~2 min | [logs/05.nccl_tests_balance_unhealthy.log](logs/05.nccl_tests_balance_unhealthy.log) |
 | `06.nccl_tests_r2cc_allreduce_unhealthy.sh` | declared failed | full sweep, R2CC-AllReduce | ~2 min | [logs/06.nccl_tests_r2cc_allreduce_unhealthy.log](logs/06.nccl_tests_r2cc_allreduce_unhealthy.log) |
 | `07.nccl_tests_r2cc_allreduce_k_sweep.sh` | healthy, then declared failed | 4 GiB, R2CC-AllReduce with K = 1–16 pipeline chunks against the model | ~7 min | [logs/07.nccl_tests_r2cc_allreduce_k_sweep.log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log) |
-| `08.hot_repair_cuda_graph.sh` | cut during the run | time per iteration of the hot repair with the AllReduce replayed from a CUDA graph: across the failure, and after capturing it again as Balance or R2CC-AllReduce | ~1.5 min | [logs/08.hot_repair_cuda_graph.log](logs/08.hot_repair_cuda_graph.log) |
+| `08.hot_repair_cuda_graph.sh` | cut during the run | the hot repair with the AllReduce replayed from a CUDA graph: time per iteration across the failure and after capturing it again as Balance or R2CC-AllReduce; every element checked as in 01/02 | ~1.5 min | [logs/08.hot_repair_cuda_graph.log](logs/08.hot_repair_cuda_graph.log) |
 | `09.training_with_nic_failure.sh` | healthy, or cut at update 400 | GPT-2 (124M) training, 1000 updates: upstream NCCL, R2CC, and R2CC with the failure (then Balance or R2CC-AllReduce), compared bit for bit and by test perplexity | ~45 min | [logs/09.training_with_nic_failure.log](logs/09.training_with_nic_failure.log) |
 
 Run times were measured on this testbed and include start-up and restoring the NIC; 01–08 together take about
@@ -143,9 +143,9 @@ AllReduce of all ranks (`R2CC_AR_SCHEDULE=2`).
 - The scripts only print to the terminal; nothing is written to disk by default, so a local run can never
   overwrite the nine reference logs in `logs/`. `SAVE_LOG=1 ./04.nccl_tests_baseline_healthy.sh` additionally
   saves the complete output to `logs/local/<NN>.<name>.log` (git-ignored; `LOG_DIR` changes the directory).
-- Every script returns a non-zero exit code when its run fails. For 01 and 02 this includes a wrong element and
-  a cut that did not hit a running AllReduce (section 3.1); both end with a `[result]` line. 08 marks a failed
-  run in its table. 09 also fails when one of its checks does not hold (section 5).
+- Every script returns a non-zero exit code when its run fails. For 01, 02 and 08 this includes a wrong element
+  and a cut that did not hit a running AllReduce (section 3.1); all three end with a `[result]` line. 09 also fails
+  when one of its checks does not hold (section 5).
 
 In every scenario the failed NIC is **node-1's `mlx5_2`**. Tests 01, 02, 08 and 09 cut it during the run on the
 BlueField (`nic/disconnect_nic1.sh` installs an OVS drop rule for the port, `nic/connect_nic1.sh` removes it);
@@ -183,7 +183,8 @@ How the run is checked:
   script passes it on and prints it in the last line.
 - The checker can be tested: `R2CC_TEST_CORRUPT=3 ./01.hot_repair_to_balance.sh` adds one to one output element
   of rank 0 in iteration 3 before the check, `R2CC_TEST_CORRUPT=3,nan` writes NaN there. Both runs end in
-  `TEST FAIL: Verification failed ...` with exit code 2.
+  `TEST FAIL: Verification failed ...` with exit code 2. The same works for 02 and 08, which use the same check
+  (`hot_repair/test_common.h`).
 
 From [logs/01.hot_repair_to_balance.log](logs/01.hot_repair_to_balance.log):
 
@@ -348,24 +349,41 @@ balance_2              -     3041309 /  3040126    1.499 / 1.499  1.5000    -0.0
 
 ## 4. CUDA graphs
 
-`08.hot_repair_cuda_graph.sh` measures the time per iteration of the hot repair when the AllReduce is captured in a
-CUDA graph. It runs `hot_repair/graph_timing` twice, each with the real failure of 01/02 in iteration 3. The graph
-captured at the start is replayed in every iteration, so the hot repair happens while it is replayed; after
-iteration 6 the AllReduce is captured again, as R2CC-Balance in the first run and as R2CC-AllReduce
-(`R2CC_AR_AFTER_REPAIR=3`) in the second, where one AllReduce outside the capture first creates its
-sub-communicators (`graph_timing --eager`). From [logs/08.hot_repair_cuda_graph.log](logs/08.hot_repair_cuda_graph.log)
-(the pre-failure rows are iteration 2 and iterations 4–6 of both runs, the re-captured rows iterations 7–10):
+`08.hot_repair_cuda_graph.sh` runs the hot repair of 01/02 with the AllReduce captured in a CUDA graph. It runs
+`hot_repair/test_hot_repair_graph` twice, each with the real failure of 01/02 in iteration 3. The graph captured at
+the start is replayed in every iteration, so the hot repair happens while it is replayed; after iteration 6 the
+AllReduce is captured again, as R2CC-Balance in the first run and as R2CC-AllReduce (`R2CC_AR_AFTER_REPAIR=3`) in
+the second, where one AllReduce outside the capture first creates its sub-communicators (`--eager`). Every
+iteration gets new inputs, and every element of every AllReduce output, including the one outside the capture, is
+checked on every rank as in 01/02 (section 3.1), outside the timed part. The table gives the time per iteration and
+the re-capture overhead (the pre-failure rows are iteration 2 and iterations 4–6 of both runs, the re-captured rows
+iterations 7–10); below it come the check and the failure evidence of each run. From
+[logs/08.hot_repair_cuda_graph.log](logs/08.hot_repair_cuda_graph.log):
 
 ```
 ===== CUDA Graphs: 4 GiB AllReduce on all GPUs, mlx5_2 of node-1 cut during the run =====
 Replayed graph (4 GiB AllReduce)    Time / iter   Re-capture overhead*
 Pre-failure graph, healthy               2.03 s   --
 Pre-failure graph, HotRepair             4.07 s   --
-Re-captured as R2CC-Balance              3.06 s   1.0 ms
+Re-captured as R2CC-Balance              3.04 s   1.7 ms
 Re-captured as R2CC-AllReduce            2.79 s   0.33 s
 * the time of the iteration that performs the re-capture, including the eager collective that R2CC-AllReduce
   needs to create its sub-communicators, minus the time of an iteration replayed from the new graph
+
+run 1/2, re-captured as R2CC-Balance:
+  Verification: all 1073741824 elements of each of the 10 iterations checked on all 6 ranks: 0 wrong
+  Failure evidence: mlx5_2 cut during iteration 3 (847 of 2312 MB received before the cut; command ran 4.00-4.83 s, iteration 4.11-7.43 s), no traffic on it in iterations 4-10, all of them completed
+  TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one the NIC failure hit.
+run 2/2, re-captured as R2CC-AllReduce:
+  Verification: all 1073741824 elements of each of the 10 iterations and of the AllReduce before re-capture checked on all 6 ranks: 0 wrong
+  Failure evidence: mlx5_2 cut during iteration 3 (674 of 2312 MB received before the cut; command ran 4.00-4.68 s, iteration 4.11-7.58 s), no traffic on it in iterations 4-10, all of them completed
+  TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one the NIC failure hit.
+[result] exit=0 PASS
 ```
+
+- **Every element of every AllReduce is correct in both runs**: in the iteration the failure hits, in the replays
+  of the pre-failure graph over the backup connection, in the AllReduce outside the capture and in the replays of
+  the re-captured graphs.
 
 - **The graph captured before the failure keeps replaying without a new capture.** The hot repair only changes
   which connection the CPU proxy uses, and NCCL drives the proxy again on every replay, so the graph runs on
@@ -373,7 +391,7 @@ Re-captured as R2CC-AllReduce            2.79 s   0.33 s
   the backup connection carries the whole share of `mlx5_2` over `mlx5_0`, hence 4.07 s.
 - **R2CC-Balance and R2CC-AllReduce are decided when a collective is enqueued**, so they apply to graphs captured
   after the repair, and the replayed graphs take about the same time as without graphs (01 and 02: 3.04 s and
-  2.80 s). Capturing and instantiating the AllReduce again costs 1.0 ms for Balance; this capture is the first
+  2.80 s). Capturing and instantiating the AllReduce again costs 1.7 ms for Balance; this capture is the first
   AllReduce call after the repair and also performs the repair's state exchange.
 - **R2CC-AllReduce creates its two sub-communicators in its first eligible AllReduce, which cannot be captured.**
   Its re-capture overhead, 0.33 s, is almost entirely that one AllReduce outside the capture; a captured AllReduce
@@ -513,11 +531,12 @@ tables again.
 05.nccl_tests_balance_unhealthy.sh         R2CC-Balance with mlx5_2 failed
 06.nccl_tests_r2cc_allreduce_unhealthy.sh  R2CC-AllReduce with mlx5_2 failed
 07.nccl_tests_r2cc_allreduce_k_sweep.sh    R2CC-AllReduce with K = 1-16 Stage-2 chunks vs. the model
-08.hot_repair_cuda_graph.sh                times of a real disconnect with the AllReduce in a CUDA graph (replay, re-capture)
+08.hot_repair_cuda_graph.sh                real disconnect with the AllReduce in a CUDA graph (replay, re-capture): times and checks
 09.training_with_nic_failure.sh            GPT-2 training: upstream NCCL / R2CC, without and with a real disconnect
 common.sh                                  shared settings: mpirun line, failure model, check_idle, NIC restore, nccl-tests runner, table
 nodes.sh                                   the servers of the experiment (node-1 + REMOTE_HOSTS) and their addresses
-hot_repair/                                test_hot_repair.cc + run_hot_repair.sh (01/02), graph_timing.cc (08), Makefile, binaries
+hot_repair/                                test_hot_repair.cc + run_hot_repair.sh (01/02), test_hot_repair_graph.cc (08),
+                                           test_common.h (the check both use), Makefile, binaries
 training/                                  train.py (one training run of 09), compare.py (its table and checks)
 nic/                                       SmartNIC helpers: disconnect_nic1.sh / connect_nic1.sh (OVS drop rule),
                                            shape_nics.sh (NIC rate limits), check_ip.sh, setup and OVS checks

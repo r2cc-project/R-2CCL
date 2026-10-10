@@ -1,76 +1,14 @@
-#include <stdio.h>
-#include <stdlib.h>
+// The hot-repair test of 01/02 (run_hot_repair.sh): 10 AllReduces of 4 GiB floats on all ranks, node-1's mlx5_2 cut on
+// the SmartNIC R2CC_AR_START_DISCONNECT_DELAY_MS after the start, and every element of every iteration checked on every
+// rank (test_common.h). Exit code: 0 pass, 2 wrong results, 3 the cut did not hit a running AllReduce, 1 a
+// CUDA/NCCL/MPI error.
 #include <unistd.h>
-#include <algorithm>
 #include <atomic>
-#include <climits>
-#include <cmath>
-#include <cstring>
+#include <chrono>
 #include <string>
 #include <thread>
-#include <vector>
-#include <chrono>
 
-#include "cuda_runtime.h"
-#include "nccl.h"
-#include "mpi.h"
-
-// Basic error handling macros
-#define MPICHECK(cmd) do { \
-  int e = cmd; \
-  if (e != MPI_SUCCESS) { \
-    printf("Failed: MPI error %s:%d '%d'\n", __FILE__, __LINE__, e); \
-    exit(EXIT_FAILURE); \
-  } \
-} while (0)
-
-#define CUDACHECK(cmd) do { \
-  cudaError_t e = cmd; \
-  if (e != cudaSuccess) { \
-    printf("Failed: Cuda error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
-    exit(EXIT_FAILURE); \
-  } \
-} while (0)
-
-#define NCCLCHECK(cmd) do { \
-  ncclResult_t r = cmd; \
-  if (r != ncclSuccess) { \
-    printf("Failed, NCCL error %s:%d '%s'\n", __FILE__, __LINE__, ncclGetErrorString(r)); \
-    exit(EXIT_FAILURE); \
-  } \
-} while (0)
-
-// Input of rank r at element i in iteration it: a pseudo-random integer below mask+1, stored as float. mask is chosen
-// so that the sum over all ranks stays below 2^24: every summation order then gives the exact result, the output can
-// be compared exactly, and data that ends up at the wrong position or iteration does not match what is expected there.
-__host__ __device__ inline unsigned int input_value(unsigned long long idx, int rank, int iter, unsigned int mask) {
-  unsigned long long x = idx + 0x9E3779B97F4A7C15ull * (unsigned long long)(rank * 4096 + iter + 1);
-  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
-  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
-  x ^= x >> 31;
-  return (unsigned int)x & mask;
-}
-
-__global__ void fill_kernel(float* buf, size_t n, int rank, int iter, unsigned int mask) {
-  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < n) {
-    buf[idx] = (float)input_value(idx, rank, iter, mask);
-  }
-}
-
-// Compares every element with the exact sum over all ranks; NaN and Inf never match.
-__global__ void check_kernel(const float* buf, size_t n, int nRanks, int iter, unsigned int mask,
-                             unsigned long long* mismatches, unsigned long long* first_bad) {
-  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= n) return;
-  unsigned int expect = 0;
-  for (int r = 0; r < nRanks; ++r) expect += input_value(idx, r, iter, mask);
-  float got = buf[idx];
-  if (!isfinite(got) || got != (float)expect) {
-    atomicAdd(mismatches, 1ull);
-    atomicMin(first_bad, (unsigned long long)idx);
-  }
-}
+#include "test_common.h"
 
 struct IbDevCounters {
   std::string dev;
@@ -144,24 +82,15 @@ int main(int argc, char* argv[]) {
   const char* reconnect_cmd = "./nic/connect_nic1.sh";
 
   const int start_disconnect_delay_ms = get_env_int("R2CC_AR_START_DISCONNECT_DELAY_MS", -1);
-  // Checker self-test: R2CC_TEST_CORRUPT=<n>[,nan] overwrites one output element of rank 0 in iteration n (a wrong
-  // value, or NaN) before it is checked. The run must then end in TEST FAIL with a non-zero exit code.
-  int corrupt_at = -1, corrupt_nan = 0;
-  if (const char* c = getenv("R2CC_TEST_CORRUPT")) {
-    corrupt_at = atoi(c);
-    corrupt_nan = strstr(c, "nan") != nullptr;
-  }
-  // Inputs are integers below 2^(24 - rank_bits); the sum over nRanks <= 2^rank_bits ranks stays below 2^24.
-  int rank_bits = 0;
-  while ((1 << rank_bits) < nRanks) ++rank_bits;
-  const unsigned int mask = (1u << (24 - rank_bits)) - 1;
+  const CorruptTest corrupt;
+  const unsigned int mask = input_mask(nRanks);
 
   if (myRank == 0) {
     printf("Config: iters=%d, bytes=%zu (%.2f GiB), count=%zu floats\n",
            iters, bytes, (double)bytes / (1024.0 * 1024.0 * 1024.0), bytes / sizeof(float));
     printf("Config: start_disconnect_delay_ms=%d\n", start_disconnect_delay_ms);
     printf("Config: disconnect_cmd=%s, reconnect_cmd=%s\n", disconnect_cmd, reconnect_cmd);
-    if (corrupt_at >= 0) printf("Config: checker self-test in iteration %d (%s)\n", corrupt_at, corrupt_nan ? "NaN" : "wrong value");
+    if (corrupt.at >= 0) printf("Config: checker self-test in iteration %d (%s)\n", corrupt.at, corrupt.nan ? "NaN" : "wrong value");
     printf("Config: every element of every iteration is checked on every rank; inputs are integers below %u\n", mask + 1);
   }
 
@@ -201,11 +130,8 @@ int main(int argc, char* argv[]) {
 
   float* d_buf = nullptr;
   CUDACHECK(cudaMalloc(&d_buf, bytes));
-  unsigned long long* d_stats = nullptr;   // [0] mismatching elements, [1] lowest mismatching index
+  unsigned long long* d_stats = nullptr;   // scratch of check_output()
   CUDACHECK(cudaMalloc(&d_stats, 2 * sizeof(unsigned long long)));
-
-  int threads = 256;
-  int blocks = (int)((count + threads - 1) / threads);
 
   bool overall_ok = true;
   unsigned long long local_mismatches = 0;
@@ -252,8 +178,7 @@ int main(int argc, char* argv[]) {
              (double)bytes / (1024.0 * 1024.0 * 1024.0));
     }
 
-    fill_kernel<<<blocks, threads, 0, stream>>>(d_buf, count, myRank, iter, mask);
-    CUDACHECK(cudaGetLastError());
+    fill_input(d_buf, count, myRank, iter, mask, stream);
 
     std::vector<unsigned long long> rx_start;
     if (myRank == 0) {
@@ -285,34 +210,16 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    if (myRank == 0 && corrupt_at == iter + 1) {
-      size_t idx = count / 3 + 12345;
-      float bad = 0.0f;
-      CUDACHECK(cudaMemcpy(&bad, d_buf + idx, sizeof(float), cudaMemcpyDeviceToHost));
-      bad = corrupt_nan ? NAN : bad + 1.0f;
-      CUDACHECK(cudaMemcpy(d_buf + idx, &bad, sizeof(float), cudaMemcpyHostToDevice));
-      printf("[Rank 0] Checker self-test: wrote %s to element %zu of iteration %d\n", corrupt_nan ? "NaN" : "a wrong value",
-             idx, iter + 1);
-    }
+    corrupt.apply(d_buf, count, myRank, iter + 1);
 
     // Check every element, outside the timed part of the iteration.
-    unsigned long long stats[2] = {0, ULLONG_MAX};
-    CUDACHECK(cudaMemcpyAsync(d_stats, stats, sizeof(stats), cudaMemcpyHostToDevice, stream));
-    check_kernel<<<blocks, threads, 0, stream>>>(d_buf, count, nRanks, iter, mask, d_stats, d_stats + 1);
-    CUDACHECK(cudaGetLastError());
-    CUDACHECK(cudaMemcpyAsync(stats, d_stats, sizeof(stats), cudaMemcpyDeviceToHost, stream));
-    CUDACHECK(cudaStreamSynchronize(stream));
-    bool iter_ok = stats[0] == 0;
+    char what[32];
+    snprintf(what, sizeof(what), "Iter %d", iter + 1);
+    unsigned long long wrong = check_output(d_buf, count, myRank, nRanks, iter, mask, d_stats, stream, what);
+    bool iter_ok = wrong == 0;
     if (!iter_ok) {
-      size_t idx = (size_t)stats[1];
-      float got = 0.0f;
-      CUDACHECK(cudaMemcpy(&got, d_buf + idx, sizeof(float), cudaMemcpyDeviceToHost));
-      unsigned int expect = 0;
-      for (int r = 0; r < nRanks; ++r) expect += input_value(idx, r, iter, mask);
-      printf("[Rank %d] Iter %d: %llu of %zu elements wrong, first at index %zu: got=%f expected=%u diff=%f\n",
-             myRank, iter + 1, stats[0], count, idx, got, expect, (double)got - expect);
       overall_ok = false;
-      local_mismatches += stats[0];
+      local_mismatches += wrong;
     }
 
     if (myRank == 0) {
@@ -373,40 +280,13 @@ int main(int argc, char* argv[]) {
     printf("[Rank 0] Verification: all %zu elements of each of the %d iterations checked on all %d ranks: %llu wrong\n",
            count, iters, nRanks, all_mismatches);
     if (start_disconnect_delay_ms >= 0) {
-      // The cut port is node-1's mlx5_2, the second counter. The iteration that was in flight when it was cut
-      // received part of its share over it; the following ones receive nothing over it.
-      const size_t port = 1;
-      unsigned long long full = 0;
-      for (int it = 0; it < iters; ++it) full = std::max(full, rx_log[it].size() > port ? rx_log[it][port] : 0ull);
-      int cut = -1;
-      for (int it = 0; it < iters && cut < 0; ++it) {
-        if (rx_log[it].size() > port && rx_log[it][port] < full * 9 / 10) cut = it;
-      }
-      const unsigned long long idle_mb = 20;
-      bool quiet_after = cut >= 0;
-      for (int it = cut + 1; cut >= 0 && it < iters; ++it) quiet_after = quiet_after && rx_log[it][port] < idle_mb;
+      const size_t port = 1;   // node-1's mlx5_2, the port that is cut
+      std::vector<unsigned long long> rx_mb(iters, 0);
+      for (int it = 0; it < iters; ++it) rx_mb[it] = rx_log[it].size() > port ? rx_log[it][port] : 0ull;
       char buf[512];
-      if (!ib_devs[port].available) {
-        snprintf(buf, sizeof(buf), "mlx5_2 counters unavailable");
-        if (status == 0) status = 3;
-      } else if (disconnect_rc != 0) {
-        snprintf(buf, sizeof(buf), "disconnect command failed (rc=%d)", disconnect_rc.load());
-        if (status == 0) status = 3;
-      } else if (cut < 0) {
-        snprintf(buf, sizeof(buf), "mlx5_2 kept its full share in every iteration: no failure observed");
-        if (status == 0) status = 3;
-      } else if (rx_log[cut][port] < idle_mb) {
-        snprintf(buf, sizeof(buf), "mlx5_2 was already down when iteration %d started (%llu MB): the cut did not hit a collective in flight; run again",
-                 cut + 1, rx_log[cut][port]);
-        if (status == 0) status = 3;
-      } else if (!quiet_after) {
-        snprintf(buf, sizeof(buf), "mlx5_2 still carried traffic after iteration %d", cut + 1);
-        if (status == 0) status = 3;
-      } else {
-        snprintf(buf, sizeof(buf), "mlx5_2 cut during iteration %d (%llu of %llu MB received before the cut; command ran %.2f-%.2f s, "
-                 "iteration %.2f-%.2f s), no traffic on it in iterations %d-%d, all of them completed",
-                 cut + 1, rx_log[cut][port], full, disconnect_t0, disconnect_t1, iter_t0[cut], iter_t1[cut], cut + 2, iters);
-      }
+      int evidence = failure_evidence(rx_mb, ib_devs[port].available, disconnect_rc.load(), disconnect_t0,
+                                      disconnect_t1, iter_t0, iter_t1, buf, sizeof(buf));
+      if (status == 0) status = evidence;
       printf("[Rank 0] Failure evidence: %s\n", buf);
     }
     if (status == 0) {
