@@ -89,9 +89,6 @@ R2CC-AllReduce gives 9.1% more bandwidth than Balance by the prediction and 8.9â
   output to `logs/local/`; 09 always writes its run files to `OUT` (section 5).
 - A failed run returns a non-zero exit code. 01, 02 and 08 end with a `[result]` line (0 pass, 2 wrong results,
   3 the cut did not hit a running AllReduce, run again).
-- On a new testbed, follow [r7525_setup.md](r7525_setup.md), build nccl-tests with `tools/build_nccl_tests.sh`,
-  limit the NICs with `nic/shape_nics.sh 10`, and run `tools/sync.sh` after every rebuild. `REMOTE_HOSTS=node-2`
-  restricts a run to two servers.
 
 The failed NIC is always node-1's `mlx5_2`. Tests 01, 02, 08 and 09 cut it on the BlueField with an OVS drop rule
 (`nic/disconnect_nic1.sh`, removed by `nic/connect_nic1.sh`); tests 03 and 05â€“07 only declare it failed.
