@@ -1,0 +1,37 @@
+RX of every node during tests 01 and 02 (2026-10-10, three r7525 servers, library and tests as in this directory)
+
+While the unchanged test ran, each node sampled port_rcv_data of mlx5_0, mlx5_2 and mlx5_3 every 5 ms. The samples
+are split at the iteration boundaries that rank 0 prints, and the split of node-1 agrees with the test's own
+per-iteration counters ("test" column) within 2 MB. MB = 2^20 bytes, received over all three NICs of a node.
+
+===== 01.hot_repair_to_balance: mlx5_2 of node-1 cut during iteration 3, R2CC-Balance afterwards =====
+Iter    node-1  node-2  node-3   node-1 mlx5_0/mlx5_2/mlx5_3   test
+1         7032    7032    7032   2406/2313/2313               2406/2312/2312
+2         7034    7031    7039   2407/2313/2313               2406/2312/2312
+3         7101    7104    7025   4164/625/2312                4164/626/2312
+4         7078    7078    7077   3609/0/3468                  3609/0/3468
+5         7078    7078    7078   3609/0/3468                  3609/0/3468
+6         7078    7078    7078   3609/0/3468                  3609/0/3468
+7         7078    7078    7078   3609/0/3468                  3609/0/3468
+8         7078    7077    7079   3609/0/3469                  3609/0/3468
+9         7077    7078    7077   3609/0/3468                  3609/0/3468
+10        7078    7078    7078   3609/0/3468                  3609/0/3468
+[Rank 0] Verification: all 1073741824 elements of each of the 10 iterations checked on all 6 ranks: 0 wrong
+[Rank 0] Failure evidence: mlx5_2 cut during iteration 3 (626 of 2312 MB received before the cut; command ran 4.00-4.82 s, iteration 4.29-7.80 s), no traffic on it in iterations 4-10, all of them completed
+[Rank 0] TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one the NIC failure hit.
+
+===== 02.hot_repair_to_r2cc_allreduce: mlx5_2 of node-1 cut during iteration 3, R2CC-AllReduce afterwards =====
+Iter    node-1  node-2  node-3   node-1 mlx5_0/mlx5_2/mlx5_3   test
+1         7034    7032    7031   2408/2313/2313               2407/2312/2312
+2         7030    7032    7032   2406/2312/2313               2406/2312/2313
+3         7109    7112    7036   4371/426/2312                4370/426/2312
+4         6151    8231    8227   3129/0/3022                  3128/0/3022
+5         6150    8230    8218   3129/0/3021                  3128/0/3020
+6         6150    8230    8214   3129/0/3021                  3128/0/3020
+7         6150    8230    8218   3129/0/3021                  3128/0/3021
+8         6151    8231    8206   3129/0/3022                  3128/0/3021
+9         6152    8232    8241   3130/0/3022                  3128/0/3020
+10        6147    8227    8189   3127/0/3020                  3128/0/3021
+[Rank 0] Verification: all 1073741824 elements of each of the 10 iterations checked on all 6 ranks: 0 wrong
+[Rank 0] Failure evidence: mlx5_2 cut during iteration 3 (426 of 2312 MB received before the cut; command ran 4.00-4.76 s, iteration 4.39-8.08 s), no traffic on it in iterations 4-10, all of them completed
+[Rank 0] TEST PASS: all AllReduces completed and every element of every iteration is correct, including the one the NIC failure hit.

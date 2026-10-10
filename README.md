@@ -19,20 +19,20 @@ AllReduce schedule to the remaining bandwidth.
 
 https://github.com/user-attachments/assets/8511cbf4-843a-4399-a742-d986eac55eb9
 
-On three CloudLab servers, [test 01](./examples/cloudlab_r7525/01.hot_repair_to_balance.sh) runs ten 4 GiB
-AllReduces and cuts the NIC `mlx5_2` of one server in the middle of the third. That AllReduce still completes,
-every element of all ten results is correct, and from the fourth AllReduce on the traffic of `mlx5_2` is spread
-over the two remaining NICs (MB received per AllReduce on that server, from the
-[reference log](./examples/cloudlab_r7525/logs/01.hot_repair_to_balance.log)).
+On three CloudLab servers, tests [01](./examples/cloudlab_r7525/01.hot_repair_to_balance.sh) and
+[02](./examples/cloudlab_r7525/02.hot_repair_to_r2cc_allreduce.sh) run ten 4 GiB AllReduces and cut the NIC `mlx5_2`
+of node-1 in the middle of the third. That AllReduce still completes, and every element of all ten results is
+correct. The data each server receives per AllReduce ([log](./examples/cloudlab_r7525/logs/rx_per_node.log)) shows
+what the two schedules do after the cut.
 
-```
-Iter   Time(ms)   mlx5_0_RX    mlx5_2_RX    mlx5_3_RX
-2      2040       2406         2312         2312
-3      3539       4188         601          2312
-4      3040       3609         0            3468
-...
-[Rank 0] Verification: all 1073741824 elements of each of the 10 iterations checked on all 6 ranks: 0 wrong
-```
+| MB received per AllReduce | node-1 (lost `mlx5_2`) | node-2 | node-3 |
+|---|---|---|---|
+| Healthy | 7032 | 7032 | 7032 |
+| R2CC-Balance after the cut | 7078 | 7078 | 7078 |
+| R2CC-AllReduce after the cut | 6150 | 8230 | 8218 |
+
+R2CC-Balance keeps node-1's load and spreads it over its two remaining NICs. R2CC-AllReduce lowers node-1's load by
+13% and moves that share to the healthy servers.
 
 ## Results
 
