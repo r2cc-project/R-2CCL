@@ -39,33 +39,37 @@ The three NIC ports of a CloudLab r7525 server have different speeds (25, 100 an
 then equal (1.18–1.23 GB/s each per direction) and bound every collective. The two GPUs sit on different NUMA nodes
 and have no NVLink.
 
-### 1.2 What the paper's formula predicts
+### 1.2 What the model in the paper predicts under this testbed
 
-N = 3 servers, P = 6 ranks in one ring. node-1 loses one of its three NICs, X = 1/3 of its bandwidth; the H = 4
-ranks of node-2 and node-3 are healthy. K is the number of pipelined Stage-2 chunks of R2CC-AllReduce
-(`R2CC_AR_STAGE2_CHUNKS`, default 4). With message size D and healthy server bandwidth B, the healthy time is
-T0 = 2(P−1)/P · D/B.
+The paper models R2CC-AllReduce in section "Failure-aware Schedule Optimization" (subsection "R2CC AllReduce").
+One node loses a fraction X of its bandwidth B; with per-node data D and n nodes, a global AllReduce on (1−Y)D runs
+concurrently with a partial AllReduce of the healthy nodes on YD, and Stage 2 broadcasts YD back, with Y = X.
 
-- **R2CC-Balance** moves the same data over (1−X)B, so T/T0 = 1/(1−X) = **1.5**.
-- **R2CC-AllReduce**, T ≈ max(T_global, T_partial) + T_tail:
-  - Stage 1. The AllReduce of the first (1−X)D on all ranks takes T_global = T0. At the same time the healthy
-    ranks reduce the last XD on the NIC slot node-1 lost, T_partial = 2(H−1)/H · XD/(XB) = 0.9 T0, hidden.
-  - Stage 2. node-1 sends its part of the tail to a helper rank and receives the reduced tail, XD each way over
-    (1−X)B, in K overlapping chunks, T_tail ≈ (1 + 1/K) · XD/((1−X)B).
+```
+T_1  = 2(n−1)/n   · (1−Y)D / ((1−X)B)        global AllReduce
+T_2  = 2(n−2)/(n−1) · YD / (XB)              partial AllReduce
+T_3  = YD / ((1−X)B)                         broadcast back
+T    = max(T_1, T_2) + T_3                   T_nf = 2(n−1)D / (nB)   (no failure)
 
-  Together **T/T0 ≈ 1 + X/((1−X) · 2(P−1)/P) · (1 + 1/K) = 1 + 0.3 · (1 + 1/K)**, 1.375 for K = 4.
+T_Balance / T_nf = 1/(1−X)                   T / T_nf = 1 + nX / (2(n−1)(1−X))
+```
 
-This is the paper's formula with the ring factor 2(P−1)/P of six ranks instead of 2(n−1)/n, and with K chunks; the
-paper's tail term is the limit K → ∞ (1.30). The paper's formula with n = 3 also gives 1.375, which here is the
-value for K = 4. Test 07 measures K = 1 to 16.
+On this testbed the ring has n = 6 members (two GPUs per server), X = 1/3 (one of node-1's three NICs), and the
+partial AllReduce runs on the 4 ranks of the healthy servers (T_2 = 0.9 T_nf, hidden behind T_1). The implementation
+runs Stage 2 as K pipelined chunks of a Reduce and a Broadcast (`R2CC_AR_STAGE2_CHUNKS`, default 4), which adds one
+chunk to T_3, T_3 = (1 + 1/K) · XD / ((1−X)B). The prediction is therefore
 
-| 4 GiB AllReduce | formula | test 03 (in-place) | tests 01/02 |
+- R2CC-Balance, T/T_nf = 1/(1−X) = **1.5**;
+- R2CC-AllReduce, T/T_nf = 1 + 0.3 · (1 + 1/K) = **1.375** for K = 4, which approaches the paper's 1 + nX/(2(n−1)(1−X))
+  = 1.30 as K grows. Test 07 measures K = 1 to 16.
+
+| 4 GiB AllReduce | prediction | test 03 (in-place) | tests 01/02 |
 |---|---|---|---|
 | healthy | 1 | 2.03 s, busbw 3.53 GB/s | 2.04 s (01), 2.03 s (02) |
 | R2CC-Balance, `mlx5_2` failed | 1.5 | 1.51 (3.05 s, 2.34 GB/s) | 1.49 (3.04 s) |
 | R2CC-AllReduce, `mlx5_2` failed, K = 4 | 1.375 | 1.38 (2.79 s, 2.56 GB/s) | 1.38 (2.80 s) |
 
-R2CC-AllReduce gives 9.1% more bandwidth than Balance by the formula and 8.9–9.4% in test 03.
+R2CC-AllReduce gives 9.1% more bandwidth than Balance by the prediction and 8.9–9.4% in test 03.
 
 ## 2. Run the tests
 
