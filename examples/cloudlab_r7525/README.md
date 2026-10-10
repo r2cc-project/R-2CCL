@@ -71,8 +71,18 @@ R2CC-AllReduce gives 9.1% more bandwidth than Balance by the prediction and 8.9â
 
 ## 2. Run the tests
 
-- Run everything from `node-1` in `/mydata/R2CC/examples/cloudlab_r7525`, e.g. `./01.hot_repair_to_balance.sh`.
-  All nine in a row take about an hour, `for t in ./0[1-9].*.sh; do SAVE_LOG=1 $t; done`.
+- Run the scripts from `node-1`, in `/mydata/R2CC/examples/cloudlab_r7525`.
+  ```
+  ./01.hot_repair_to_balance.sh
+  ./02.hot_repair_to_r2cc_allreduce.sh
+  ./03.nccl_tests_compare_all.sh
+  ./04.nccl_tests_baseline_healthy.sh
+  ./05.nccl_tests_balance_unhealthy.sh
+  ./06.nccl_tests_r2cc_allreduce_unhealthy.sh
+  ./07.nccl_tests_r2cc_allreduce_k_sweep.sh
+  ./08.hot_repair_cuda_graph.sh
+  ./09.training_with_nic_failure.sh
+  ```
 - One job at a time. Every script refuses to start while another one runs and first restores `mlx5_2` on the
   SmartNIC. `tools/kill.sh` stops leftover processes on all nodes.
 - The scripts print to the terminal and never overwrite the reference logs in `logs/`. `SAVE_LOG=1` also saves the
