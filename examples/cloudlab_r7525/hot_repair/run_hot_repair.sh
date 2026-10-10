@@ -56,7 +56,7 @@ if [[ "${LOG_FLAG}" == "1" ]]; then
 else
   TRACE_ONLY="${TRACE_ONLY:-0}"
 fi
-TRACE_GREP="${TRACE_GREP:-R2CC_PROXY_STATE|\\[trace\\]|\\[Rank [0-9]+\\] Running on|\\[Rank 0\\] Iter [0-9]+/[0-9]+|Config:|IB RX per-iteration|TEST PASS|TEST FAIL|NCCL WARN|NCCL ERROR|Failed}"
+TRACE_GREP="${TRACE_GREP:-R2CC_PROXY_STATE|\\[trace\\]|\\[Rank [0-9]+\\] Running on|\\[Rank 0\\] Iter [0-9]+/[0-9]+|Config:|IB RX per-iteration|\\[Rank [0-9]+\\] Iter [0-9]+: |Checker self-test|NIC disconnect command|Verification:|Failure evidence:|TEST PASS|TEST FAIL|NCCL WARN|NCCL ERROR|Failed}"
 SAVE_RAW_LOG="${SAVE_RAW_LOG:-0}"
 LOG_DIR="${LOG_DIR:-./logs}"
 LOG_TAG="${LOG_TAG:-$(date +%Y%m%d_%H%M%S)}"
@@ -209,8 +209,7 @@ mpirun_cmd=(
   -x "R2CC_AR_START_DISCONNECT_DELAY_MS=${R2CC_AR_START_DISCONNECT_DELAY_MS:-4000}"
 )
 for var in R2CC_MODE R2CC_FAILED_NODE R2CC_FAILED_HCA R2CC_FAILED_NIC_COUNT \
-           R2CC_AR_STAGE2_CHUNKS R2CC_AR_SCHEDULE R2CC_AR_MIN_BYTES R2CC_AR_AFTER_REPAIR \
-           R2CC_TEST_GRAPH R2CC_TEST_RECAPTURE_AT R2CC_TEST_EAGER_BEFORE_RECAPTURE R2CC_TEST_NEWBUF_AT R2CC_TEST_REGISTER; do
+           R2CC_AR_STAGE2_CHUNKS R2CC_AR_SCHEDULE R2CC_AR_MIN_BYTES R2CC_AR_AFTER_REPAIR R2CC_TEST_CORRUPT; do
   if [[ -v "$var" ]]; then
     mpirun_cmd+=(-x "$var")
   fi
@@ -260,6 +259,14 @@ if [[ "${SAMPLE_LINES}" =~ ^[0-9]+$ ]] && (( SAMPLE_LINES > 0 )); then
 fi
 
 [[ "${TRACE_TMP}" == "1" ]] && rm -f "${TRACE_LOG}"
+# Exit codes of test_hot_repair (mpirun passes on the first non-zero one).
+case "${mpirun_rc}" in
+  0) result="PASS" ;;
+  2) result="FAIL: wrong results" ;;
+  3) result="FAIL: the NIC failure did not hit a running AllReduce (see 'Failure evidence'); run again" ;;
+  *) result="FAIL: aborted (CUDA/NCCL/MPI error, crash or kill)" ;;
+esac
+echo "[result] exit=${mpirun_rc} ${result}"
 exit "${mpirun_rc}"
 
 # NCCL_R2CC_FAILOVER_TIMEOUT_MS=500   Should set according your scale and NCCL native timeout and retry env.

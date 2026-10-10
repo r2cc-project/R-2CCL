@@ -9,12 +9,11 @@
 #     Stage 2  K-way pipelined Reduce of the tail from the degraded node to a helper rank on a healthy node
 #              (its input is the partial result) and Broadcast of each finished chunk to all ranks.
 #   X = failed NICs / NICs per node (1/3 here). The first AllReduce after the switch also creates the two
-#   sub-communicators (slower once). Expect: TEST PASS; mlx5_2 RX 0 after failover.
+#   sub-communicators (slower once). Expect: TEST PASS (exit codes as in 01); mlx5_2 RX 0 after failover.
 #
 # Usage: ./02.hot_repair_to_r2cc_allreduce.sh [-log 0|1]
 #   Tunables (env): R2CC_AR_STAGE2_CHUNKS (K, default 4), R2CC_AR_SCHEDULE (0-3; default 1 = Stage 1 concurrent
 #   with three or more nodes, 2 = Stage 1 serialized with two), R2CC_AR_MIN_BYTES (default 16 MiB).
-#   CUDA-graph options of the test program: README.md, section 4.
 #   Nothing is written to disk by default; SAVE_LOG=1 also saves the terminal output to logs/local/.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"

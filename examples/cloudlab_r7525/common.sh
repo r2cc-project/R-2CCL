@@ -74,7 +74,7 @@ print_nic_limit() {
   echo "[testbed] $(hostname -s) mlx5_0 egress ${r:-ratelimit: unknown} (nic/shape_nics.sh status shows all ports)"
 }
 
-# Default nccl-tests arguments: full size sweep, results verified against a CPU reference (-c 1).
+# Default nccl-tests arguments: full size sweep; -c 1 checks one extra AllReduce of every size element by element.
 NCCL_TESTS_DEFAULT_ARGS=(-b 8 -e 4G -f 2 -g 1 -c 1 -n 5 -w 2 -d float -o sum)
 
 # run_nccl_tests <R2CC_MODE> <log_tag> [nccl-tests args...]
@@ -114,7 +114,7 @@ run_nccl_tests() {
   return "${rc}"
 }
 
-# run_logged <NN.name> <command...>: run the command. By default nothing is written to disk: the six files in
+# run_logged <NN.name> <command...>: run the command. By default nothing is written to disk: the files in
 # logs/ are the reference logs shipped with the repository and must not be overwritten by a local run. With
 # SAVE_LOG=1 the complete terminal output is also written to ${LOG_DIR}/<NN.name>.log (default logs/local/,
 # git-ignored). To regenerate the reference logs deliberately: SAVE_LOG=1 LOG_DIR=<repo>/examples/cloudlab_r7525/logs.
