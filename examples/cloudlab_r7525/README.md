@@ -153,9 +153,19 @@ iteration costs about 1.5 s more than a healthy one.
 
 ### 3.2 Test 02 — real NIC failure, hot repair, then R2CC-AllReduce
 
-The same run, but after the repair R2CC-AllReduce runs (`R2CC_AR_AFTER_REPAIR=3`). Its stages are NCCL collectives
-on two sub-communicators, created with `ncclCommSplit` in the first AllReduce after the repair.
-From [logs/02.hot_repair_to_r2cc_allreduce.log](logs/02.hot_repair_to_r2cc_allreduce.log):
+**Experiment description:** the same run as 01, but after the repair R2CC-AllReduce runs (`R2CC_AR_AFTER_REPAIR=3`).
+Its stages are NCCL collectives on two sub-communicators, created with `ncclCommSplit` in the first AllReduce after
+the repair.
+
+**Proves:**
+
+- The failure is repaired in flight as in 01, and every element is correct.
+- R2CC-AllReduce takes 1.38 times the healthy time, as the paper's model predicts under this testbed (1.375 for
+  K = 4, section 1.2), and 8% less than Balance.
+- It lowers the load of the degraded server as the paper's R2CC-AllReduce figure shows (2D to 7/4D in its 4-node
+  example); here node-1 receives 13% less than with Balance.
+
+**Evidence:** from [logs/02.hot_repair_to_r2cc_allreduce.log](logs/02.hot_repair_to_r2cc_allreduce.log):
 
 ```
 Iter   Time(ms)   mlx5_0_RX    mlx5_2_RX    mlx5_3_RX
@@ -175,16 +185,26 @@ Iter   Time(ms)   mlx5_0_RX    mlx5_2_RX    mlx5_3_RX
          the NIC failure hit.
 ```
 
-An iteration takes 2.80 s, 1.38 times the healthy 2.03 s (formula 1.375 for K = 4) and 8% less than with Balance.
-node-1 receives 13% less than with Balance, exactly (2(P−1)/P·(1−X) + X) / (2(P−1)/P) = 0.867; node-2 and node-3
-carry the tail AllReduce on their otherwise idle `mlx5_2`.
+Steady iterations take 2.80 s against 2.03 s healthy. node-1 receives 6.1 GB instead of Balance's 7.1 GB, exactly
+(2(P−1)/P·(1−X) + X) / (2(P−1)/P) = 0.867; node-2 and node-3 carry the partial AllReduce on their otherwise idle
+`mlx5_2`.
 
 ### 3.3 Test 03 — nccl-tests: correctness and a side-by-side table
 
-`all_reduce_perf` runs three times with the same arguments, healthy with R2CC switched off (`R2CC_MODE=0`), then
-R2CC-Balance (`R2CC_MODE=2`) and R2CC-AllReduce (`R2CC_MODE=3`) with `mlx5_2` under failure. With `-c 1`,
-nccl-tests checks one more AllReduce of every size element by element (`#wrong`); the timed iterations are not
-checked. From [logs/03.nccl_tests_compare_all.log](logs/03.nccl_tests_compare_all.log):
+**Experiment description:** `all_reduce_perf` runs three times with the same arguments, healthy with R2CC switched
+off (`R2CC_MODE=0`), then R2CC-Balance (`R2CC_MODE=2`) and R2CC-AllReduce (`R2CC_MODE=3`) with `mlx5_2` under
+failure.
+
+**Proves:**
+
+- Both schedules return correct results under failure.
+- At 4 GiB, Balance and R2CC-AllReduce take 1.51 and 1.38 times the healthy time, against 1.5 and 1.375 from the
+  paper's model under this testbed.
+- R2CC-AllReduce is faster than Balance for large messages, as in the paper's H100 AllReduce benchmark
+  (Evaluation, Microbenchmarks).
+
+**Evidence:** with `-c 1`, nccl-tests checks one more AllReduce of every size element by element (`#wrong`); the
+timed iterations are not checked. From [logs/03.nccl_tests_compare_all.log](logs/03.nccl_tests_compare_all.log):
 
 ```
 ===== comparison (-b 256M -e 4G -f 4 -g 1 -c 1 -n 5 -w 2 -d float -o sum) =====
@@ -196,13 +216,19 @@ bytes        | baseline_healthy                 | balance_unhealthy             
 ```
 
 All `#wrong` are 0. At 4 GiB, healthy runs at 3.53 GB/s (three NICs), Balance at 2.34–2.35 GB/s (two NICs) and
-R2CC-AllReduce at 2.56 GB/s, 1.51 and 1.38 times the healthy time (formula 1.5 and 1.375). Smaller sizes vary more
-between runs.
+R2CC-AllReduce at 2.56 GB/s. Smaller sizes vary more between runs.
 
 ### 3.4 Tests 04–06 — full nccl-tests sweeps
 
-Each runs `all_reduce_perf` over every message size from 8 B to 4 GiB (`-b 8 -e 4G -f 2 -g 1 -c 1 -n 5 -w 2
--d float -o sum`), checked with `-c 1` as in 03:
+**Experiment description:** each test runs `all_reduce_perf` over every message size from 8 B to 4 GiB
+(`-b 8 -e 4G -f 2 -g 1 -c 1 -n 5 -w 2 -d float -o sum`) in one scenario, checked with `-c 1` as in 03.
+
+**Proves:**
+
+- Results are correct at every message size, healthy and under failure.
+- As in the paper's H100 benchmark, Balance is used for small messages and R2CC-AllReduce is faster for large ones.
+
+**Evidence:**
 
 | Test | Scenario | busbw from 512 MiB to 4 GiB (out-of-place / in-place) | at 4 GiB |
 |---|---|---|---|
@@ -210,9 +236,11 @@ Each runs `all_reduce_perf` over every message size from 8 B to 4 GiB (`-b 8 -e 
 | 05 | R2CC-Balance, `mlx5_2` failed (`R2CC_MODE=2`) | 2.35–2.36 / 2.35–2.36 GB/s | 2.35 / 2.35 GB/s |
 | 06 | R2CC-AllReduce, `mlx5_2` failed (`R2CC_MODE=3`) | 2.50–2.56 / 2.50–2.56 GB/s | 2.56 / 2.56 GB/s |
 
-Below 16 MiB (`R2CC_AR_MIN_BYTES`) R2CC-AllReduce falls back to Balance, with one warning per rank. Single sizes up
-to 256 MiB are sometimes slower in one pass; from 512 MiB on, runs differ by at most about 0.1 GB/s. The scripts
-take nccl-tests arguments and `NCCL_TEST_BIN` for other collectives:
+Below 16 MiB (`R2CC_AR_MIN_BYTES`) R2CC-AllReduce falls back to Balance, with one warning per rank. From 16 MiB on it
+is faster than Balance in at least one pass, and in both from 256 MiB on. Single sizes up to 256 MiB are sometimes
+slower in one pass; from 512 MiB on, runs differ by at most about 0.1 GB/s.
+
+The scripts take nccl-tests arguments and `NCCL_TEST_BIN` for other collectives:
 
 ```bash
 ./06.nccl_tests_r2cc_allreduce_unhealthy.sh -b 1G -e 4G -f 4 -d half -o prod
@@ -222,10 +250,17 @@ R2CC_AR_STAGE2_CHUNKS=8 ./06.nccl_tests_r2cc_allreduce_unhealthy.sh -b 4G -e 4G 
 
 ### 3.5 Test 07 — the pipeline depth K of R2CC-AllReduce against the paper's formula
 
-`all_reduce_perf` at 4 GiB with `mlx5_2` under failure, in nine configurations, healthy, Balance, R2CC-AllReduce
-with K = 1, 2, 4, 8 and 16, then healthy and Balance again to show drift. Every time is divided by the mean of the
-two healthy runs and printed next to the formula of section 1.2.
-From [logs/07.nccl_tests_r2cc_allreduce_k_sweep.log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log):
+**Experiment description:** `all_reduce_perf` at 4 GiB with `mlx5_2` under failure, in nine configurations, healthy,
+Balance, R2CC-AllReduce with K = 1, 2, 4, 8 and 16, then healthy and Balance again to show drift.
+
+**Proves:**
+
+- Every configuration is within 0.74% of the paper's model under this testbed (section 1.2), and R2CC-AllReduce
+  approaches the paper's formula (1.30) as K grows.
+- R2CC-AllReduce is faster than Balance from K = 2 on.
+
+**Evidence:** every time is divided by the mean of the two healthy runs and printed next to the prediction of
+section 1.2. From [logs/07.nccl_tests_r2cc_allreduce_k_sweep.log](logs/07.nccl_tests_r2cc_allreduce_k_sweep.log):
 
 ```
 run                    K     time oop / ip (us)    T/T0 oop / ip   model   vs. model oop/ip  #wrong
@@ -240,9 +275,8 @@ healthy_2              -     2029505 /  2029159    1.000 / 1.000  1.0000    +0.0
 balance_2              -     3040734 /  3041923    1.499 / 1.499  1.5000    -0.08% / -0.06%  0/0
 ```
 
-Every configuration is within 0.74% of the formula and every check is 0; the runs before and after the sweep
-differ by at most 0.1%. With K = 1 R2CC-AllReduce is slower than Balance (1.60); from K = 2 on it is faster and
-approaches the K → ∞ value 1.30.
+Every check is 0, and the runs before and after the sweep differ by at most 0.1%. With K = 1 R2CC-AllReduce is
+slower than Balance (1.60).
 
 ## 4. CUDA graphs
 
