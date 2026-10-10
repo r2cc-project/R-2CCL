@@ -230,9 +230,8 @@ R2CC-AllReduce at 2.56 GB/s. Smaller sizes vary more between runs.
 | 05 | R2CC-Balance, `mlx5_2` failed (`R2CC_MODE=2`) | 2.35–2.36 / 2.35–2.36 GB/s | 2.35 / 2.35 GB/s |
 | 06 | R2CC-AllReduce, `mlx5_2` failed (`R2CC_MODE=3`) | 2.50–2.56 / 2.50–2.56 GB/s | 2.56 / 2.56 GB/s |
 
-Below 16 MiB (`R2CC_AR_MIN_BYTES`) R2CC-AllReduce falls back to Balance, with one warning per rank. From 16 MiB on it
-is faster than Balance in at least one pass, and in both from 256 MiB on. Single sizes up to 256 MiB are sometimes
-slower in one pass; from 512 MiB on, runs differ by at most about 0.1 GB/s.
+Below 16 MiB (`R2CC_AR_MIN_BYTES`) R2CC-AllReduce falls back to Balance, with one warning per rank in the 06 log.
+From 256 MiB on it is faster than Balance in both passes.
 
 ### 3.5 Test 07 — the pipeline depth K of R2CC-AllReduce against the paper's formula
 
