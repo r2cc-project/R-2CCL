@@ -104,8 +104,8 @@ transfers to the backup connection, finishes the AllReduce and then runs R2CC-Ba
 
 - R2CC repairs a NIC failure in the middle of an AllReduce without restarting the job or losing data; every element
   is correct.
-- After the repair, R2CC-Balance runs at 1.49 times the healthy time, against the paper's prediction
-  1/(1−X) = 1.5.
+- After the repair, R2CC-Balance spreads the same ~7.0 GB per iteration evenly over the two remaining NICs
+  (3609 and 3468 MB), as the paper's Balance formula assumes, the same data over the remaining (1−X)B.
 - This is the lossless live migration of the paper's section "Failure Detection and Mitigation", with the same trend
   as the paper's failover microbenchmark (Evaluation, the figure of AllReduce bandwidth at 1 GB with the R2CC
   pipeline for failover), a dip in the iteration of the repair followed by a steady, lower bandwidth.
