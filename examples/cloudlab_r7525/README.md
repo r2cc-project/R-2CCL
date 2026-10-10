@@ -86,7 +86,7 @@ R2CC-AllReduce gives 9.1% more bandwidth than Balance by the prediction and 8.9�
 - One job at a time. Every script refuses to start while another one runs and first restores `mlx5_2` on the
   SmartNIC. `tools/kill.sh` stops leftover processes on all nodes.
 - The scripts print to the terminal and never overwrite the reference logs in `logs/`. `SAVE_LOG=1` also saves the
-  output to `logs/local/`; 09 always writes its run files to `OUT` (section 5).
+  output to `logs/local/`; 09 always writes its run files to `OUT` (section 3.7).
 - A failed run returns a non-zero exit code. 01, 02 and 08 end with a `[result]` line (0 pass, 2 wrong results,
   3 the cut did not hit a running AllReduce, run again).
 
@@ -263,14 +263,23 @@ balance_2              -     3040734 /  3041923    1.499 / 1.499  1.5000    -0.0
 Every check is 0, and the runs before and after the sweep differ by at most 0.1%. With K = 1 R2CC-AllReduce is
 slower than Balance (1.60).
 
-## 4. CUDA graphs
+### 3.6 Test 08 — CUDA graphs
 
-This is the CUDA Graphs compatibility experiment added to the appendix during shepherding. `08.hot_repair_cuda_graph.sh`
-runs `hot_repair/test_hot_repair_graph` twice with the failure of 01/02 in iteration 3. The graph captured at the
-start is replayed in every iteration; after iteration 6 the AllReduce is captured again, as R2CC-Balance in run 1 and
-as R2CC-AllReduce in run 2, which first needs one AllReduce outside the capture (`--eager`). Every element of every
-AllReduce is checked as in 01, outside the timed part.
-From [logs/08.hot_repair_cuda_graph.log](logs/08.hot_repair_cuda_graph.log):
+**Experiment description:** `08.hot_repair_cuda_graph.sh` runs `hot_repair/test_hot_repair_graph` twice with the
+failure of 01/02 in iteration 3. The graph captured at the start is replayed in every iteration; after iteration 6
+the AllReduce is captured again, as R2CC-Balance in run 1 and as R2CC-AllReduce in run 2, which first needs one
+AllReduce outside the capture (`--eager`). Every element of every AllReduce is checked as in 01, outside the timed
+part.
+
+**Proves:**
+
+- R2CC works with CUDA Graphs, the compatibility experiment added to the appendix during shepherding (Discussion,
+  CUDA Graphs paragraph and table), and the times match that table.
+- A graph captured before the failure keeps replaying correctly after the repair, over the backup connection.
+- Capturing the AllReduce again applies R2CC-Balance or R2CC-AllReduce, at 1.7 ms for Balance and 0.33 s for
+  R2CC-AllReduce.
+
+**Evidence:** from [logs/08.hot_repair_cuda_graph.log](logs/08.hot_repair_cuda_graph.log):
 
 ```
 ===== CUDA Graphs: 4 GiB AllReduce on all GPUs, mlx5_2 of node-1 cut during the run =====
@@ -293,18 +302,15 @@ run 2/2, re-captured as R2CC-AllReduce:
 [result] exit=0 PASS
 ```
 
-- **Every element of every AllReduce is correct in both runs**, including the replays across the failure.
-- **The pre-failure graph keeps replaying after the repair.** It still has the healthy channel layout, so the backup
-  connection on `mlx5_0` carries the whole share of `mlx5_2` (4.07 s).
-- **Balance and R2CC-AllReduce are chosen when a collective is enqueued**, so they need a new capture, 1.7 ms for
-  Balance. R2CC-AllReduce adds 0.33 s for its AllReduce outside the capture.
+Every element of every AllReduce is correct in both runs. The pre-failure graph keeps the healthy channel layout, so
+the backup connection on `mlx5_0` carries the whole share of `mlx5_2` (4.07 s). Balance and R2CC-AllReduce are
+chosen when a collective is enqueued, so they take effect in the re-captured graph.
 
-## 5. Training through a NIC failure
+### 3.7 Test 09 — training through a NIC failure
 
-This is the training-quality experiment added during shepherding (summarized in the evaluation section, details in
-the appendix). `09.training_with_nic_failure.sh` trains GPT-2 (124M) on WikiText-103 with PyTorch DDP on the six
-GPUs for 1000 updates (`training/train.py`), with a fixed seed and deterministic kernels. Every update runs one
-475 MiB gradient AllReduce. Four runs use the same seed (default 42):
+**Experiment description:** `09.training_with_nic_failure.sh` trains GPT-2 (124M) on WikiText-103 with PyTorch DDP
+on the six GPUs for 1000 updates (`training/train.py`), with a fixed seed and deterministic kernels. Every update
+runs one 475 MiB gradient AllReduce. Four runs use the same seed (default 42):
 
 | Run | Library | node-1's `mlx5_2` | Schedule after the hot repair |
 |---|---|---|---|
@@ -316,7 +322,21 @@ GPUs for 1000 updates (`training/train.py`), with a fixed seed and deterministic
 The library is not told which NIC fails. `training/compare.py` compares every run with VNF by the training loss of
 every update, the SHA-256 of the AllReduce outputs of updates 400–408 and of the parameters, the error of those
 AllReduces against an FP64 sum of the inputs (E_rel, Euclidean norm over all elements), and the test perplexity.
-From [logs/09.training_with_nic_failure.log](logs/09.training_with_nic_failure.log):
+The runs use PyTorch 2.4.1 built against the system NCCL, so each run loads R2CC or upstream NCCL 2.23.4 from
+`LD_LIBRARY_PATH`, and WikiText-103 tokenized with the GPT-2 BPE (SHA-256 in `manifest.json`), all under
+`/proj/softmeasure-PG0/r2cc_ae`. The files of every run go to `OUT`, printed at the start.
+
+**Proves:**
+
+- Without a failure, R2CC is identical to upstream NCCL bit for bit.
+- The AllReduce that the failure hits returns the same bits as upstream NCCL, and training continues without a
+  restart.
+- After the repair, the schedules only change the order in which gradients are summed, so the results differ by
+  FP32 rounding, the loss by at most 1.76e-3 and the test perplexity by at most +0.023%.
+- This is the training-quality experiment added during shepherding (summarized in the evaluation section, details in
+  the appendix "Training Quality Under a NIC Failure"), and these runs are bit-identical to its seed-42 runs.
+
+**Evidence:** from [logs/09.training_with_nic_failure.log](logs/09.training_with_nic_failure.log):
 
 ```
 [09] VNF_42: done in 10 min, test PPL 75.56742342917366
@@ -349,16 +369,9 @@ yes  seed 42: all runs: the parameters are identical on all ranks at every check
 RESULT: all checks passed
 ```
 
-- **Without a failure, R2CC is identical to upstream NCCL bit for bit.**
-- **The hot repair returns the same bits.** The cut takes effect before the AllReduce of update 401, which R2CC
-  repairs; its output equals VNF's, so the loss is identical up to update 402. Update 401 takes about 1.4 s instead
-  of 0.5 s, and training continues without a restart.
-- **From update 402 on** the schedules sum the gradients in a different order, so the results differ only by FP32
-  rounding (E_rel 5.8e-8, as for NCCL). The loss differs by at most 1.76e-3 and the test perplexity by at most
-  +0.023%.
-
-These runs are bit-identical to the seed-42 runs in the paper. The paper reports seeds 42, 43 and 44, for which
-`training/compare.py` prints
+The cut takes effect before the AllReduce of update 401, which R2CC repairs; its output equals VNF's, so the loss is
+identical up to update 402. Update 401 takes about 1.4 s instead of 0.5 s. From update 402 on, E_rel stays at
+5.8e-8, as for NCCL. The paper reports seeds 42, 43 and 44, for which `training/compare.py` prints
 
 ```
 Condition                  Test PPL   Max. paired Δ*
@@ -368,11 +381,7 @@ R2CC-Balance, failure        76.085   +0.008%
 R2CC-AllReduce, failure      76.086   +0.023%
 ```
 
-The runs use PyTorch 2.4.1 built against the system NCCL, so each run loads R2CC or upstream NCCL 2.23.4 from
-`LD_LIBRARY_PATH`, and WikiText-103 tokenized with the GPT-2 BPE (SHA-256 in `manifest.json`), all under
-`/proj/softmeasure-PG0/r2cc_ae`. The files of every run go to `OUT`, printed at the start.
-
-## 6. Directory layout
+## 4. Directory layout
 
 ```
 0[1-9].*.sh     the nine tests

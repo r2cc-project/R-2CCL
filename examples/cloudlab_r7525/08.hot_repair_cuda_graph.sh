@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The hot repair of 01/02 with the AllReduce captured in a CUDA graph (README.md, section 4). Two runs of
+# The hot repair of 01/02 with the AllReduce captured in a CUDA graph (README.md, section 3.6). Two runs of
 # hot_repair/test_hot_repair_graph, each 10 x 4 GiB with node-1's mlx5_2 cut 4 s after the start, i.e. during
 # iteration 3. The graph captured at the start is replayed in every iteration, so the hot repair happens while it is
 # replayed; after iteration 6 the AllReduce is captured again:
