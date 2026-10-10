@@ -56,19 +56,43 @@ function iterAt(et) {
 const fmt = (x, d = 2) => x.toFixed(d);
 
 // ---------------- storyboard (video seconds -> experiment seconds) ----------------
-const S = [
-  { v0: 0.0,  v1: 6.0,  e0: 2.36, e1: 4.39 },                          // healthy AllReduce #2
-  { v0: 6.0,  v1: 9.5,  e0: 4.39, e1: CUT + 0.04 },                    // #3 starts, the port is cut
-  { v0: 9.5,  v1: 15.0, e0: CUT + 0.04, e1: CUT + 0.04 },              // hold on the cut
-  { v0: 15.0, v1: 20.5, e0: CUT + 0.04, e1: 6.30 },                    // the other connections finish
-  { v0: 20.5, v1: 26.5, e0: 6.30, e1: IT[2].end + 0.003 },             // the backup port carries the rest
-  { v0: 26.5, v1: 31.5, e0: IT[2].end + 0.003, e1: IT[2].end + 0.003 },  // hold on the completion of #3
-  { v0: 31.5, v1: 45.0, e0: IT[2].end + 0.003, e1: END + 0.05 },       // #4 to #10 with R2CC-AllReduce
-];
-const HOLD_CUT = S[2], HOLD_DONE = S[5];
-const RUN_END = 45.4, RES0 = 45.2, CONC = 52.0, RES1 = 64.5, TOTAL = 68.5;
+// The run plays at SPEED (1 = real time) and freezes for `dur` seconds at each moment in F, where the caption changes.
 const SINGLE = DATA.single_backup_s, AR_S = R.steady_ms / 1000, BAL_S = B.steady_ms / 1000;
 const pct = (a, b) => `${Math.round(100 * (1 - a / b))}%`;
+const SPEED = 1;
+const firstAfter = (t0, test) => { for (let t = t0; t < END; t += 0.01) if (test(t)) return t; return t0; };
+const RESUME = firstAfter(CUT + 0.2, t => gbps("node-3", 1, t, 0.05) > 2);        // repaired connections flow again
+const ONLY_BACKUP = firstAfter(RESUME, t => gbps("node-3", 0, t, 0.05) < 0.5);     // the healthy channels have finished
+const F = [
+  { et: 2.90, dur: 4.5, c: ["A healthy 4 GiB AllReduce on three servers", "Every NIC port runs at its 10 Gb/s limit"] },
+  { et: CUT + 0.15, dur: 5.5, pulse: true,
+    c: ["Port mlx5_2 of node-1 fails in the middle of AllReduce #3", "The connections that used it stall. The GPUs are fine"] },
+  { et: RESUME + 0.25, dur: 5.5,
+    c: [`About ${fmt(RESUME - CUT, 1)} s later, R2CC moves them to the backup port mlx5_0`,
+        "Only the unfinished part is resent, and the other connections keep running"] },
+  { et: ONLY_BACKUP + 0.2, dur: 5.0, c: ["The backup port carries the rest of AllReduce #3", "AllReduce #3 is not restarted"] },
+  { et: IT[2].end + 0.003, dur: 5.0, done: true,
+    c: ["AllReduce #3 completes, and every element is correct", "Same operation, finished over the surviving ports"] },
+  { et: IT[3].start + 1.2, dur: 5.5,
+    c: ["AllReduce #4 · R2CC-AllReduce stage 1, two rings at once",
+        "A global AllReduce over mlx5_0 and mlx5_3, and a partial AllReduce of node-2 and node-3 over mlx5_2"] },
+  { et: IT[3].start + 2.8, dur: 5.5,
+    c: ["Stage 2 · custom broadcast", "Node-1's share is merged in and broadcast to all ranks. mlx5_2 is idle"] },
+  { et: IT[5].start + 1.0, dur: 5.0,
+    c: ["Port mlx5_2 stays down, and the job keeps going",
+        `${fmt(AR_S)} s per AllReduce, and node-1 receives ${fmt(recv("node-1", IT[4]), 1)} GiB instead of ${fmt(recv("node-1", IT[1]), 1)} GiB`] },
+];
+const S = [];
+{
+  let v = 0, e = F[0].et;
+  for (const f of F) {
+    if (f.et > e) { const d = (f.et - e) / SPEED; S.push({ v0: v, v1: v + d, e0: e, e1: f.et }); v += d; e = f.et; }
+    f.v0 = v; f.v1 = v + f.dur; S.push({ v0: v, v1: f.v1, e0: e, e1: e }); v = f.v1;
+  }
+  const d = (END + 0.05 - e) / SPEED; S.push({ v0: v, v1: v + d, e0: e, e1: END + 0.05 });
+}
+const CUT_F = F.find(f => f.pulse), DONE_F = F.find(f => f.done);
+const RUN_END = S[S.length - 1].v1 + 0.4, RES0 = RUN_END - 0.2, CONC = RUN_END + 6.6, RES1 = CONC + 12.5, TOTAL = RES1 + 4;
 function expTime(vt) {
   for (const s of S) if (vt < s.v1) return s.e0 + (s.e1 - s.e0) * clamp((vt - s.v0) / (s.v1 - s.v0), 0, 1);
   return END + 0.05;
@@ -77,19 +101,11 @@ function speedAt(vt) {
   for (const s of S) if (vt < s.v1) return (s.e1 - s.e0) / (s.v1 - s.v0);
   return 0;
 }
-const CAPTIONS = [
-  [0.0, 6.0, "A healthy 4 GiB AllReduce on three servers", "Every NIC port runs at its 10 Gb/s limit"],
-  [6.0, 9.5, "AllReduce #3 starts", "The run is real. This is a replay of its measurements"],
-  [9.5, 15.0, "Port mlx5_2 of node-1 fails in the middle of AllReduce #3", "The GPUs are fine. Only one network port is lost"],
-  [15.0, 20.5, "R2CC moves the failed connections to the backup port mlx5_0", "The other connections keep running"],
-  [20.5, 26.5, "Only the unfinished part is resent, over the backup port", "AllReduce #3 is not restarted"],
-  [26.5, 31.5, "AllReduce #3 completes, and every element is correct", "Same operation, finished over the surviving ports"],
-  [31.5, 38.5, "From AllReduce #4 on, R2CC-AllReduce takes over", "The traffic uses both surviving ports, and node-1 receives less"],
-  [38.5, 45.4, "Port mlx5_2 stays down, and the job keeps going", `${fmt(AR_S)} s per AllReduce after the failure, ${fmt(IT[1].ms / 1000)} s when healthy`],
-  [45.4, CONC, "R2CC-AllReduce takes load off the degraded server", "The healthy servers take on more communication instead"],
+const CAPTIONS = F.map((f, i) => [f.v0, i + 1 < F.length ? F[i + 1].v0 : RUN_END, ...f.c]).concat([
+  [RUN_END, CONC, "R2CC-AllReduce takes load off the degraded server", "The healthy servers take on more communication instead"],
   [CONC, RES1, `${pct(AR_S, SINGLE)} less time per AllReduce than a single backup port`,
    `and ${pct(AR_S, BAL_S)} less than R2CC-Balance, with every element checked`],
-];
+]);
 
 // ---------------- static scene ----------------
 el("rect", { x: 0, y: 0, width: 1920, height: 1080, fill: "#f7f8fa" });
@@ -146,7 +162,7 @@ const opName = el("text", { x: 1372, y: 258, "font-size": 52, "font-weight": 700
 const pill = el("rect", { x: 1372, y: 282, width: 250, height: 44, rx: 22, fill: C.blueSoft }, op);
 const pillTxt = el("text", { x: 1392, y: 312, "font-size": 21, "font-weight": 600, fill: C.blue }, op);
 el("text", { x: 1372, y: 370, "font-size": 19, fill: C.sub }, op, "Schedule");
-const sched = el("text", { x: 1372, y: 402, "font-size": 23, "font-weight": 600, fill: C.ink }, op);
+const sched = el("text", { x: 1372, y: 402, "font-size": 21, "font-weight": 600, fill: C.ink }, op);
 el("line", { x1: 1372, y1: 428, x2: 1828, y2: 428, stroke: C.line, "stroke-width": 2 }, op);
 const rows = IT.map((it, i) => {
   const ry = 462 + i * 25;
@@ -247,14 +263,14 @@ function renderAt(vt) {
   speed.textContent = vt >= RUN_END ? "" : sp === 0 ? "paused" : `playback ${sp < 1 ? fmt(sp, 2) : fmt(sp, 1)}×`;
 
   const down = et >= CUT;
-  const hold = vt >= HOLD_DONE.v0 && vt < HOLD_DONE.v1, win = hold ? 0.002 : 0.1;
+  const hold = vt >= DONE_F.v0 && vt < DONE_F.v1, win = hold ? 0.002 : 0.1;
   cards.forEach((c, n) => {
     const node = NODES[n];
     c.ports.forEach((p, k) => {
       const failed = n === 0 && k === 1 && down;
       const r = failed ? 0 : gbps(node, k, et, win);
       p.bar.setAttribute("width", clamp(r / 10, 0, 1) * p.w);
-      const repaired = n === 0 && k === 0 && et >= 6.25 && et <= IT[2].end + 0.006;
+      const repaired = n <= 1 && k === 0 && et >= RESUME && et <= IT[2].end + 0.006;
       p.bar.setAttribute("fill", repaired ? C.orange : C.blue);
       p.down.setAttribute("opacity", failed ? 1 : 0);
       p.val.textContent = failed ? "PORT DOWN" : `${fmt(r, 1)} Gb/s`;
@@ -265,13 +281,13 @@ function renderAt(vt) {
     c.rx.textContent = last ? `${fmt(recv(node, last))} GiB` : "–";
     if (n === 0) {
       c.tag.setAttribute("opacity", down ? 1 : 0);
-      const pulse = vt >= HOLD_CUT.v0 - 0.3 && vt < HOLD_CUT.v1 ? 0.5 + 0.5 * Math.sin((vt - HOLD_CUT.v0) * 6) : 0;
+      const pulse = vt >= CUT_F.v0 && vt < CUT_F.v1 ? 0.5 + 0.5 * Math.sin((vt - CUT_F.v0) * 6) : 0;
       c.frame.setAttribute("stroke", down ? C.red : C.line);
       c.frame.setAttribute("stroke-width", down ? 2 + 2 * pulse : 2);
     }
   });
 
-  const justDone = vt >= HOLD_DONE.v0 && vt < HOLD_DONE.v1;
+  const justDone = vt >= DONE_F.v0 && vt < DONE_F.v1;
   const cur = justDone ? IT[2] : iterAt(et) || IT[IT.length - 1];
   const done = cur.end <= et;
   opName.textContent = `AllReduce #${cur.n}`;
@@ -283,10 +299,15 @@ function renderAt(vt) {
     pillTxt.textContent = `running · ${fmt(et - cur.start)} s`; pill.setAttribute("width", 250);
   }
   const ar = et > IT[2].end + 0.006;
-  sched.textContent = et < CUT ? "Ring over all three ports"
-                    : !ar ? "HotRepair, failed connection on mlx5_0"
-                    : "R2CC-AllReduce over mlx5_0 and mlx5_3";
-  sched.setAttribute("fill", et < CUT ? C.ink : !ar ? C.orange : C.teal);
+  let st = ["Ring over all three ports", C.ink];
+  if (et >= CUT && et < RESUME) st = ["Connections on mlx5_2 stalled", C.red];
+  else if (et >= RESUME && !ar) st = ["HotRepair, failed connections on mlx5_0", C.orange];
+  else if (ar) {
+    const busy = gbps("node-1", 0, et) + gbps("node-1", 2, et) > 1;
+    st = [gbps("node-2", 1, et) > 2 ? "R2CC-AllReduce · stage 1, two rings"
+          : busy ? "R2CC-AllReduce · stage 2, broadcast" : "R2CC-AllReduce", C.teal];
+  }
+  sched.textContent = st[0]; sched.setAttribute("fill", st[1]);
   IT.forEach((it, i) => rows[i].setAttribute("opacity", it.end <= et ? 1 : 0));
 
   blocks.forEach((b, i) => {
