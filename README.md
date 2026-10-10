@@ -52,6 +52,11 @@ NIC failed, which removes 12.5% of that server's bandwidth.
 
 ## How it works
 
+<p align="center">
+  <img width="95%" src="./fig/r2cc-overview.png"><br/>
+  <b>R2CC detects failures, repairs in-flight transfers and adapts collective schedules in the communication layer</b>
+</p>
+
 R2CC handles a failure in three steps, each building on the previous one.
 
 1. **Detect and localize.** R2CC notices a failed path from transport errors, or from sends that stop completing
