@@ -10,14 +10,24 @@ paths while collective operations are still running. When the GPUs are healthy a
 completes the interrupted operation without restarting the job, then redistributes the traffic and adapts the
 AllReduce schedule to the remaining bandwidth.
 
+**In the paper's H100 evaluation, R2CC adds less than 1.1% overhead to training and less than 3% to inference under a NIC failure.**
+
 <p align="center">
-  <img width="80%" src="./fig/r2cc-timeline.png"><br/>
-  <b>R2CC (with failure) vs. Ideal (failure-free)</b>
+  <img width="95%" src="./fig/r2cc-overview.png"><br/>
+  <b>R2CC detects failures, repairs in-flight transfers and adapts collective schedules in the communication layer</b>
 </p>
 
 ## Demo
 
 https://github.com/user-attachments/assets/8511cbf4-843a-4399-a742-d986eac55eb9
+
+<details>
+<summary>R2CC (with failure) vs. Ideal (failure-free)</summary>
+<p align="center">
+  <img width="80%" src="./fig/r2cc-timeline.png"><br/>
+  <b>R2CC (with failure) vs. Ideal (failure-free)</b>
+</p>
+</details>
 
 On three CloudLab servers, tests [01](./examples/cloudlab_r7525/01.hot_repair_to_balance.sh) and
 [02](./examples/cloudlab_r7525/02.hot_repair_to_r2cc_allreduce.sh) run ten 4 GiB AllReduces and cut the NIC `mlx5_2`
@@ -32,7 +42,7 @@ what the two schedules do after the cut.
 | R2CC-AllReduce after the cut | 6150 | 8230 | 8218 |
 
 R2CC-Balance spreads node-1's traffic over its two remaining NICs. R2CC-AllReduce reduces the traffic node-1
-receives by 13%, and the healthy servers take on more communication over their full set of NICs instead.
+receives by 13% relative to R2CC-Balance, and the healthy servers take on more communication over their full set of NICs instead.
 
 ## Results
 
@@ -52,11 +62,6 @@ NIC failed, which removes 12.5% of that server's bandwidth.
 
 ## How it works
 
-<p align="center">
-  <img width="95%" src="./fig/r2cc-overview.png"><br/>
-  <b>R2CC detects failures, repairs in-flight transfers and adapts collective schedules in the communication layer</b>
-</p>
-
 R2CC handles a failure in three steps, each building on the previous one.
 
 1. **Detect and localize.** R2CC notices a failed path from transport errors, or from sends that stop completing
@@ -69,27 +74,32 @@ R2CC handles a failure in three steps, each building on the previous one.
 3. **Adapt the schedule.** The backup NIC now carries extra traffic and becomes the bottleneck. R2CC-Balance spreads
    the failed NIC's share over all remaining NICs of the server. For AllReduce, the server that lost bandwidth
    still sets the pace, because every server in a ring moves the same amount of data. R2CC-AllReduce reduces the
-   communication load on that server with a partial AllReduce among the healthy servers and a broadcast of its
-   result.
+   communication load on that server, as shown below.
 
-<details>
-<summary>The two stages of R2CC-AllReduce</summary>
+### How R2CC-AllReduce reduces the load of the degraded server
+
+R2CC-AllReduce runs a global AllReduce on one part of the tensor while the healthy servers reduce the remaining part
+in parallel. The degraded server's contribution to that remaining part is then combined with the partial result and
+distributed to all ranks.
+
 <p align="center">
-  <img width="70%" src="./fig/r2cc-allreduce-stages.png"><br/>
-  <b>R2CC-AllReduce reduces the degraded node's load from 2D to 7/4D</b>
+  <img width="80%" src="./fig/r2cc-allreduce-stages.png"><br/>
+  <b>R2CC-AllReduce reduces communication on the degraded node</b><br/>
+  Illustrated for four nodes with 25% bandwidth loss, where the degraded node's load drops from 2D to 7D/4.
 </p>
-</details>
 
 ## Capabilities and validated integrations
 
 | Capability / integration | Validated by | Scope |
 |---|---|---|
 | nccl-tests | This repo, [tests 03–07](./examples/cloudlab_r7525/README.md#33-test-03--nccl-tests-correctness-and-a-side-by-side-table) | AllReduce from 8 B to 4 GiB, in place and out of place, results checked at every size |
-| CUDA Graphs | This repo, [test 08](./examples/cloudlab_r7525/README.md#36-test-08--cuda-graphs) | A graph captured before the failure keeps replaying correctly. A re-capture switches to the optimized schedule, and R2CC-AllReduce needs one eager AllReduce before it |
-| PyTorch DDP | This repo, [test 09](./examples/cloudlab_r7525/README.md#37-test-09--training-through-a-nic-failure) | GPT-2 training with a NIC cut at update 400 that stays cut. The AllReduce the cut hits gives the same gradient as upstream NCCL, and the final test perplexity is at most 0.023% higher (seed 42) |
+| CUDA Graphs | This repo, [test 08](./examples/cloudlab_r7525/README.md#36-test-08--cuda-graphs) | Correct replay through a failure, and a re-capture enables the optimized schedule\* |
+| PyTorch DDP | This repo, [test 09](./examples/cloudlab_r7525/README.md#37-test-09--training-through-a-nic-failure) | GPT-2 training through a persistent NIC failure, with gradients, parameters, loss and perplexity checked |
 | Megatron-LM | [Paper](https://arxiv.org/abs/2512.25059) | Data-parallel (2.7B) and tensor plus pipeline parallel (13B) training |
 | vLLM | [Paper](https://arxiv.org/abs/2512.25059) | Serving with a NIC failure (TTFT and TPOT) |
 | AllGather, ReduceScatter, SendRecv | [Paper](https://arxiv.org/abs/2512.25059) | R2CC-Balance keeps 83–90% of the healthy throughput for large messages |
+
+\* R2CC-AllReduce needs one eager AllReduce before its schedule is captured for the first time.
 
 Each row is validated in the setting it names, not for every framework version or deployment.
 
@@ -115,8 +125,8 @@ or R2CC-AllReduce with `R2CC_AR_AFTER_REPAIR=3`. To run the tests, set up three 
 [examples/cloudlab_r7525](./examples/cloudlab_r7525/README.md) runs nine tests on three CloudLab r7525 servers, each
 with a reference log. Tests 01, 02, 08 and 09 cut a real NIC in the middle of the run by dropping its traffic on the
 BlueField SmartNIC. Tests 01, 02 and 08 check every element of every AllReduce, and tests 03–07 check the result at
-every message size with nccl-tests. At 4 GiB, the bandwidth of R2CC-Balance and R2CC-AllReduce is within 1% of what
-the paper's formulas predict for this testbed (tests 03 and 07).
+every message size with nccl-tests. In the 4 GiB K sweep of test 07, the normalized completion
+times agree within 1% with the paper's formulas applied to this testbed's six-rank ring and finite pipeline depth.
 
 ## Citation
 ```
